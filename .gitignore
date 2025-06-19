@@ -106,3 +106,4 @@ releases/*/*
 
 .DS_Store
 videos
+configs/*
