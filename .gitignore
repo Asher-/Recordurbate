@@ -103,3 +103,6 @@ ENV/
 # CUSTOM
 releases/*/*
 .vscode
+
+.DS_Store
+videos
