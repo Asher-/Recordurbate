@@ -2,12 +2,16 @@ import os
 import signal
 import subprocess
 import time
+import threading
 
 import json
 from pprint import pprint
 
 import requests
 from config import load_config
+
+import asyncio
+from concurrent.futures import Future
 
 
 class Bot:
@@ -68,6 +72,32 @@ class Bot:
             if not found:
                 self.config["streamers"].append([new_streamer, False])
 
+    def handle_stream(self, streamer):
+        """
+        Runs the given args in a subprocess.Popen, and then calls the function
+        on_exit when the subprocess completes.
+        on_exit is a callable object, and popen_args is a list/tuple of args that 
+        would give to subprocess.Popen.
+        """
+        def run_in_thread():
+            process_args = self.config["youtube-dl_cmd"].split(" ") + ["https://chaturbate.com/{}/".format(streamer[0]), "--config-location", self.config["youtube-dl_config"]] 
+            process = subprocess.Popen( process_args, 0, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL )
+            # sleep (10)? and make sure process didn't immediately exit
+            poll_wait_time = self.config["process_poll_wait_time"]
+            if poll_wait_time is None:
+                poll_wait_time = 3
+            time.sleep( poll_wait_time )
+            if process.poll() is None:
+                self.logger.info("Started to record {}.".format(streamer[0]))
+                streamer[1] = process
+            process.wait()
+            streamer[1] = False
+            return
+        thread = threading.Thread(target=run_in_thread, args=())
+        thread.start()
+        # returns immediately after the thread starts
+        return thread
+
     def run(self):
         while self.running:
             
@@ -78,21 +108,6 @@ class Bot:
                 if self.config["auto_reload_config"]:
                     self.reload_config()
 
-                # check current processes
-                for idx, rec in enumerate(self.processes):
-
-                    # check if ended
-                    if rec[1].poll() is not None:
-                        self.logger.info("Stopped recording {}".format(rec[0]))
-
-                        # set streamer recording to false
-                        for loc, streamer in enumerate(self.config["streamers"]):
-                            if streamer[0] == rec[0]:
-                                self.config["streamers"][loc][1] = False
-
-                        # remove from proc list
-                        del self.processes[idx]
-
                 # check to start recording
                 for idx, streamer in enumerate(self.config["streamers"]):
 
@@ -100,23 +115,8 @@ class Bot:
                     if streamer[1]:
                         continue
 
-                    # check if online
+                    self.handle_stream( streamer )
 
-                    # prep args (dl bin and config)
-                    args = self.config["youtube-dl_cmd"].split(" ") + ["https://chaturbate.com/{}/".format(streamer[0]), "--config-location", self.config["youtube-dl_config"]] 
-                        
-                    # append idx and process to processes list
-                    process = subprocess.Popen(args, 0, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    time.sleep(1)
-                    if process.poll() is None:
-                        self.logger.info("Started to record {}".format(streamer[0]))
-                        self.processes.append([streamer[0], process])
-                        # set to recording
-                        self.config["streamers"][idx][1] = True
-                    #else:
-                    #    self.logger.info( streamer[0] + " is not currently online.")
-
-                    # check rate limit
                     if self.config["rate_limit"]:
                         time.sleep(self.config["rate_limit_time"])
 
@@ -132,9 +132,11 @@ class Bot:
                 time.sleep(1)
 
         # loop ended, stop all recording
-        for rec in self.processes:
-            # send sigint, wait for end
-            rec[1].send_signal(signal.SIGINT)
-            rec[1].wait()
+        for idx, streamer in enumerate(self.config["streamers"]):
+            if streamer[1]:
+                self.logger.info("Signaling {} to stop.".format(streamer[0]))
+                streamer[1].send_signal(signal.SIGINT)
+                streamer[1].wait()
+                self.logger.info("Stopped {}.".format(streamer[0]))
         
-        self.logger.info("Successfully stopped")
+        self.logger.info("Successfully stopped.")

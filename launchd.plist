@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.recordurbate.daemon</string>
+    
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>cd /Users/asher/Movies/recordurbate && rm -f ./configs/rb.pid && source ./venv/bin/activate && ./Recordurbate start</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/asher/Movies/recordurbate</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/asher/Movies/recordurbate/recordurbate.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/asher/Movies/recordurbate/recordurbate.error.log</string>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>ExitTimeOut</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>cd /Users/asher/Movies/recordurbate && ./Recordurbate stop</string>
+    </array>
+</dict>
+</plist>
