@@ -10,9 +10,6 @@ from pprint import pprint
 import requests
 from config import load_config
 
-import asyncio
-from concurrent.futures import Future
-
 
 class Bot:
 
@@ -32,6 +29,24 @@ class Bot:
         # reg signals
         signal.signal(signal.SIGINT, self.stop)
         signal.signal(signal.SIGTERM, self.stop)
+        signal.signal(signal.SIGUSR1, self.list_streamers)
+
+    def list_streamers(self, sig, frame):
+        if len(self.config['streamers']) == 0:
+            print('No streamers in recording list ({}).'.format(len(self.config['streamers'])))
+        else:
+            print("Streamers in recording list:\n")
+            live_streamer_count = 0
+            for streamer in self.config['streamers']:
+                if streamer[1]:
+                    print('* ' + streamer[0])
+                    ++live_streamer_count
+            
+            if live_streamer_count > 0 and live_streamer_count < len(self.config['streamers']):
+                print("\n")
+            for streamer in self.config['streamers']:
+                if not streamer[1]:
+                    print('- ' + streamer[0])
 
     def stop(self, signum, stack):
         if self.running:
@@ -91,7 +106,9 @@ class Bot:
                 self.logger.info("Started to record {}.".format(streamer[0]))
                 streamer[1] = process
             process.wait()
-            streamer[1] = False
+            if streamer[1]:
+                streamer[1] = False
+                self.logger.info("Stopped {}.".format(streamer[0]))
             return
         thread = threading.Thread(target=run_in_thread, args=())
         thread.start()
@@ -124,7 +141,6 @@ class Bot:
                 for i in range(60):
                     if not self.running:
                         break
-
                     time.sleep(1)
                 
             except Exception:
@@ -137,6 +153,7 @@ class Bot:
                 self.logger.info("Signaling {} to stop.".format(streamer[0]))
                 streamer[1].send_signal(signal.SIGINT)
                 streamer[1].wait()
+                streamer[1] = False
                 self.logger.info("Stopped {}.".format(streamer[0]))
         
         self.logger.info("Successfully stopped.")

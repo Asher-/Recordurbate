@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import sys
+import os
 from daemon import Daemon
 import config as Config
 
@@ -56,12 +57,8 @@ def remove():
 
 def list_streamers():
     if not check_num_args(2): return
-
-    # load config, print streamers
-    config = Config.load_config()
-    print('Streamers in recording list:\n')
-    for streamer in config['streamers']:
-        print('- ' + streamer)
+    daemon = Daemon()
+    daemon.list_streamers()
 
 def import_streamers():
     if not check_num_args(3): return
@@ -125,7 +122,9 @@ argument_map = {
     "list": list_streamers,
     "import": import_streamers,
     "export": export_streamers,
-    "start": bot, "stop": bot, "restart": bot
+    "start": bot, 
+    "stop": bot, 
+    "restart": bot
 }
 
 if __name__ == "__main__":

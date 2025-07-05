@@ -7,9 +7,11 @@ import logging
 import os
 import sys
 import time
+import signal
 
 from signal import SIGTERM
 from bot import Bot
+import config as Config
 
 class Daemon:
 
@@ -37,13 +39,13 @@ class Daemon:
         try:
             # Note: os.fork() "returns 0 in the child process and child’s process id in the parent process".
             # See https://www.geeksforgeeks.org/python-os-fork-method/
-            pid = os.fork()
-            if pid > 0:
+            self.pid = os.fork()
+            if self.pid > 0:
                 self.logger.debug("Parent PID = {}".format(os.getpid()))
                 sys.exit(0)
             
-            pid = os.fork()
-            if pid > 0:
+            self.pid = os.fork()
+            if self.pid > 0:
                 self.logger.debug("Fork PID = {}".format(os.getpid()))
                 sys.exit(0)
             
@@ -57,7 +59,7 @@ class Daemon:
 
         # close std's
         sys.stdin.close()
-        sys.stdout.close()
+        # sys.stdout.close()
         sys.stderr.close()
 
         # write pid file
@@ -78,13 +80,20 @@ class Daemon:
         except IOError:
             return None
 
+    def load_from_pid(self):
+        self.pid = self.read_pid()
+        if self.pid:
+            return True
+        else:
+            return False
+
     def start(self):
         # check pid file
-        pid = self.read_pid()
+        self.pid = self.read_pid()
 
         # if found, exit
-        if pid:
-            print("Pid file found, is Recordurbate already running? pid: {}".format(pid))
+        if self.pid:
+            print("Pid file found, is Recordurbate already running? pid: {}".format(self.pid))
             sys.exit(1)
 
         # continue
@@ -92,17 +101,14 @@ class Daemon:
         self.run(self.logger)
 
     def stop(self):
-        # check pid file
-        pid = self.read_pid()
-
-        if not pid:
+        if not self.load_from_pid():
             print("Pid file not found, Daemon not running?")
             return
 
         # try and kill
         try:
             while True:
-                os.kill(pid, SIGTERM)
+                os.kill(self.pid, SIGTERM)
                 time.sleep(0.1)
 
         # when excepts, check process died
@@ -119,6 +125,19 @@ class Daemon:
     def restart(self):
         self.stop()
         self.start()
+
+    def list_streamers(self):
+        if self.load_from_pid():
+            os.kill(self.pid, signal.SIGUSR1)
+        else:    
+            # load config, print streamers
+            config = Config.load_config()
+            if len(config['streamers']) == 0:
+                print('No streamers in recording list.')
+            else:
+                print('Streamers in recording list:\n')
+                for streamer in config['streamers']:
+                    print('- ' + streamer)
 
     def run(self, logger):
         bot = Bot(logger)
