@@ -1,9 +1,7 @@
 import json
 import sys
 
-
 config_loc = "configs/config.json"
-
 
 # opens file, returns json dict, returns None if error
 def load_config():
