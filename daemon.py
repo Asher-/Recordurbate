@@ -45,13 +45,13 @@ class Daemon:
         signal.signal(signal.SIGINT, stop_signal)
         signal.signal(signal.SIGTERM, stop_signal)
 
-    def init_ipc_server( self ):
-        self.ipc_client = SocketServer( daemon=self, hostname="localhost" )
-        self.ipc_client.start()
-
     def daemonize(self):
         if not self.pid:
             self.logger.info("Starting daemon")
+
+            # start socket server for ipc            
+            self.ipc_client = SocketServer( daemon=self, hostname="localhost" )
+
             self.logger.debug("calling os.fork()")
 
             # double fork
@@ -78,13 +78,13 @@ class Daemon:
                 print("Failed to daemonize. Note: run recordurbate on Linux terminal instead of Windows. See " + self.logfile + " for details.")
                 sys.exit(1)
 
+            self.ipc_client.start()
+
             # close std's to complete daemonization
             sys.stdin.close()
             sys.stdout.close()
             sys.stderr.close()
     
-            # start socket server for ipc            
-            self.init_ipc_server()
             self.logger.info("Successfully started daemon, pid: {}".format(self.pid))
 
     def reload_config(self):

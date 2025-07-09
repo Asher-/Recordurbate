@@ -19,11 +19,14 @@ class Streamer:
             # sleep (10)? and make sure process didn't immediately exit
             poll_wait_time = self.daemon.config["process_poll_wait_time"]
             if poll_wait_time is None:
-                poll_wait_time = 3
+                poll_wait_time = 10
             time.sleep( poll_wait_time )
             if stream.poll() is None:
-                self.daemon.logger.info("Started to record {}.".format(self.name))
-                self.stream = stream
+                self.daemon.logger.info("Stream for {} appears to be healthy - validating.".format(self.name))
+                # stream_error = stream.stderror.readline()
+                if not False:
+                    self.daemon.logger.info("Started to record {}.".format(self.name))
+                    self.stream = stream
             stream.wait()
             if self.stream:
                 self.stream = None

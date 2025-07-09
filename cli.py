@@ -2,17 +2,20 @@
 
 import sys
 import time
+import socket
 
-# import asyncio
+from zeroconf import ServiceInfo, Zeroconf, NonUniqueNameException
 
 from ipc.client import SocketClient
 from ipc.discover_port import DiscoverPort
+from ipc.zeroconf_config import ZeroconfConfig
 
 from daemon import Daemon
 
 daemon = None
 host = "localhost"
-port = None
+ip = "127.0.0.1"
+port = 0
 args = None
 socket_client = None
 
@@ -86,8 +89,28 @@ def start():
     if not check_num_args(2): 
         print("Encountered unexpected extra arguments {}.".format(" ".join(sys.argv[2:])))      
         return
-    daemon = Daemon()
-    daemon.start()
+    def ensure_service_not_started():
+        global host, ip, port
+        server_address = socket.inet_aton( ip )
+        info = ServiceInfo(
+            ZeroconfConfig.service_type,
+            f"{ZeroconfConfig.service_name}.{ZeroconfConfig.service_type}",
+            addresses=[ip],
+            port=port,
+            properties={},
+            server=host, 
+        )
+        publish_zeroconf = Zeroconf()
+        try:
+            publish_zeroconf.register_service(info)
+        except NonUniqueNameException:
+            print("Already started.")
+            sys.exit(1)
+        publish_zeroconf.unregister_service(info)
+        return True
+    if ensure_service_not_started():
+        daemon = Daemon()
+        daemon.start()
 
 def stop():
     if not check_num_args(2): 
