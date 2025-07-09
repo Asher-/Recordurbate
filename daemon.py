@@ -82,7 +82,7 @@ class Daemon:
 
             # close std's to complete daemonization
             sys.stdin.close()
-            sys.stdout.close()
+            # sys.stdout.close()
             sys.stderr.close()
     
             self.logger.info("Successfully started daemon, pid: {}".format(self.pid))
@@ -96,8 +96,8 @@ class Daemon:
                 del self.streamers[ name ]
             else:
                 new_streamers[ name ] = Streamer( self, name )
-        for index, streamer in enumerate(self.streamers.items()):
-            self.logger.info("{} has been removed".format(streamer.name))
+        for name in self.streamers:
+            self.logger.info("{} has been removed".format(name))
         if self.config:
             del self.config
         if self.streamers:
@@ -123,23 +123,24 @@ class Daemon:
 
     def add_streamer( self, name, save_config = True, client_response = None ):
         if name in self.streamers:
-            client_response.print("{} has already been added".format(username))
+            client_response.print("{} has already been added".format(name))
         else:
-            self.streamers[ name ] = Streamer( self, name )
-            config["streamers"].append(name)
-            if save_config and Config.save_config(config):
+            self.config["streamers"].append(name)
+            if save_config and Config.save_config(self.config):
                 client_response.print("{} has been added".format(name))
+            self.logger.info("Added {} to streamers.".format(name))
 
     def delete_streamer( self, name, save_config = True, client_response = None ):
         if name not in self.streamers:
-            client_response.print("{} hasn't been added".format(username))
+            client_response.print("{} hasn't been added".format(name))
         else:
             self.streamers[ name ].stop()
             del self.streamers[ name ]
-            index = Config.find_in_config(username, config)
+            index = Config.find_in_config(name, self.config)
             del self.config[ index ]
-            if save_config and Config.save_config(config):
-                client_response.print("{} has been deleted".format(username))
+            if save_config and Config.save_config(self.config):
+                client_response.print("{} has been deleted".format(name))
+            self.logger.info("Deleted {} from streamers.".format(name))
 
     def import_streamers( self, path, client_response = None ):
         with open(path, "r") as f:
@@ -153,7 +154,7 @@ class Daemon:
         if path is None:
             path = self.config["default_export_location"]
         with open(path, "w") as f:
-            for streamer in config["streamers"]:
+            for streamer in self.config["streamers"]:
                 f.write(streamer + "\n")
         client_response.print("Wrote streamers to file")
 
@@ -210,7 +211,7 @@ class Daemon:
 
                     for name in self.streamers:
                         streamer = self.streamers[name]
-                        if streamer.stream:
+                        if streamer.stream or streamer.started:
                             continue
                         else:
                             streamer.start()

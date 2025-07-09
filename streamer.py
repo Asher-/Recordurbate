@@ -1,16 +1,38 @@
 import subprocess
 import threading
 import time
+import os
+import signal
+
+from pid import process_active, get_pid_by_name_and_args
+
 class Streamer:
   
     name = None
     daemon = None
     stream = None
+    started = False
 
     def __init__( self, daemon, name ):
       self.name = name
       self.daemon = daemon
     
+    def ensure_valid_stream( self, ytdlp_pid = None, ffmpeg_pid = None):
+        if not process_active(ytdlp_pid):
+            ytdlp_pid = None
+        ffmpeg_pid = get_pid_by_name_and_args('ffmpeg', args_substring='/' + self.name + '/')#, exe_path=os.getcwd() + '/venv/bin') 
+        if ytdlp_pid:
+            if ffmpeg_pid:
+                return True
+            else:
+                time.sleep(10)
+                return self.ensure_valid_stream( self, ytdlp_pid=ytdlp_pid )
+        else:
+            if ffmpeg_pid:
+                self.daemon.logger.exception("Lost parent yt-dlp; killing stranded ffmpeg with PID {}".format(ffmpeg_pid))
+                os.kill( ffmpeg_pid, signal.SIGTERM )
+            else:
+                return False
  
     def start(self):
         def stream_thread():
@@ -23,15 +45,16 @@ class Streamer:
             time.sleep( poll_wait_time )
             if stream.poll() is None:
                 self.daemon.logger.info("Stream for {} appears to be healthy - validating.".format(self.name))
-                # stream_error = stream.stderror.readline()
-                if not False:
+                if self.ensure_valid_stream( ytdlp_pid = stream.pid ):
                     self.daemon.logger.info("Started to record {}.".format(self.name))
                     self.stream = stream
-            stream.wait()
+                    stream.wait()
             if self.stream:
                 self.stream = None
-                self.daemon.logger.info("Stopped {}.".format(streamer.name))
+                self.daemon.logger.info("Stopped {}.".format(self.name))
+            self.started = False # We marked as started even if we then failed - unmark
             return
+        self.started = True
         thread = threading.Thread(target=stream_thread, args=())
         thread.daemon = True
         thread.start()
@@ -43,5 +66,5 @@ class Streamer:
             self.stream.send_signal(signal.SIGINT)
             self.stream.wait()
             self.stream = None
-            self.daemon.logger.info("Stopped {}.".format(streamer.name))
+            self.daemon.logger.info("Stopped {}.".format(self.name))
 
