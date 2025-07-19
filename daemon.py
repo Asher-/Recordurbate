@@ -45,6 +45,33 @@ class Daemon:
         signal.signal(signal.SIGINT, stop_signal)
         signal.signal(signal.SIGTERM, stop_signal)
 
+    def register_child_signal( self ):
+        def child_exit_signal(signum, stack):
+            try:
+#                self.logger.info(f"Child process signal.")
+                # os.waitpid(-1, os.WNOHANG) waits for any child process (-1)
+                # without blocking if no child has terminated (os.WNOHANG).
+                child_pid, status = os.waitpid(-1, os.WNOHANG)
+#                self.logger.info(f"Child process had PID {child_pid}.")
+                if child_pid != 0:  # If a child was reaped
+                    if not (status == 0 or status == 256):
+                        self.logger.info(f"Child process with PID {child_pid} crashed with status {status}.")
+                    for idx, name in enumerate(self.config["streamers"]):
+                        streamer = self.streamers[ name ]
+                        if streamer.stream and streamer.stream.pid == child_pid:
+                            streamer.stop( signal_child=False )
+                            break
+                    else:
+                        # No child had terminated, or it was already reaped
+#                        self.logger.info(f"Child process {child_pid} exited clean.")
+                        pass
+            except ChildProcessError as e:
+                pass
+            except OSError as e:
+                self.logger.info(f"Error in SIGCHLD handler: {e}")
+
+        signal.signal(signal.SIGCHLD, child_exit_signal)
+
     def daemonize(self):
         if not self.pid:
             self.logger.info("Starting daemon")
@@ -82,8 +109,10 @@ class Daemon:
 
             # close std's to complete daemonization
             sys.stdin.close()
-            # sys.stdout.close()
+            sys.stdout.close()
             sys.stderr.close()
+
+            self.register_child_signal()
     
             self.logger.info("Successfully started daemon, pid: {}".format(self.pid))
 
@@ -112,7 +141,8 @@ class Daemon:
     def stop(self, client_response = None):
         if self.pid:
             self.logger.info("Caught stop signal, stopping")
-            client_response.close() # Since we exit we have to do this here
+            if client_response:
+                client_response.close() # Since we exit we have to do this here
             self.pid = None
             time.sleep(1)
             sys.exit(0)
@@ -179,15 +209,19 @@ class Daemon:
                     client_response.print('- ' + streamer.name)
 
     def list_streamers_online(self, client_response = None):
-        streamer_count = len(self.streamers)
-        if streamer_count == 0:
+        at_least_one_streamer_live = False
+        for name in self.streamers:
+            if self.streamers[name].started:
+                at_least_one_streamer_live = True
+
+        if not at_least_one_streamer_live:
             client_response.print('No streamers in recording list ({}).'.format(streamer_count))
         else:
             client_response.print("Streamers currently online:\n")
             live_streamer_count = 0
             for name in self.streamers:
                 streamer = self.streamers[name]
-                if streamer.stream:
+                if streamer.started:
                     client_response.print('* ' + streamer.name)
                     ++live_streamer_count
 
@@ -211,9 +245,7 @@ class Daemon:
 
                     for name in self.streamers:
                         streamer = self.streamers[name]
-                        if streamer.stream or streamer.started:
-                            continue
-                        else:
+                        if not streamer.stream:
                             streamer.start()
                         if self.config["rate_limit_time"]:
                             time.sleep(self.config["rate_limit_time"])
