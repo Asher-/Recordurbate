@@ -48,29 +48,36 @@ class Daemon:
     def register_child_signal( self ):
         def child_exit_signal(signum, stack):
             try:
-#                self.logger.info(f"Child process signal.")
+                # self.logger.info(f"Child process signal.")
                 # os.waitpid(-1, os.WNOHANG) waits for any child process (-1)
                 # without blocking if no child has terminated (os.WNOHANG).
                 child_pid, status = os.waitpid(-1, os.WNOHANG)
-#                self.logger.info(f"Child process had PID {child_pid}.")
+                if self.pid != os.getpid():                
+                    self.logger.info(f"child_exit_signal for pid {os.getpid()}")
+                # self.logger.info(f"Child process had PID {child_pid}.")
                 if child_pid != 0:  # If a child was reaped
                     if not (status == 0 or status == 256):
-                        self.logger.info(f"Child process with PID {child_pid} crashed with status {status}.")
-                    for idx, name in enumerate(self.config["streamers"]):
-                        streamer = self.streamers[ name ]
-                        if streamer.stream and streamer.stream.pid == child_pid:
-                            streamer.stop( signal_child=False )
-                            break
+                        self.clear_child( child_pid, status )
                     else:
                         # No child had terminated, or it was already reaped
 #                        self.logger.info(f"Child process {child_pid} exited clean.")
                         pass
             except ChildProcessError as e:
-                pass
+                if child_pid:
+                    self.clear_child( child_pid, status )
             except OSError as e:
-                self.logger.info(f"Error in SIGCHLD handler: {e}")
+                self.logger.error(f"Error in SIGCHLD handler: {e}")
 
         signal.signal(signal.SIGCHLD, child_exit_signal)
+
+    def clear_child( self, child_pid, status ):
+        for idx, name in enumerate(self.streamers):
+            streamer = self.streamers[ name ]
+            if streamer.stream and streamer.stream.pid == child_pid:
+                self.logger.info(f"Child process for {streamer.name} with PID {child_pid} crashed with status {status}.")
+                streamer.ensure_valid_stream( ytdlp_pid = streamer.stream.pid )
+                streamer.stop( signal_child=False )
+                break
 
     def daemonize(self):
         if not self.pid:

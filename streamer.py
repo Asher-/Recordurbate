@@ -17,7 +17,7 @@ class Streamer:
       self.name = name
       self.daemon = daemon
     
-    def ensure_valid_stream( self, ytdlp_pid = None, ffmpeg_pid = None):
+    def ensure_valid_stream( self, ytdlp_pid = None, ffmpeg_pid = None, recursion=0):
         if not ytdlp_pid and self.stream:
             ytdlp_pid = self.stream.pid
         if ytdlp_pid and not process_active(ytdlp_pid):
@@ -26,11 +26,13 @@ class Streamer:
         if ytdlp_pid:
             if ffmpeg_pid:
                 return True
+            elif recursion > 10:
+                return False
             else:
                 time.sleep(10)
                 # If we have yt-dlp but not ffmpeg it probably hasn't started yet.
                 # Maybe we want to add a recursion count but it hasn't been an issue yet.
-                return self.ensure_valid_stream( self, ytdlp_pid=ytdlp_pid )
+                return self.ensure_valid_stream(recursion=recursion+1)
         else:
             if ffmpeg_pid:
                 self.daemon.logger.exception("Lost parent yt-dlp; killing stranded ffmpeg with PID {}".format(ffmpeg_pid))
@@ -40,8 +42,15 @@ class Streamer:
  
     def start(self):
         def stream_thread():
+
+            def ignore_signals():
+                signal.signal(signal.SIGINT, signal.SIG_IGN)
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+
             process_args = self.daemon.config["youtube-dl_cmd"].split(" ") + ["https://chaturbate.com/{}/".format(self.name), "--config-location", self.daemon.config["youtube-dl_config"]] 
-            self.stream = subprocess.Popen( process_args, 0, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL )
+            self.stream = subprocess.Popen( process_args, 0, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=ignore_signals )
+    
             # sleep (10)? and make sure process didn't immediately exit
             poll_wait_time = self.daemon.config["process_poll_wait_time"]
             if poll_wait_time is None:
@@ -53,6 +62,7 @@ class Streamer:
                     self.daemon.logger.info("Started to record {}.".format(self.name))
                     self.started = True
                     self.stream.wait()
+            self.stop( signal_child=False )
             return
         thread = threading.Thread(target=stream_thread, args=())
         thread.daemon = True
@@ -61,12 +71,12 @@ class Streamer:
 
     def stop( self, signal_child = True ):
         if self.stream:
-            if signal_child:
-                self.daemon.logger.info("Signaling {} to stop.".format(self.name))
-                self.stream.send_signal(signal.SIGINT)
-                self.stream.wait()
-            self.stream = None
             if self.started:
                 self.started = False
+                if signal_child:
+                    self.daemon.logger.info("Signaling {} to stop.".format(self.name))
+                    self.stream.send_signal(signal.SIGINT)
+                    self.stream.wait()
                 self.daemon.logger.info("Stopped {}.".format(self.name))
+            self.stream = None
 
