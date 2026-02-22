@@ -26,10 +26,10 @@ class Streamer:
         if ytdlp_pid:
             if ffmpeg_pid:
                 return True
-            elif recursion > 10:
+            elif recursion > 5:
                 return False
             else:
-                time.sleep(10)
+                time.sleep(5)
                 # If we have yt-dlp but not ffmpeg it probably hasn't started yet.
                 # Maybe we want to add a recursion count but it hasn't been an issue yet.
                 return self.ensure_valid_stream(recursion=recursion+1)
@@ -49,11 +49,14 @@ class Streamer:
             process_args = self.daemon.config["youtube-dl_cmd"].split(" ") + ["https://chaturbate.com/{}/".format(self.name), "--config-location", self.daemon.config["youtube-dl_config"]] 
             self.stream = subprocess.Popen( process_args, 0, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, preexec_fn=ignore_sigchld )
     
-            # sleep (10)? and make sure process didn't immediately exit
+            # poll in 1s intervals to detect early exit (e.g. streamer offline)
             poll_wait_time = self.daemon.config["process_poll_wait_time"]
             if poll_wait_time is None:
                 poll_wait_time = 10
-            time.sleep( poll_wait_time )
+            for _ in range(poll_wait_time):
+                if not self.stream or self.stream.poll() is not None:
+                    break
+                time.sleep(1)
             if self.stream and self.stream.poll() is None:
                 # self.daemon.logger.info("Stream for {} appears to be healthy - validating.".format(self.name))
                 if self.ensure_valid_stream( ytdlp_pid = self.stream.pid ):
