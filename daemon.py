@@ -1,6 +1,5 @@
 import sys
 import os
-import errno
 import logging
 import signal
 import time
@@ -46,44 +45,6 @@ class Daemon:
         signal.signal(signal.SIGINT, stop_signal)
         signal.signal(signal.SIGTERM, stop_signal)
 
-    def register_child_signal( self ):
-        def child_exit_signal(signum, stack):
-            # Loop to reap all children - SIGCHLD may be delivered once for multiple children
-            while True:
-                try:
-                    # os.waitpid(-1, os.WNOHANG) waits for any child process (-1)
-                    # without blocking if no child has terminated (os.WNOHANG).
-                    child_pid, status = os.waitpid(-1, os.WNOHANG)
-                    if child_pid == 0:  # No more children to reap
-                        break
-                    
-                    # Check if this is a non-zero exit status (not clean exit)
-                    # status is the exit code shifted left by 8 bits, so 0 means clean exit
-                    # 256 = 1 << 8 means exit code 1
-                    if not (status == 0 or status == 256):
-                        self.clear_child( child_pid, status )
-                    # If clean exit (status 0 or 256), we still reaped it, just don't need special handling
-                except ChildProcessError:
-                    # No child processes exist - we're done
-                    break
-                except OSError as e:
-                    # ECHILD means no child processes, which is fine
-                    # Other OSErrors should be logged
-                    if e.errno != errno.ECHILD:
-                        self.logger.error(f"Error in SIGCHLD handler: {e}")
-                    break
-
-        signal.signal(signal.SIGCHLD, child_exit_signal)
-
-    def clear_child( self, child_pid, status ):
-        for idx, name in enumerate(self.streamers):
-            streamer = self.streamers[ name ]
-            if streamer.stream and streamer.stream.pid == child_pid:
-                self.logger.info(f"Child process for {streamer.name} with PID {child_pid} crashed with status {status}.")
-                streamer.ensure_valid_stream( ytdlp_pid = streamer.stream.pid )
-                streamer.stop( signal_child=False )
-                break
-
     def daemonize(self):
         if not self.pid:
             self.logger.info("Starting daemon")
@@ -124,8 +85,6 @@ class Daemon:
             sys.stdout.close()
             sys.stderr.close()
 
-            self.register_child_signal()
-    
             self.logger.info("Successfully started daemon, pid: {}".format(self.pid))
 
     def reload_config(self):

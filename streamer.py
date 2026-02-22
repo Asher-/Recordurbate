@@ -43,13 +43,11 @@ class Streamer:
     def start(self):
         def stream_thread():
 
-            def ignore_signals():
-                signal.signal(signal.SIGINT, signal.SIG_IGN)
-                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            def ignore_sigchld():
                 signal.signal(signal.SIGCHLD, signal.SIG_IGN)
 
             process_args = self.daemon.config["youtube-dl_cmd"].split(" ") + ["https://chaturbate.com/{}/".format(self.name), "--config-location", self.daemon.config["youtube-dl_config"]] 
-            self.stream = subprocess.Popen( process_args, 0, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=ignore_signals )
+            self.stream = subprocess.Popen( process_args, 0, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, preexec_fn=ignore_sigchld )
     
             # sleep (10)? and make sure process didn't immediately exit
             poll_wait_time = self.daemon.config["process_poll_wait_time"]
@@ -62,12 +60,19 @@ class Streamer:
                     self.daemon.logger.info("Started to record {}.".format(self.name))
                     self.started = True
                     self.stream.wait()
+                    self.cleanup_ffmpeg()
             self.stop( signal_child=False )
             return
         thread = threading.Thread(target=stream_thread, args=())
         thread.daemon = True
         thread.start()
         return thread
+
+    def cleanup_ffmpeg( self ):
+        ffmpeg_pid = get_pid_by_name_and_args('ffmpeg', args_substring='/' + self.name + '/')
+        if ffmpeg_pid:
+            self.daemon.logger.info("Killing orphaned ffmpeg (PID {}) for {}".format(ffmpeg_pid, self.name))
+            os.kill( ffmpeg_pid, signal.SIGTERM )
 
     def stop( self, signal_child = True ):
         if self.stream:
@@ -78,5 +83,8 @@ class Streamer:
                     self.stream.send_signal(signal.SIGINT)
                     self.stream.wait()
                 self.daemon.logger.info("Stopped {}.".format(self.name))
+            if self.stream.poll() is None:
+                self.stream.terminate()
+                self.stream.wait()
             self.stream = None
 
