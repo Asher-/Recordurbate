@@ -107,5 +107,5 @@ releases/*/*
 .vscode
 
 .DS_Store
-videos
+videos/
 configs/*

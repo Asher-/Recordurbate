@@ -1,5 +1,6 @@
 import sys
 import os
+import errno
 import logging
 import signal
 import time
@@ -47,26 +48,30 @@ class Daemon:
 
     def register_child_signal( self ):
         def child_exit_signal(signum, stack):
-            try:
-                # self.logger.info(f"Child process signal.")
-                # os.waitpid(-1, os.WNOHANG) waits for any child process (-1)
-                # without blocking if no child has terminated (os.WNOHANG).
-                child_pid, status = os.waitpid(-1, os.WNOHANG)
-                if self.pid != os.getpid():                
-                    self.logger.info(f"child_exit_signal for pid {os.getpid()}")
-                # self.logger.info(f"Child process had PID {child_pid}.")
-                if child_pid != 0:  # If a child was reaped
+            # Loop to reap all children - SIGCHLD may be delivered once for multiple children
+            while True:
+                try:
+                    # os.waitpid(-1, os.WNOHANG) waits for any child process (-1)
+                    # without blocking if no child has terminated (os.WNOHANG).
+                    child_pid, status = os.waitpid(-1, os.WNOHANG)
+                    if child_pid == 0:  # No more children to reap
+                        break
+                    
+                    # Check if this is a non-zero exit status (not clean exit)
+                    # status is the exit code shifted left by 8 bits, so 0 means clean exit
+                    # 256 = 1 << 8 means exit code 1
                     if not (status == 0 or status == 256):
                         self.clear_child( child_pid, status )
-                    else:
-                        # No child had terminated, or it was already reaped
-#                        self.logger.info(f"Child process {child_pid} exited clean.")
-                        pass
-            except ChildProcessError as e:
-                if child_pid:
-                    self.clear_child( child_pid, status )
-            except OSError as e:
-                self.logger.error(f"Error in SIGCHLD handler: {e}")
+                    # If clean exit (status 0 or 256), we still reaped it, just don't need special handling
+                except ChildProcessError:
+                    # No child processes exist - we're done
+                    break
+                except OSError as e:
+                    # ECHILD means no child processes, which is fine
+                    # Other OSErrors should be logged
+                    if e.errno != errno.ECHILD:
+                        self.logger.error(f"Error in SIGCHLD handler: {e}")
+                    break
 
         signal.signal(signal.SIGCHLD, child_exit_signal)
 
@@ -174,7 +179,7 @@ class Daemon:
             self.streamers[ name ].stop()
             del self.streamers[ name ]
             index = Config.find_in_config(name, self.config)
-            del self.config[ index ]
+            del self.config["streamers"][index]
             if save_config and Config.save_config(self.config):
                 client_response.print("{} has been deleted".format(name))
             self.logger.info("Deleted {} from streamers.".format(name))
@@ -184,7 +189,7 @@ class Daemon:
             for line in f:
                 name = line.rstrip()
                 self.add_streamer( name, False )
-        if Config.save_config(config):
+        if Config.save_config(self.config):
             client_response.print("Streamers imported, Config saved")
 
     def export_streamers( self, path = None, client_response = None ):
@@ -222,7 +227,7 @@ class Daemon:
                 at_least_one_streamer_live = True
 
         if not at_least_one_streamer_live:
-            client_response.print('No streamers in recording list ({}).'.format(streamer_count))
+            client_response.print('No streamers in recording list ({}).'.format(len(self.streamers)))
         else:
             client_response.print("Streamers currently online:\n")
             live_streamer_count = 0
