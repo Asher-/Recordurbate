@@ -1,94 +1,177 @@
 # Recordurbate
-The act of recording a Chaturbate live stream
 
-Youtube-dl was previously broken, please update your installs to >= 2019.11.22
+Automatically records Chaturbate live streams. Runs as a background daemon that
+monitors a list of streamers and records any that go live using yt-dlp and
+ffmpeg.
+
+This is a full rewrite of the original
+[oliverjrose99/Recordurbate](https://github.com/oliverjrose99/Recordurbate).
+The daemon, process management, and IPC layers have been rebuilt from scratch.
+
+## How It Works
+
+The daemon runs in the background (via UNIX double-fork) and loops every 60
+seconds over a list of streamers. For each streamer that isn't already being
+recorded, it launches a yt-dlp subprocess targeting their Chaturbate page.
+yt-dlp handles stream detection and spawns ffmpeg to download the video.
+
+Each yt-dlp process runs in its own session (`setsid`) so it is isolated from
+the daemon's signal environment. The daemon monitors each process in a
+dedicated thread, validates that both yt-dlp and ffmpeg are alive, and cleans
+up orphaned processes when streams end or crash.
+
+Runtime management (add/remove streamers, start/stop, list status) is done via
+a TCP IPC interface. The daemon binds to a dynamic port and registers itself
+via Zeroconf (mDNS), so the CLI client can discover it without a PID file or
+fixed port.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical breakdown
+(process hierarchy, thread model, signal handling, IPC protocol, etc.).
+
 ## Requirements
-* Linux / Android (with Termux)
-* Python 3+ (requests)
-* Yt-dlp
-* FFmpeg
 
-```commandline
-# apt update && apt upgrade
-# apt install python3 ffmpeg
-$ pip3 install yt-dlp requests
+- **macOS** or **Linux**
+- **Python 3.10+**
+- **yt-dlp**
+- **ffmpeg**
+- **Python packages**: `psutil`, `zeroconf`
+
+### macOS
+
+```bash
+brew install python ffmpeg
+pip3 install yt-dlp psutil zeroconf
 ```
+
+### Linux
+
+```bash
+sudo apt update && sudo apt install python3 ffmpeg
+pip3 install yt-dlp psutil zeroconf
+```
+
 ## Installation
-```commandline
-$ git clone https://github.com/oliverjrose99/Recordurbate.git
+
+```bash
+git clone https://github.com/oliverjrose99/Recordurbate.git
+cd Recordurbate
+python3 -m venv venv
+source venv/bin/activate
+pip install yt-dlp psutil zeroconf
 ```
-The default config files will work out of the box with youtube-dl and FFmpeg installed. Streams will be saved to the folder videos/\<name>/\<name> \<date> \<hour>_\<min>.mp4. This can be changed by editing the youtube-dl.config file, see the configuration section for more. 
+
+Streams are saved to `videos/<streamer_name>/` by default. This can be changed
+in `configs/youtube-dl.config`.
+
 ## Usage
 
-View the usage/help text
 ```
-./Recordurbate help
-```
+python cli.py start                   # start the daemon
+python cli.py stop                    # stop the daemon
+python cli.py restart                 # restart the daemon
 
-Add or remove a streamer to record
-```
-./Recordurbate.py [add | del] username
-```
+python cli.py add <username>          # add a streamer
+python cli.py del <username>          # remove a streamer (stops recording)
 
-Start, stop or restart the daemon
-```
-./Recordurbate.py [start | stop | restart]
-```
+python cli.py list                    # list all streamers (* = recording, - = offline)
+python cli.py list online             # list currently recording
+python cli.py list offline            # list currently offline
 
-List the streamers in the config
-```
-./Recordurbate list
+python cli.py import <file>           # import streamer names from file (one per line)
+python cli.py export [file]           # export streamer names to file
+
+python cli.py help                    # show usage
 ```
 
-Import streamers from a file
+## Configuration
+
+Two config files in the `configs/` directory:
+
+### config.json
+
+| Key                      | Type     | Default                       | Description                                                                 |
+|:-------------------------|:---------|:------------------------------|:----------------------------------------------------------------------------|
+| `youtube-dl_cmd`         | `string` | `"yt-dlp"`                    | Command to invoke yt-dlp. Can be an absolute path.                          |
+| `youtube-dl_config`      | `string` | `"configs/youtube-dl.config"` | Path to yt-dlp config, passed via `--config-location`.                      |
+| `auto_reload_config`     | `bool`   | `true`                        | Reload config every loop iteration (60s). Allows live streamer list edits.  |
+| `rate_limit`             | `bool`   | `true`                        | Whether to rate-limit between launching streamers.                          |
+| `rate_limit_time`        | `number` | `0`                           | Seconds to sleep between streamer launches. `0` = no delay.                 |
+| `process_poll_wait_time` | `number` | `15`                          | Seconds to poll (1s intervals) after launching yt-dlp before validation.    |
+| `default_export_location`| `string` | `"./list.txt"`                | Default file path for the `export` command.                                 |
+| `streamers`              | `array`  | `[]`                          | Chaturbate usernames to record.                                             |
+
+### youtube-dl.config
+
+Passed to yt-dlp via `--config-location`. Controls output format, quality, and
+yt-dlp behavior. Default settings:
+
 ```
-./Recordurbate import [file]
+-o "videos/%(id)s/%(title)s.%(ext)s"
+--quiet
+--hls-use-mpegts
+--cookies ./chaturbate.com_cookies.txt
 ```
 
-Export streamers to a file. The file parameter is optional and the default location will be used if not passed
+Quality can be limited to reduce file size and bandwidth:
+
 ```
-./Recordurbate.py export [file]
+-f 'best[height<1080][fps<?60]' -o "videos/%(id)s/%(title)s.%(ext)s"
 ```
 
-## Config Files
-There are two main config files that are used, `config.json` and `youtube-dl.config`, both being stored in the configs directory. In that directory is also the log file (rb.log) and the pid file (rb.pid).
+See the [yt-dlp documentation](https://github.com/yt-dlp/yt-dlp#usage-and-options)
+for all available options.
 
-### Config.json
-This file is used directly by Recordurbate and contains all the configuration options as well as the array of streamers to record.
+## Monitoring
 
-`youtube-dl_cmd` - Sets the command used to run Youtube-dl. 
+yt-dlp processes run in their own sessions and won't appear in `ps -u`. Use:
 
-`youtube-dl_config` - Sets where the config file for Youtube-dl is located and is passed with the `--config-location` parameter. Note that system and user wide configs still apply, see [this link](https://github.com/ytdl-org/youtube-dl#configuration) for more info.
+```bash
+# all yt-dlp processes
+ps aux | grep yt-dlp
 
-`auto_reload_config` - Sets if the bot should reload the config after every loop to allow adding or removing streamers while running.
+# detailed: PID, parent PID, status, uptime, command
+ps -eo pid,ppid,stat,etime,command | grep yt-dlp
 
-`rate_limit` - Sets whether or not the API calls should be rate limited.
+# check for zombies
+ps aux | awk '$8 ~ /Z/'
+```
 
-`rate_limit_time` - The time in seconds to wait between API calls, only waits if `rate_limit` is true.
+Daemon log: `configs/rb.log`
 
-`default_export_location` - Sets the default location for the export command.
+## macOS launchd
 
-`streamers` - An array of strings, each of which is a streamer to record.
+To run as a user agent that starts at login:
 
-### Youtube-dl.config
-This file is used to set all of the Youtube-dl config options and is passed using the `--config-location` parameter. As mentioned, the system and user wide configs still apply. Options such as quality, export options and more can be [found on the Youtube-dl Github.](https://github.com/ytdl-org/youtube-dl)
+```bash
+cp launchd.plist ~/Library/LaunchAgents/com.recordurbate.daemon.plist
+launchctl load ~/Library/LaunchAgents/com.recordurbate.daemon.plist
+```
 
-## TODO and future features
-* Integration with Chaturbate e.g. import from following, record paid for shows, etc
-* Better logging and config options
-* Support for other sites
-* Support for windows (OS.fork() alt)
+To remove:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.recordurbate.daemon.plist
+rm ~/Library/LaunchAgents/com.recordurbate.daemon.plist
+```
 
 ## Notes
 
-### Recordings lag and freeze
-A couple users have reported that recordings may lag and freeze which was due to out of date youtube-dl and ffmpeg versions. If you experience this, please ensure you are using the latest stable versions and that your internet, storage and CPU are not bottlenecks causing issues.
+### Large files and bandwidth
 
-### No files / Not running
-Some users found that no files were being made which was due to either software not being installed/configured or incorrect permissions. It's also possible that AppArmor is blocking the script which can be checked by looking at the syslog. Please check these before making an issue. Youtube-dl needs to be >= version 2019.11.22. It can be updated by running `pip3 install -U youtube-dl` and the version can be checked with the command `youtube-dl --version`.
+Streams are captured at the source quality (up to 4K/60fps). This produces
+large files and heavy bandwidth usage. Use yt-dlp config options to limit
+quality if needed.
 
-### Large Files and bandwidth usage
-Because the streams are intended to be watched live, there is little compression on the video. This can cause very large files and heavy internet usage as the max settings for some streamers are 4k/60fps and youtube-dl defaults to best available options. Internet usage can be reduced by using a lower quality and file size can be further reduced by compressing the file (will causes heavy CPU usage). All this can be done with youtube-dl config options. 
+### Recordings lag or freeze
 
-### Termux support
-Recordurbate will work on termux but the python install location is different to normal Linux installs. You can either run the script as `python Recordurbate.py [command]` or change the shebang to `/data/data/com.termux/files/usr/bin/python3.7` and run the script as normal. I don't currently know how well YouTube-dl will work with changing between WiFi and 4G, but either way will use a lot of data and possibly battery. Please open an issue if you find any issues or have anything to add. 
+Usually caused by outdated yt-dlp or ffmpeg. Update both:
+
+```bash
+pip3 install -U yt-dlp
+brew upgrade ffmpeg    # macOS
+```
+
+### No files appearing
+
+Check that yt-dlp, ffmpeg, and cookies are configured correctly. Check
+`configs/rb.log` for errors. Ensure the `videos/` directory is writable.
