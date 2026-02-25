@@ -93,15 +93,12 @@ class Daemon:
         for index, name in enumerate(new_config["streamers"]):
             if name in self.streamers:
                 new_streamers[ name ] = self.streamers[ name ]
-                del self.streamers[ name ]
             else:
                 new_streamers[ name ] = Streamer( self, name )
-        for name in self.streamers:
-            self.logger.info("{} has been removed".format(name))
-        if self.config:
-            del self.config
-        if self.streamers:
-            del self.streamers
+        removed = { name: s for name, s in self.streamers.items() if name not in new_streamers }
+        for name, streamer in removed.items():
+            self.logger.info("{} has been removed, stopping".format(name))
+            streamer.stop()
         self.config = new_config
         self.streamers = new_streamers
 

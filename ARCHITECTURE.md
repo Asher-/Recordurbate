@@ -46,6 +46,8 @@
   - [Zombie / Orphan Process Fixes](#zombie--orphan-process-fixes)
   - [IPC Reliability Fixes](#ipc-reliability-fixes)
   - [Timing Improvements](#timing-improvements)
+- [Changes (Feb 25, 2026)](#changes-feb-25-2026)
+  - [Stranded Sleeping Process Fixes](#stranded-sleeping-process-fixes)
 
 ---
 
@@ -895,3 +897,51 @@ full daemon restart.
 The blind `time.sleep(poll_wait_time)` was replaced with a 1s polling loop
 that checks `stream.poll()` each iteration and breaks immediately when the
 process exits.
+
+---
+
+## Changes (Feb 25, 2026)
+
+### Stranded Sleeping Process Fixes
+
+**Problem**: yt-dlp processes were accumulating as stranded sleeping orphans
+(status `Ss`, PPID=1) across daemon restarts and config reloads.
+
+**Root causes and fixes**:
+
+| #   | Root Cause                                                        | Fix                                                                                              |
+|:----|:------------------------------------------------------------------|:-------------------------------------------------------------------------------------------------|
+| 1   | `stream_thread` had no `try/finally`. Any exception after         | Wrapped post-`Popen` logic in `try/finally` so `self.stop(signal_child=False)` always runs,      |
+|     | `Popen` (e.g., accessing `self.daemon.config` during a            | guaranteeing the child is terminated and reaped even if the thread crashes.                       |
+|     | `reload_config()` race) killed the thread without cleanup,        |                                                                                                  |
+|     | orphaning the yt-dlp process.                                     |                                                                                                  |
+| 2   | `reload_config()` dropped removed streamers without calling       | Removed streamers now have `stop()` called before being dropped. Their yt-dlp processes are      |
+|     | `stop()`. Their yt-dlp processes (in their own sessions)          | signaled and reaped.                                                                             |
+|     | continued running indefinitely.                                   |                                                                                                  |
+| 3   | `reload_config()` used `del self.config` followed by              | Replaced `del` + reassign with direct assignment (`self.config = new_config`). The old           |
+|     | `self.config = new_config`. Between those two lines,              | reference is released by GC after reassignment. Same fix applied to `self.streamers`.            |
+|     | `self.config` resolved to the class-level `None`, causing         |                                                                                                  |
+|     | `TypeError` in concurrent `stream_thread` accesses (trigger       |                                                                                                  |
+|     | for Bug 1).                                                       |                                                                                                  |
+| 4   | `stop(signal_child=True)` called `wait()` with no timeout         | Added `timeout=10` to `wait()` after SIGINT. On `TimeoutExpired`, logs and falls through to      |
+|     | after SIGINT. If yt-dlp was deadlocked, `wait()` blocked          | the existing `terminate()` + `wait()` safety net.                                                |
+|     | forever, preventing the `terminate()` safety net from             |                                                                                                  |
+|     | executing. During daemon shutdown this hung the run loop           |                                                                                                  |
+|     | thread, eventually requiring kill -9 and orphaning all            |                                                                                                  |
+|     | children.                                                         |                                                                                                  |
+
+**Files changed**: `streamer.py`, `daemon.py`
+
+**`streamer.py`**:
+
+- `stream_thread()` — wrapped post-`Popen` body in `try/except/finally`.
+  `except` logs the error; `finally` guarantees `self.stop(signal_child=False)`.
+- `stop()` — `wait()` after SIGINT now uses `timeout=10`. `TimeoutExpired` is
+  caught and logged; execution falls through to `terminate()` + `wait()`.
+
+**`daemon.py`**:
+
+- `reload_config()` — removed streamers now have `stop()` called. Removed
+  unsafe `del self.config` / `del self.streamers` pattern; replaced with
+  direct assignment. Removed unnecessary `del self.streamers[name]` mutation
+  inside the preservation loop.

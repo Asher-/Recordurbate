@@ -49,22 +49,26 @@ class Streamer:
             process_args = self.daemon.config["youtube-dl_cmd"].split(" ") + ["https://chaturbate.com/{}/".format(self.name), "--config-location", self.daemon.config["youtube-dl_config"]] 
             self.stream = subprocess.Popen( process_args, 0, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, preexec_fn=ignore_sigchld )
     
-            # poll in 1s intervals to detect early exit (e.g. streamer offline)
-            poll_wait_time = self.daemon.config["process_poll_wait_time"]
-            if poll_wait_time is None:
-                poll_wait_time = 10
-            for _ in range(poll_wait_time):
-                if not self.stream or self.stream.poll() is not None:
-                    break
-                time.sleep(1)
-            if self.stream and self.stream.poll() is None:
-                # self.daemon.logger.info("Stream for {} appears to be healthy - validating.".format(self.name))
-                if self.ensure_valid_stream( ytdlp_pid = self.stream.pid ):
-                    self.daemon.logger.info("Started to record {}.".format(self.name))
-                    self.started = True
-                    self.stream.wait()
-                    self.cleanup_ffmpeg()
-            self.stop( signal_child=False )
+            try:
+                # poll in 1s intervals to detect early exit (e.g. streamer offline)
+                poll_wait_time = self.daemon.config["process_poll_wait_time"]
+                if poll_wait_time is None:
+                    poll_wait_time = 10
+                for _ in range(poll_wait_time):
+                    if not self.stream or self.stream.poll() is not None:
+                        break
+                    time.sleep(1)
+                if self.stream and self.stream.poll() is None:
+                    # self.daemon.logger.info("Stream for {} appears to be healthy - validating.".format(self.name))
+                    if self.ensure_valid_stream( ytdlp_pid = self.stream.pid ):
+                        self.daemon.logger.info("Started to record {}.".format(self.name))
+                        self.started = True
+                        self.stream.wait()
+                        self.cleanup_ffmpeg()
+            except Exception:
+                self.daemon.logger.exception("stream_thread error for {}".format(self.name))
+            finally:
+                self.stop( signal_child=False )
             return
         thread = threading.Thread(target=stream_thread, args=())
         thread.daemon = True
@@ -84,7 +88,10 @@ class Streamer:
                 if signal_child:
                     self.daemon.logger.info("Signaling {} to stop.".format(self.name))
                     self.stream.send_signal(signal.SIGINT)
-                    self.stream.wait()
+                    try:
+                        self.stream.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        self.daemon.logger.info("SIGINT timeout for {}, escalating to SIGTERM.".format(self.name))
                 self.daemon.logger.info("Stopped {}.".format(self.name))
             if self.stream.poll() is None:
                 self.stream.terminate()
