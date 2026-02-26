@@ -282,7 +282,10 @@ class Daemon:
                 with self.streamers_lock:
                     streamer_snapshot = dict(self.streamers)
                 for name, streamer in streamer_snapshot.items():
-                    streamer.stop()
+                    try:
+                        streamer.stop()
+                    except Exception:
+                        self.logger.exception("Error stopping {} during shutdown".format(name))
             else:
                 self.logger.info("Handoff mode: leaving child processes running.")
             
