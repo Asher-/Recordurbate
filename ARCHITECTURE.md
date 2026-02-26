@@ -54,6 +54,10 @@
   - [New IPC Command](#new-ipc-command)
   - [New CLI Command](#new-cli-command)
   - [Files Changed](#files-changed)
+- [Stale Stream Watchdog](#stale-stream-watchdog)
+  - [Detection Mechanism](#detection-mechanism)
+  - [Configuration](#configuration-1)
+  - [Defence in Depth](#defence-in-depth)
 
 ---
 
@@ -1048,3 +1052,59 @@ continue uninterrupted through the new daemon.
 
 - `upgrade()` — sends `"handoff"` via IPC, polls Zeroconf until the old
   service disappears, then starts a new daemon.
+
+---
+
+## Stale Stream Watchdog
+
+ffmpeg can hang indefinitely when an HLS source disconnects. The remote CDN
+sends FIN, the TCP sockets enter `CLOSE_WAIT`, but ffmpeg never closes its
+end — leaving both ffmpeg and yt-dlp at 0% CPU with a stale output file.
+The streamer thread blocks on `wait()` forever.
+
+### Detection Mechanism
+
+`Streamer.wait_with_watchdog(proc)` replaces the previous blocking
+`proc.wait()` call in both `stream_thread` and `adopted_thread`:
+
+```
+loop:
+  proc.wait(timeout=60s)
+    └── process exited → return
+    └── TimeoutExpired → check output file
+
+  scan videos/{name}/ for .part files
+  compare newest .part mtime to last check
+    └── mtime advanced  → reset stale timer
+    └── mtime unchanged → start/continue stale timer
+        └── stale_since >= stale_stream_timeout
+            ├── SIGINT → wait(10s)
+            │   └── TimeoutExpired → SIGTERM
+            └── return (cleanup_ffmpeg + stop follow)
+```
+
+After `wait_with_watchdog` returns (either normally or via kill), the
+existing `cleanup_ffmpeg()` and `stop(signal_child=False)` chain runs
+unchanged.
+
+### Configuration
+
+| Key                    | Default | Description                                    |
+|:-----------------------|:--------|:-----------------------------------------------|
+| `stale_stream_timeout` | `300`   | Seconds of no output growth before killing     |
+
+Set in `config.json`. The check interval is fixed at 60 seconds, so the
+effective resolution is ±60s around the configured threshold.
+
+### Defence in Depth
+
+Two independent layers protect against hung ffmpeg:
+
+| Layer            | Where                       | Mechanism                                    |
+|:-----------------|:----------------------------|:---------------------------------------------|
+| ffmpeg timeouts  | `youtube-dl.config`         | `-rw_timeout` / `-timeout` (30s, µs units)   |
+| Output watchdog  | `Streamer.wait_with_watchdog` | `.part` file mtime staleness (default 300s)  |
+
+The ffmpeg timeouts address hangs where ffmpeg is blocked on a socket
+read/write. The output watchdog catches all other causes — including the
+`CLOSE_WAIT` bug where ffmpeg is not performing I/O at all.
