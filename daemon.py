@@ -21,6 +21,7 @@ class Daemon:
     logfile = "./configs/rb.log"
     
     def __init__( self ):
+        self.streamers_lock = threading.Lock()
         self.initLogger()
         self.init_config()
         self.init_signals()
@@ -89,18 +90,19 @@ class Daemon:
 
     def reload_config(self):
         new_config = Config.load_config()
-        new_streamers = {}
-        for index, name in enumerate(new_config["streamers"]):
-            if name in self.streamers:
-                new_streamers[ name ] = self.streamers[ name ]
-            else:
-                new_streamers[ name ] = Streamer( self, name )
-        removed = { name: s for name, s in self.streamers.items() if name not in new_streamers }
+        with self.streamers_lock:
+            new_streamers = {}
+            for index, name in enumerate(new_config["streamers"]):
+                if name in self.streamers:
+                    new_streamers[ name ] = self.streamers[ name ]
+                else:
+                    new_streamers[ name ] = Streamer( self, name )
+            removed = { name: s for name, s in self.streamers.items() if name not in new_streamers }
+            self.config = new_config
+            self.streamers = new_streamers
         for name, streamer in removed.items():
             self.logger.info("{} has been removed, stopping".format(name))
             streamer.stop()
-        self.config = new_config
-        self.streamers = new_streamers
 
     def start(self):
         self.daemonize()
@@ -120,25 +122,31 @@ class Daemon:
         self.start()
 
     def add_streamer( self, name, save_config = True, client_response = None ):
-        if name in self.streamers:
-            client_response.print("{} has already been added".format(name))
-        else:
+        with self.streamers_lock:
+            if name in self.streamers:
+                if client_response:
+                    client_response.print("{} has already been added".format(name))
+                return
+            self.streamers[ name ] = Streamer( self, name )
             self.config["streamers"].append(name)
-            if save_config and Config.save_config(self.config):
+        if save_config and Config.save_config(self.config):
+            if client_response:
                 client_response.print("{} has been added".format(name))
-            self.logger.info("Added {} to streamers.".format(name))
+        self.logger.info("Added {} to streamers.".format(name))
 
     def delete_streamer( self, name, save_config = True, client_response = None ):
-        if name not in self.streamers:
-            client_response.print("{} hasn't been added".format(name))
-        else:
-            self.streamers[ name ].stop()
-            del self.streamers[ name ]
+        with self.streamers_lock:
+            if name not in self.streamers:
+                client_response.print("{} hasn't been added".format(name))
+                return
+            streamer = self.streamers.pop(name)
             index = Config.find_in_config(name, self.config)
-            del self.config["streamers"][index]
-            if save_config and Config.save_config(self.config):
-                client_response.print("{} has been deleted".format(name))
-            self.logger.info("Deleted {} from streamers.".format(name))
+            if index is not None:
+                del self.config["streamers"][index]
+        streamer.stop()
+        if save_config and Config.save_config(self.config):
+            client_response.print("{} has been deleted".format(name))
+        self.logger.info("Deleted {} from streamers.".format(name))
 
     def import_streamers( self, path, client_response = None ):
         with open(path, "r") as f:
@@ -151,56 +159,64 @@ class Daemon:
     def export_streamers( self, path = None, client_response = None ):
         if path is None:
             path = self.config["default_export_location"]
+        with self.streamers_lock:
+            streamer_names = list(self.config["streamers"])
         with open(path, "w") as f:
-            for streamer in self.config["streamers"]:
-                f.write(streamer + "\n")
+            for name in streamer_names:
+                f.write(name + "\n")
         client_response.print("Wrote streamers to file")
 
     def list_streamers(self, client_response = None):
-        streamer_count = len(self.streamers)
+        with self.streamers_lock:
+            streamer_snapshot = dict(self.streamers)
+        streamer_count = len(streamer_snapshot)
         if streamer_count == 0:
             client_response.print('No streamers in recording list ({}).'.format(streamer_count))
         else:
             client_response.print("Streamers in recording list:\n")
             live_streamer_count = 0
-            for name in self.streamers:
-                streamer = self.streamers[name]
+            for name in streamer_snapshot:
+                streamer = streamer_snapshot[name]
                 if streamer.stream:
                     client_response.print('* ' + streamer.name)
                     ++live_streamer_count
             
             if live_streamer_count > 0 and live_streamer_count < streamer_count:
                 client_response.print("\n")
-            for name in self.streamers:
-                streamer = self.streamers[name]
+            for name in streamer_snapshot:
+                streamer = streamer_snapshot[name]
                 if not streamer.stream:
                     client_response.print('- ' + streamer.name)
 
     def list_streamers_online(self, client_response = None):
+        with self.streamers_lock:
+            streamer_snapshot = dict(self.streamers)
         at_least_one_streamer_live = False
-        for name in self.streamers:
-            if self.streamers[name].started:
+        for name in streamer_snapshot:
+            if streamer_snapshot[name].started:
                 at_least_one_streamer_live = True
 
         if not at_least_one_streamer_live:
-            client_response.print('No streamers in recording list ({}).'.format(len(self.streamers)))
+            client_response.print('No streamers in recording list ({}).'.format(len(streamer_snapshot)))
         else:
             client_response.print("Streamers currently online:\n")
             live_streamer_count = 0
-            for name in self.streamers:
-                streamer = self.streamers[name]
+            for name in streamer_snapshot:
+                streamer = streamer_snapshot[name]
                 if streamer.started:
                     client_response.print('* ' + streamer.name)
                     ++live_streamer_count
 
     def list_streamers_offline(self, client_response = None):
-        streamer_count = len(self.streamers)
+        with self.streamers_lock:
+            streamer_snapshot = dict(self.streamers)
+        streamer_count = len(streamer_snapshot)
         if streamer_count == 0:
             client_response.print('No streamers in recording list ({}).'.format(streamer_count))
         else:
             client_response.print("Streamers currently offline:\n")
-            for name in self.streamers:
-                streamer = self.streamers[name]
+            for name in streamer_snapshot:
+                streamer = streamer_snapshot[name]
                 if not streamer.stream:
                     client_response.print('- ' + streamer.name)
 
@@ -211,8 +227,9 @@ class Daemon:
                     if self.config is None or self.config["auto_reload_config"]:
                         self.reload_config()
 
-                    for name in self.streamers:
-                        streamer = self.streamers[name]
+                    with self.streamers_lock:
+                        streamer_snapshot = dict(self.streamers)
+                    for name, streamer in streamer_snapshot.items():
                         if not streamer.stream:
                             streamer.start()
                         if self.config["rate_limit_time"]:
@@ -228,8 +245,9 @@ class Daemon:
                     time.sleep(1)
 
             # loop ended, stop all recording
-            for name in self.streamers:
-                streamer = self.streamers[name]
+            with self.streamers_lock:
+                streamer_snapshot = dict(self.streamers)
+            for name, streamer in streamer_snapshot.items():
                 streamer.stop()
             
             self.logger.info("Successfully stopped.")

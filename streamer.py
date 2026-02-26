@@ -48,6 +48,7 @@ class Streamer:
 
             process_args = self.daemon.config["youtube-dl_cmd"].split(" ") + ["https://chaturbate.com/{}/".format(self.name), "--config-location", self.daemon.config["youtube-dl_config"]] 
             self.stream = subprocess.Popen( process_args, 0, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, preexec_fn=ignore_sigchld )
+            proc = self.stream
     
             try:
                 # poll in 1s intervals to detect early exit (e.g. streamer offline)
@@ -55,15 +56,15 @@ class Streamer:
                 if poll_wait_time is None:
                     poll_wait_time = 10
                 for _ in range(poll_wait_time):
-                    if not self.stream or self.stream.poll() is not None:
+                    if not self.stream or proc.poll() is not None:
                         break
                     time.sleep(1)
-                if self.stream and self.stream.poll() is None:
+                if self.stream and proc.poll() is None:
                     # self.daemon.logger.info("Stream for {} appears to be healthy - validating.".format(self.name))
-                    if self.ensure_valid_stream( ytdlp_pid = self.stream.pid ):
+                    if self.ensure_valid_stream( ytdlp_pid = proc.pid ):
                         self.daemon.logger.info("Started to record {}.".format(self.name))
                         self.started = True
-                        self.stream.wait()
+                        proc.wait()
                         self.cleanup_ffmpeg()
             except Exception:
                 self.daemon.logger.exception("stream_thread error for {}".format(self.name))
@@ -82,19 +83,20 @@ class Streamer:
             os.kill( ffmpeg_pid, signal.SIGTERM )
 
     def stop( self, signal_child = True ):
-        if self.stream:
+        stream = self.stream
+        if stream:
             if self.started:
                 self.started = False
                 if signal_child:
                     self.daemon.logger.info("Signaling {} to stop.".format(self.name))
-                    self.stream.send_signal(signal.SIGINT)
+                    stream.send_signal(signal.SIGINT)
                     try:
-                        self.stream.wait(timeout=10)
+                        stream.wait(timeout=10)
                     except subprocess.TimeoutExpired:
                         self.daemon.logger.info("SIGINT timeout for {}, escalating to SIGTERM.".format(self.name))
                 self.daemon.logger.info("Stopped {}.".format(self.name))
-            if self.stream.poll() is None:
-                self.stream.terminate()
-                self.stream.wait()
+            if stream.poll() is None:
+                stream.terminate()
+                stream.wait()
             self.stream = None
 
