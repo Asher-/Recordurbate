@@ -3,6 +3,7 @@
 import sys
 import time
 import socket
+import gc
 
 from zeroconf import ServiceInfo, Zeroconf, NonUniqueNameException
 
@@ -167,6 +168,7 @@ def upgrade():
     print("Starting new daemon...")
     global socket_client
     socket_client = None
+    gc.collect()
     daemon = Daemon()
     daemon.start()
 
