@@ -7,6 +7,7 @@ import threading
 from ipc.server import SocketServer
 
 from streamer import Streamer
+from pid import find_running_ytdlp
 import config as Config
 
 class Daemon:
@@ -17,6 +18,7 @@ class Daemon:
     logger = None
     ipc_client = None
     streamers = {}
+    _handoff = False
 
     logfile = "./configs/rb.log"
     
@@ -108,11 +110,41 @@ class Daemon:
         self.daemonize()
         self.run()
 
+    def adopt_existing( self ):
+        running = find_running_ytdlp()
+        if not running:
+            self.logger.info("No existing yt-dlp processes found to adopt.")
+            return
+        with self.streamers_lock:
+            streamer_snapshot = dict(self.streamers)
+        adopted = 0
+        for name, pid in running.items():
+            if name in streamer_snapshot:
+                streamer = streamer_snapshot[ name ]
+                if not streamer.stream:
+                    streamer.adopt( pid )
+                    adopted += 1
+                    self.logger.info("Adopting yt-dlp PID {} for {}.".format(pid, name))
+            else:
+                self.logger.info("Found yt-dlp PID {} for {} but streamer not in config, ignoring.".format(pid, name))
+        self.logger.info("Adopted {} existing streams.".format(adopted))
+
     def stop(self, client_response = None):
         if self.pid:
             self.logger.info("Caught stop signal, stopping")
             if client_response:
                 client_response.close() # Since we exit we have to do this here
+            self.pid = None
+            time.sleep(1)
+            sys.exit(0)
+
+    def handoff( self, client_response = None ):
+        if self.pid:
+            self.logger.info("Handoff requested, exiting without killing children")
+            self._handoff = True
+            if client_response:
+                client_response.print("Handoff initiated, daemon exiting.")
+                client_response.close()
             self.pid = None
             time.sleep(1)
             sys.exit(0)
@@ -222,6 +254,7 @@ class Daemon:
 
     def run(self):
         def daemon_run_loop():
+            self.adopt_existing()
             while self.pid:
                 try:
                     if self.config is None or self.config["auto_reload_config"]:
@@ -244,11 +277,14 @@ class Daemon:
                     self.logger.exception("loop error")
                     time.sleep(1)
 
-            # loop ended, stop all recording
-            with self.streamers_lock:
-                streamer_snapshot = dict(self.streamers)
-            for name, streamer in streamer_snapshot.items():
-                streamer.stop()
+            # loop ended
+            if not self._handoff:
+                with self.streamers_lock:
+                    streamer_snapshot = dict(self.streamers)
+                for name, streamer in streamer_snapshot.items():
+                    streamer.stop()
+            else:
+                self.logger.info("Handoff mode: leaving child processes running.")
             
             self.logger.info("Successfully stopped.")
         thread = threading.Thread(target=daemon_run_loop, args=())
@@ -260,6 +296,8 @@ class Daemon:
         match argv[0]:
             case "stop":
                 self.stop( client_response=client_response )
+            case "handoff":
+                self.handoff( client_response=client_response )
             case "restart":
                 self.restart( client_response=client_response )
             case "add":

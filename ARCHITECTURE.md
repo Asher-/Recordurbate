@@ -48,6 +48,12 @@
   - [Timing Improvements](#timing-improvements)
 - [Changes (Feb 25, 2026)](#changes-feb-25-2026)
   - [Stranded Sleeping Process Fixes](#stranded-sleeping-process-fixes)
+- [In-Place Upgrade (Handoff)](#in-place-upgrade-handoff)
+  - [Upgrade Lifecycle](#upgrade-lifecycle)
+  - [AdoptedProcess](#adoptedprocess)
+  - [New IPC Command](#new-ipc-command)
+  - [New CLI Command](#new-cli-command)
+  - [Files Changed](#files-changed)
 
 ---
 
@@ -570,6 +576,7 @@ Commands are space-delimited strings. The first token is the command name:
 | `list`               | `daemon.list_streamers()`   | List all streamers             |
 | `list online`        | `daemon.list_streamers_online()`  | List currently recording |
 | `list offline`       | `daemon.list_streamers_offline()` | List currently offline   |
+| `handoff`            | `daemon.handoff()`          | Exit without killing children  |
 | `import <path>`      | `daemon.import_streamers()` | Import streamers from file     |
 | `export <path>`      | `daemon.export_streamers()` | Export streamers to file       |
 
@@ -945,3 +952,99 @@ process exits.
   unsafe `del self.config` / `del self.streamers` pattern; replaced with
   direct assignment. Removed unnecessary `del self.streamers[name]` mutation
   inside the preservation loop.
+
+---
+
+## In-Place Upgrade (Handoff)
+
+The daemon supports in-place upgrades: a new daemon process takes over
+monitoring of existing yt-dlp subprocesses from the old daemon, allowing code
+updates without interrupting active recordings.
+
+### Upgrade Lifecycle
+
+```
+CLI: python cli.py upgrade
+  │
+  ├── 1. Send "handoff" command to running daemon via IPC
+  │
+  ├── 2. Old daemon receives "handoff":
+  │      ├── Sets _handoff = True
+  │      ├── Sets self.pid = None (stops run loop)
+  │      ├── Run loop exits WITHOUT calling streamer.stop()
+  │      ├── yt-dlp children are reparented to PID 1 (launchd)
+  │      └── Old daemon process exits
+  │
+  ├── 3. CLI polls Zeroconf until old service disappears (up to 15s)
+  │
+  ├── 4. CLI creates new Daemon() and calls daemon.start()
+  │      ├── Double-fork daemonization
+  │      └── Registers new Zeroconf service
+  │
+  └── 5. New daemon's run() calls adopt_existing():
+         ├── find_running_ytdlp() scans all processes for yt-dlp
+         │   with chaturbate.com URLs in their command lines
+         ├── For each match in the streamer config:
+         │   └── streamer.adopt(pid) wraps the PID in AdoptedProcess
+         │       and starts a monitoring thread
+         └── Unmatched yt-dlp processes are logged but ignored
+```
+
+### AdoptedProcess
+
+`AdoptedProcess` (in `pid.py`) wraps a bare PID with the same interface as
+`subprocess.Popen`, allowing `Streamer` to use either interchangeably:
+
+| Method          | Popen                        | AdoptedProcess                    |
+|:----------------|:-----------------------------|:----------------------------------|
+| `poll()`        | Checks child exit status     | `psutil.Process.status()`         |
+| `wait(timeout)` | `os.waitpid()` (child only)  | `psutil.Process.wait()` (any PID) |
+| `send_signal(s)`| `os.kill(self.pid, s)`       | `os.kill(self.pid, s)`            |
+| `terminate()`   | Sends SIGTERM                | Sends SIGTERM                     |
+
+`wait(timeout)` translates `psutil.TimeoutExpired` into
+`subprocess.TimeoutExpired` so `Streamer.stop()` exception handling works
+unchanged.
+
+### New IPC Command
+
+| Command   | Handler              | Description                                     |
+|:----------|:---------------------|:------------------------------------------------|
+| `handoff` | `daemon.handoff()`   | Exit daemon without killing child processes     |
+
+### New CLI Command
+
+```bash
+python cli.py upgrade
+```
+
+Performs a full in-place upgrade: handoff → wait → start. Active recordings
+continue uninterrupted through the new daemon.
+
+### Files Changed
+
+**`pid.py`**:
+
+- `AdoptedProcess` class — Popen-compatible wrapper using `psutil.Process`.
+- `find_running_ytdlp()` — scans system processes for yt-dlp with chaturbate
+  URLs, returns `{streamer_name: pid}` dict.
+
+**`streamer.py`**:
+
+- `adopt(pid)` — creates a daemon thread that wraps the PID in
+  `AdoptedProcess`, validates the stream, and blocks on `wait()` until the
+  yt-dlp process exits. On exit, cleans up ffmpeg and resets `self.stream`.
+
+**`daemon.py`**:
+
+- `_handoff` flag — when `True`, the run loop cleanup phase skips
+  `streamer.stop()`, leaving children running.
+- `handoff()` — sets `_handoff = True`, stops the run loop, exits.
+- `adopt_existing()` — called at the start of `run()`. Scans for running
+  yt-dlp processes and calls `streamer.adopt(pid)` for each match.
+- IPC dispatch — routes `"handoff"` to `daemon.handoff()`.
+
+**`cli.py`**:
+
+- `upgrade()` — sends `"handoff"` via IPC, polls Zeroconf until the old
+  service disappears, then starts a new daemon.

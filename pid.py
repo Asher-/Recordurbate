@@ -1,5 +1,7 @@
 import psutil
-import sys
+import subprocess
+import signal
+import re
 import os
 
 def process_active(pid: int or str) -> bool:
@@ -42,3 +44,59 @@ def get_pid_by_name_and_args(process_name, args_substring=None, exe_path=None):
             # Handle potential errors when accessing process info
             pass
     return None
+
+class AdoptedProcess:
+
+    def __init__( self, pid ):
+        self.pid = pid
+        self._process = psutil.Process( pid )
+        self._returncode = None
+
+    def poll( self ):
+        if self._returncode is not None:
+            return self._returncode
+        try:
+            status = self._process.status()
+            if status in (psutil.STATUS_DEAD, psutil.STATUS_ZOMBIE):
+                self._returncode = -1
+                return self._returncode
+            return None
+        except psutil.NoSuchProcess:
+            self._returncode = -1
+            return self._returncode
+
+    def wait( self, timeout=None ):
+        try:
+            self._process.wait( timeout=timeout )
+            self._returncode = -1
+            return self._returncode
+        except psutil.TimeoutExpired:
+            raise subprocess.TimeoutExpired( cmd="adopted_process", timeout=timeout )
+        except psutil.NoSuchProcess:
+            self._returncode = -1
+            return self._returncode
+
+    def send_signal( self, sig ):
+        os.kill( self.pid, sig )
+
+    def terminate( self ):
+        self.send_signal( signal.SIGTERM )
+
+def find_running_ytdlp():
+    results = {}
+    pattern = re.compile( r'chaturbate\.com/([^/]+)/' )
+    for process in psutil.process_iter(['pid', 'cmdline']):
+        try:
+            cmdline = process.info.get('cmdline')
+            if not cmdline:
+                continue
+            cmdline_str = ' '.join( cmdline )
+            if 'yt-dlp' not in cmdline_str and 'yt_dlp' not in cmdline_str:
+                continue
+            match = pattern.search( cmdline_str )
+            if match:
+                name = match.group(1)
+                results[ name ] = process.info['pid']
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+    return results

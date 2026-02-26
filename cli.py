@@ -124,7 +124,52 @@ def restart():
         print("Encountered unexpected extra arguments {}.".format(" ".join(sys.argv[2:])))      
         return      
     ipc( "restart" )
- 
+
+def upgrade():
+    if not check_num_args(2): 
+        print("Encountered unexpected extra arguments {}.".format(" ".join(sys.argv[2:])))
+        return
+    print("Sending handoff to running daemon...")
+    try:
+        ipc( "handoff" )
+    except Exception as e:
+        print("Failed to send handoff: {}".format(e))
+        sys.exit(1)
+    print("Waiting for old daemon to exit...")
+    max_wait = 15
+    for i in range(max_wait):
+        time.sleep(1)
+        try:
+            global host, ip, port
+            server_address = socket.inet_aton( ip )
+            info = ServiceInfo(
+                ZeroconfConfig.service_type,
+                f"{ZeroconfConfig.service_name}.{ZeroconfConfig.service_type}",
+                addresses=[ip],
+                port=0,
+                properties={},
+                server=host,
+            )
+            publish_zeroconf = Zeroconf()
+            try:
+                publish_zeroconf.register_service(info)
+                publish_zeroconf.unregister_service(info)
+                publish_zeroconf.close()
+                break
+            except NonUniqueNameException:
+                publish_zeroconf.close()
+                continue
+        except Exception:
+            break
+    else:
+        print("Old daemon did not exit within {}s.".format(max_wait))
+        sys.exit(1)
+    print("Starting new daemon...")
+    global socket_client
+    socket_client = None
+    daemon = Daemon()
+    daemon.start()
+
 #################### Usage ####################
 
 def ipc( command ):
@@ -138,7 +183,7 @@ def ipc( command ):
 def usage():
     padding = "       "
     print(  "\nUsage: Recordurbate [add | del] username" )
-    print( padding + "Recordurbate [start | stop | restart]" )
+    print( padding + "Recordurbate [start | stop | restart | upgrade]" )
     print( padding + "Recordurbate list" )
     print( padding + "Recordurbate import list.txt" )
     print( padding + "Recordurbate export [file location]\n" )
@@ -153,7 +198,8 @@ argument_map = {
     "export": export_streamers,
     "start": start, 
     "stop": stop, 
-    "restart": restart
+    "restart": restart,
+    "upgrade": upgrade
 }
 
 #################### __main__ ####################

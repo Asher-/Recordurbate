@@ -4,7 +4,7 @@ import time
 import os
 import signal
 
-from pid import process_active, get_pid_by_name_and_args
+from pid import process_active, get_pid_by_name_and_args, AdoptedProcess
 
 class Streamer:
   
@@ -72,6 +72,28 @@ class Streamer:
                 self.stop( signal_child=False )
             return
         thread = threading.Thread(target=stream_thread, args=())
+        thread.daemon = True
+        thread.start()
+        return thread
+
+    def adopt( self, pid ):
+        def adopted_thread():
+            self.stream = AdoptedProcess( pid )
+            try:
+                self.daemon.logger.info("Adopted existing yt-dlp (PID {}) for {}.".format(pid, self.name))
+                if self.ensure_valid_stream( ytdlp_pid=pid ):
+                    self.started = True
+                    self.daemon.logger.info("Adopted stream for {} validated.".format(self.name))
+                    self.stream.wait()
+                    self.cleanup_ffmpeg()
+                else:
+                    self.daemon.logger.info("Adopted stream for {} failed validation, will restart.".format(self.name))
+            except Exception:
+                self.daemon.logger.exception("adopted_thread error for {}".format(self.name))
+            finally:
+                self.stop( signal_child=False )
+            return
+        thread = threading.Thread(target=adopted_thread, args=())
         thread.daemon = True
         thread.start()
         return thread
