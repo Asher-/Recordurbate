@@ -5,9 +5,14 @@
 # Usage:
 #   ./service.sh enable   — install and load the launchd plist (runs at login)
 #   ./service.sh disable  — unload and remove the launchd plist
-#   ./service.sh start    — start the daemon now
-#   ./service.sh stop     — stop the daemon now
-#   ./service.sh status   — show whether the service is loaded and running
+#   ./service.sh status   — show whether the launchd service is loaded/running
+#   ./service.sh <cmd>    — any other command passes through to cli.py via venv
+#
+# Examples:
+#   ./service.sh start
+#   ./service.sh stop
+#   ./service.sh add username
+#   ./service.sh list online
 #
 
 set -euo pipefail
@@ -91,31 +96,6 @@ cmd_disable() {
     echo "Disabled: ${LABEL}"
 }
 
-cmd_start() {
-    if ! is_loaded; then
-        if [[ -f "$PLIST_DST" ]]; then
-            launchctl load "$PLIST_DST"
-        else
-            die "Service not enabled. Run './service.sh enable' first."
-        fi
-    fi
-    launchctl start "$LABEL"
-    echo "Started: ${LABEL}"
-}
-
-cmd_stop() {
-    if is_loaded; then
-        launchctl stop "$LABEL"
-        echo "Stopped: ${LABEL}"
-    else
-        # Fall back to IPC stop in case the daemon was started manually
-        echo "Service not loaded in launchd; sending IPC stop..."
-        cd "$PROJECT_DIR"
-        source ./venv/bin/activate
-        python cli.py stop
-    fi
-}
-
 cmd_status() {
     echo "Label:   ${LABEL}"
     echo "Plist:   ${PLIST_DST}"
@@ -139,16 +119,22 @@ cmd_status() {
     fi
 }
 
+# ── cli passthrough ──────────────────────────────────────────────────
+
+cmd_cli() {
+    cd "$PROJECT_DIR"
+    source ./venv/bin/activate
+    python cli.py "$@"
+}
+
 # ── main ─────────────────────────────────────────────────────────────
 
 case "${1:-}" in
     enable)  cmd_enable  ;;
     disable) cmd_disable ;;
-    start)   cmd_start   ;;
-    stop)    cmd_stop    ;;
     status)  cmd_status  ;;
     *)
-        echo "Usage: $0 {enable|disable|start|stop|status}"
-        exit 1
+        # Everything else passes through to cli.py via the venv
+        cmd_cli "$@"
         ;;
 esac
