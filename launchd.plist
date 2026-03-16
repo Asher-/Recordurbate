@@ -4,12 +4,12 @@
 <dict>
     <key>Label</key>
     <string>com.recordurbate.daemon</string>
-    
+
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
         <string>-c</string>
-        <string>cd /Users/asher/Movies/recordurbate && rm -f ./configs/rb.pid && source ./venv/bin/activate && ./Recordurbate start</string>
+        <string>cd "/Users/asher/Movies/Recordurbate" &amp;&amp; source ./venv/bin/activate &amp;&amp; python cli.py start</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -19,22 +19,15 @@
     <false/>
 
     <key>WorkingDirectory</key>
-    <string>/Users/asher/Movies/recordurbate</string>
+    <string>/Users/asher/Movies/Recordurbate</string>
 
     <key>StandardOutPath</key>
-    <string>/Users/asher/Movies/recordurbate/recordurbate.log</string>
+    <string>/Users/asher/Movies/Recordurbate/configs/launchd.stdout.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/asher/Movies/recordurbate/recordurbate.error.log</string>
+    <string>/Users/asher/Movies/Recordurbate/configs/launchd.stderr.log</string>
 
     <key>ThrottleInterval</key>
     <integer>30</integer>
-
-    <key>ExitTimeOut</key>
-    <array>
-        <string>/bin/bash</string>
-        <string>-c</string>
-        <string>cd /Users/asher/Movies/recordurbate && ./Recordurbate stop</string>
-    </array>
 </dict>
 </plist>

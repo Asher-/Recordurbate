@@ -66,7 +66,11 @@ class Daemon:
                     self.logger.debug("Parent PID = {}".format(os.getpid()))
                     self.pid = None
                     sys.exit(0)
-                
+
+                # Detach from the parent's session so launchd/shell
+                # cleanup signals don't reach the daemon.
+                os.setsid()
+
                 self.pid = os.fork()
                 if self.pid > 0:
                     self.logger.debug("Fork PID = {}".format(os.getpid()))
