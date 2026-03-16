@@ -112,7 +112,10 @@ class Daemon:
 
     def start(self):
         self.daemonize()
-        self.run()
+        thread = self.run()
+        # Block main thread on the run loop so Python finalization
+        # doesn't deadlock the GIL while the loop thread is still working.
+        thread.join()
 
     def adopt_existing( self ):
         running = find_running_ytdlp()
