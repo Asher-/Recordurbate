@@ -110,8 +110,9 @@ def start():
         publish_zeroconf.unregister_service(info)
         return True
     if ensure_service_not_started():
+        foreground = "--foreground" in sys.argv
         daemon = Daemon()
-        daemon.start()
+        daemon.start(foreground=foreground)
 
 def stop():
     if not check_num_args(2): 

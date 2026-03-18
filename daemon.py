@@ -110,11 +110,23 @@ class Daemon:
             self.logger.info("{} has been removed, stopping".format(name))
             streamer.stop()
 
-    def start(self):
-        self.daemonize()
+    def start(self, foreground=False):
+        if foreground:
+            self.start_foreground()
+        else:
+            self.daemonize()
+            thread = self.run()
+            # Block main thread on the run loop so Python finalization
+            # doesn't deadlock the GIL while the loop thread is still working.
+            thread.join()
+
+    def start_foreground(self):
+        """Run without daemonizing — for use under launchd or other supervisors."""
+        self.pid = os.getpid()
+        self.logger.info("Starting in foreground mode, pid: {}".format(self.pid))
+        self.ipc_client = SocketServer( daemon=self, hostname="localhost" )
+        self.ipc_client.start()
         thread = self.run()
-        # Block main thread on the run loop so Python finalization
-        # doesn't deadlock the GIL while the loop thread is still working.
         thread.join()
 
     def adopt_existing( self ):

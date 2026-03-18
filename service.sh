@@ -44,7 +44,7 @@ generate_plist() {
     <array>
         <string>/bin/bash</string>
         <string>-c</string>
-        <string>cd "${PROJECT_DIR}" &amp;&amp; source ./venv/bin/activate &amp;&amp; python cli.py start</string>
+        <string>cd "${PROJECT_DIR}" &amp;&amp; source ./venv/bin/activate &amp;&amp; python cli.py start --foreground</string>
     </array>
 
     <key>RunAtLoad</key>
