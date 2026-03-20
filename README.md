@@ -40,14 +40,12 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical breakdown
 
 ```bash
 brew install python ffmpeg
-pip3 install yt-dlp psutil zeroconf
 ```
 
 ### Linux
 
 ```bash
 sudo apt update && sudo apt install python3 ffmpeg
-pip3 install yt-dlp psutil zeroconf
 ```
 
 ## Installation
@@ -63,24 +61,73 @@ pip install yt-dlp psutil zeroconf
 Streams are saved to `videos/<streamer_name>/` by default. This can be changed
 in `configs/youtube-dl.config`.
 
-## Usage
+## Running Recordurbate
 
+There are two ways to invoke commands: **`service.sh`** (recommended) and
+**`cli.py`** (direct). Both accept the same commands — the difference is how
+they handle the Python virtual environment.
+
+### service.sh — recommended
+
+`service.sh` activates the venv transparently before dispatching to `cli.py`.
+No manual activation step, no risk of running against system Python. It also
+provides `enable`/`disable`/`status` commands for macOS launchd integration
+(see [macOS launchd](#macos-launchd) below).
+
+```bash
+./service.sh start                    # start the daemon
+./service.sh stop                     # stop the daemon
+./service.sh restart                  # restart the daemon
+./service.sh upgrade                  # in-place upgrade (preserves recordings)
+
+./service.sh add <username>           # add a streamer
+./service.sh del <username>           # remove a streamer (stops recording)
+
+./service.sh list                     # list all streamers (* = recording, - = offline)
+./service.sh list online              # list currently recording
+./service.sh list offline             # list currently offline
+
+./service.sh import <file>            # import streamer names from file (one per line)
+./service.sh export [file]            # export streamer names to file
+
+./service.sh help                     # show usage
 ```
-python cli.py start                   # start the daemon
-python cli.py stop                    # stop the daemon
-python cli.py restart                 # restart the daemon
 
-python cli.py add <username>          # add a streamer
-python cli.py del <username>          # remove a streamer (stops recording)
+### cli.py — direct
 
-python cli.py list                    # list all streamers (* = recording, - = offline)
-python cli.py list online             # list currently recording
-python cli.py list offline            # list currently offline
+`cli.py` is the Python entry point. It imports project dependencies (`psutil`,
+`zeroconf`) directly, so the virtual environment **must** be activated first:
 
-python cli.py import <file>           # import streamer names from file (one per line)
-python cli.py export [file]           # export streamer names to file
+```bash
+source venv/bin/activate
+python cli.py start
+python cli.py add <username>
+# etc. — same commands as service.sh
+```
 
-python cli.py help                    # show usage
+Use `cli.py` directly when you are already working inside the venv, or when
+`service.sh` is not available (e.g. on Linux without bash).
+
+### Foreground mode
+
+The `--foreground` flag prevents the daemon from double-forking. The process
+stays attached to the terminal instead of detaching into the background. This
+is used by launchd (which expects to supervise the process directly) but is
+also useful for debugging:
+
+```bash
+python cli.py start --foreground
+```
+
+### In-place upgrade
+
+The `upgrade` command performs a graceful handoff: the running daemon stops
+accepting new streams, hands its child process table to a new daemon instance,
+and exits. Active yt-dlp/ffmpeg recordings continue uninterrupted across the
+restart.
+
+```bash
+./service.sh upgrade
 ```
 
 ## Configuration
@@ -89,16 +136,17 @@ Two config files in the `configs/` directory:
 
 ### config.json
 
-| Key                      | Type     | Default                       | Description                                                                 |
-|:-------------------------|:---------|:------------------------------|:----------------------------------------------------------------------------|
-| `youtube-dl_cmd`         | `string` | `"yt-dlp"`                    | Command to invoke yt-dlp. Can be an absolute path.                          |
-| `youtube-dl_config`      | `string` | `"configs/youtube-dl.config"` | Path to yt-dlp config, passed via `--config-location`.                      |
-| `auto_reload_config`     | `bool`   | `true`                        | Reload config every loop iteration (60s). Allows live streamer list edits.  |
-| `rate_limit`             | `bool`   | `true`                        | Whether to rate-limit between launching streamers.                          |
-| `rate_limit_time`        | `number` | `0`                           | Seconds to sleep between streamer launches. `0` = no delay.                 |
-| `process_poll_wait_time` | `number` | `15`                          | Seconds to poll (1s intervals) after launching yt-dlp before validation.    |
-| `default_export_location`| `string` | `"./list.txt"`                | Default file path for the `export` command.                                 |
-| `streamers`              | `array`  | `[]`                          | Chaturbate usernames to record.                                             |
+| Key                       | Type     | Default                       | Description                                                                |
+| :------------------------ | :------- | :---------------------------- | :------------------------------------------------------------------------- |
+| `youtube-dl_cmd`          | `string` | `"yt-dlp"`                    | Command to invoke yt-dlp. Can be an absolute path.                         |
+| `youtube-dl_config`       | `string` | `"configs/youtube-dl.config"` | Path to yt-dlp config, passed via `--config-location`.                     |
+| `auto_reload_config`      | `bool`   | `true`                        | Reload config every loop iteration (60s). Allows live streamer list edits. |
+| `rate_limit`              | `bool`   | `true`                        | Whether to rate-limit between launching streamers.                         |
+| `rate_limit_time`         | `number` | `0`                           | Seconds to sleep between streamer launches. `0` = no delay.                |
+| `process_poll_wait_time`  | `number` | `15`                          | Seconds to poll (1s intervals) after launching yt-dlp before validation.   |
+| `stale_stream_timeout`    | `number` | `300`                         | Seconds of `.part` file inactivity before killing a stale stream.          |
+| `default_export_location` | `string` | `"./list.txt"`                | Default file path for the `export` command.                                |
+| `streamers`               | `array`  | `[]`                          | Chaturbate usernames to record.                                            |
 
 ### youtube-dl.config
 
@@ -140,19 +188,25 @@ Daemon log: `configs/rb.log`
 
 ## macOS launchd
 
-To run as a user agent that starts at login:
+`service.sh` can install Recordurbate as a macOS user agent that starts
+automatically at login:
 
 ```bash
-cp launchd.plist ~/Library/LaunchAgents/com.recordurbate.daemon.plist
-launchctl load ~/Library/LaunchAgents/com.recordurbate.daemon.plist
+./service.sh enable                   # generate plist, install, and load
+./service.sh disable                  # unload and remove
+./service.sh status                   # show loaded/running state and PID
 ```
 
-To remove:
+When enabled, launchd starts the daemon in foreground mode (`--foreground`) so
+it can supervise the process directly — the daemon skips the double-fork and
+launchd handles restart-on-crash (throttled to 30s intervals).
 
-```bash
-launchctl unload ~/Library/LaunchAgents/com.recordurbate.daemon.plist
-rm ~/Library/LaunchAgents/com.recordurbate.daemon.plist
-```
+Logs:
+- stdout: `configs/launchd.stdout.log`
+- stderr: `configs/launchd.stderr.log`
+
+The generated plist is installed to
+`~/Library/LaunchAgents/com.recordurbate.daemon.plist`.
 
 ## Notes
 
