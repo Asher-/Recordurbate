@@ -43,13 +43,14 @@ class Streamer:
     def start(self):
         def stream_thread():
 
-            def ignore_sigchld():
-                signal.signal(signal.SIGCHLD, signal.SIG_IGN)
-
-            process_args = self.daemon.config["youtube-dl_cmd"].split(" ") + ["https://chaturbate.com/{}/".format(self.name), "--config-location", self.daemon.config["youtube-dl_config"]] 
-            self.stream = subprocess.Popen( process_args, 0, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, preexec_fn=ignore_sigchld )
+            try:
+                process_args = self.daemon.config["youtube-dl_cmd"].split(" ") + ["https://chaturbate.com/{}/".format(self.name), "--config-location", self.daemon.config["youtube-dl_config"]]
+                self.stream = subprocess.Popen( process_args, 0, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True )
+            except OSError:
+                self.daemon.logger.exception("Failed to launch yt-dlp for {}".format(self.name))
+                return
             proc = self.stream
-    
+
             try:
                 # poll in 1s intervals to detect early exit (e.g. streamer offline)
                 poll_wait_time = self.daemon.config["process_poll_wait_time"]

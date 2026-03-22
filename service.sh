@@ -44,8 +44,14 @@ generate_plist() {
     <array>
         <string>/bin/bash</string>
         <string>-c</string>
-        <string>cd "${PROJECT_DIR}" &amp;&amp; source ./venv/bin/activate &amp;&amp; python cli.py start --foreground</string>
+        <string>cd "${PROJECT_DIR}" &amp;&amp; source ./venv/bin/activate &amp;&amp; exec python cli.py start --foreground</string>
     </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
 
     <key>RunAtLoad</key>
     <true/>
