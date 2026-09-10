@@ -114,7 +114,7 @@ cmd_status() {
         echo "Loaded:  yes"
         # Show PID if running
         local pid
-        pid=$(launchctl list "$LABEL" 2>/dev/null | awk 'NR==2{print $1}')
+        pid=$(launchctl list "$LABEL" 2>/dev/null | awk -F'[=;]' '/"PID"/{gsub(/ /,"",$2); print $2}')
         if [[ "$pid" =~ ^[0-9]+$ ]]; then
             echo "PID:     ${pid}"
         else
