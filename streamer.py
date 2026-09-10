@@ -45,7 +45,10 @@ class Streamer:
 
             try:
                 process_args = self.daemon.config["youtube-dl_cmd"].split(" ") + ["https://chaturbate.com/{}/".format(self.name), "--config-location", self.daemon.config["youtube-dl_config"]]
-                self.stream = subprocess.Popen( process_args, 0, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True )
+                with open( "./configs/capture-{}.log".format(self.name), "a" ) as capture_log:
+                    capture_log.write( "\n=== {} capture start {} ===\n".format(self.name, time.strftime("%Y-%m-%d %H:%M:%S")) )
+                    capture_log.flush()
+                    self.stream = subprocess.Popen( process_args, 0, stdout=capture_log, stderr=capture_log, start_new_session=True )
             except OSError:
                 self.daemon.logger.exception("Failed to launch yt-dlp for {}".format(self.name))
                 return
