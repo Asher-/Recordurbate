@@ -19,12 +19,13 @@ class FakeLogger:
         self.messages.append(msg)
 
 
-def make_daemon():
+def make_daemon(**overrides):
     config = {
         "youtube-dl_cmd": "yt-dlp",
         "youtube-dl_config": "youtube-dl.config",
         "process_poll_wait_time": 0,
     }
+    config.update(overrides)
     return types.SimpleNamespace(logger=FakeLogger(), config=config)
 
 
@@ -100,6 +101,22 @@ def test_missing_directory_does_not_raise(workdir):
     assert any("Failed to list" in m for m in daemon.logger.messages)
 
 
+def test_rename_failure_is_logged_and_part_kept(workdir, monkeypatch):
+    before = time.time()
+    part = write(workdir / "videos/alice/a.mp4.part", before - 600)
+    daemon = make_daemon()
+
+    def failing_rename(src, dst):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(streamer.os, "rename", failing_rename)
+    Streamer(daemon, "alice").finalize_prior_parts(before)
+
+    assert part.exists()
+    assert not (workdir / "videos/alice/a.mp4").exists()
+    assert any("Failed to rename" in m for m in daemon.logger.messages)
+
+
 # wiring into Streamer.start
 
 class FakeProc:
@@ -164,3 +181,97 @@ def test_failed_validation_renames_nothing(workdir, fake_launch, monkeypatch):
 
     assert old_part.exists()
     assert fake_launch.exists()
+
+
+# Streamer.start in isolation: finalize_prior_parts is faked so only start's own
+# routes are under test.
+
+class ExitedProc(FakeProc):
+    def __init__(self):
+        self.returncode = 0
+
+
+@pytest.fixture
+def start_harness(workdir, monkeypatch):
+    calls = {"popen_at": None, "finalize": [], "validated": 0}
+
+    def fake_popen(*args, **kwargs):
+        calls["popen_at"] = time.time()
+        return calls.get("proc_factory", FakeProc)()
+
+    def fake_finalize(self, before):
+        calls["finalize"].append(before)
+
+    (workdir / "configs").mkdir()
+    monkeypatch.setattr(streamer.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(Streamer, "wait_with_watchdog", lambda self, proc: None)
+    monkeypatch.setattr(Streamer, "cleanup_ffmpeg", lambda self: None)
+    monkeypatch.setattr(Streamer, "finalize_prior_parts", fake_finalize)
+    return calls
+
+
+def validation_returning(calls, result):
+    def ensure_valid_stream(self, **kwargs):
+        calls["validated"] += 1
+        return result
+    return ensure_valid_stream
+
+
+def test_start_finalizes_with_launch_time_taken_before_popen(start_harness, monkeypatch):
+    monkeypatch.setattr(Streamer, "ensure_valid_stream", validation_returning(start_harness, True))
+    daemon = make_daemon(process_poll_wait_time=1)
+
+    run_start(Streamer(daemon, "alice"))
+
+    assert start_harness["finalize"] == [start_harness["finalize"][0]]
+    assert start_harness["finalize"][0] <= start_harness["popen_at"]
+    assert any("Started to record alice." in m for m in daemon.logger.messages)
+
+
+def test_start_does_not_finalize_when_validation_fails(start_harness, monkeypatch):
+    monkeypatch.setattr(Streamer, "ensure_valid_stream", validation_returning(start_harness, False))
+
+    run_start(Streamer(make_daemon(), "alice"))
+
+    assert start_harness["validated"] == 1
+    assert start_harness["finalize"] == []
+
+
+def test_start_does_not_validate_when_ytdlp_exits_during_poll(start_harness, monkeypatch):
+    start_harness["proc_factory"] = ExitedProc
+    monkeypatch.setattr(Streamer, "ensure_valid_stream", validation_returning(start_harness, True))
+
+    run_start(Streamer(make_daemon(process_poll_wait_time=None), "alice"))
+
+    assert start_harness["validated"] == 0
+    assert start_harness["finalize"] == []
+
+
+def test_start_does_not_finalize_when_launch_fails(start_harness, monkeypatch):
+    def failing_popen(*args, **kwargs):
+        raise OSError("no yt-dlp")
+
+    monkeypatch.setattr(streamer.subprocess, "Popen", failing_popen)
+    monkeypatch.setattr(Streamer, "ensure_valid_stream", validation_returning(start_harness, True))
+    daemon = make_daemon()
+
+    run_start(Streamer(daemon, "alice"))
+
+    assert start_harness["validated"] == 0
+    assert start_harness["finalize"] == []
+    assert any("Failed to launch yt-dlp for alice" in m for m in daemon.logger.messages)
+
+
+def test_start_logs_and_stops_when_validation_raises(start_harness, monkeypatch):
+    def exploding_validation(self, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(Streamer, "ensure_valid_stream", exploding_validation)
+    daemon = make_daemon()
+    s = Streamer(daemon, "alice")
+
+    run_start(s)
+
+    assert start_harness["finalize"] == []
+    assert s.stream is None
+    assert any("stream_thread error for alice" in m for m in daemon.logger.messages)
