@@ -272,8 +272,10 @@ The `Streamer` class manages a single streamer's yt-dlp process.
    exits.
 3. If the process is still alive, calls `ensure_valid_stream()` to verify both
    yt-dlp and ffmpeg are running.
-4. If valid, sets `started = True` and blocks on `self.stream.wait()` until the
-   stream ends.
+4. If valid, calls `finalize_prior_parts()` to strip `.part` from this
+   streamer's files last written before yt-dlp was launched (leftovers of
+   earlier recordings that were never finalized), then sets `started = True`
+   and blocks on `self.stream.wait()` until the stream ends.
 5. On exit, calls `cleanup_ffmpeg()` to kill any orphaned ffmpeg, then
    `stop(signal_child=False)`.
 
@@ -482,6 +484,7 @@ to finish (which only happens when `self.pid` is set to `None`).
                     │        ├─ yt-dlp dead, ffmpeg alive → kill  │
                     │        └─ both dead → False                 │
                     │  4. If valid:                               │
+                    │     ├─ finalize_prior_parts()               │
                     │     ├─ started = True                       │
                     │     ├─ stream.wait() (blocks until end)     │
                     │     └─ cleanup_ffmpeg()                     │

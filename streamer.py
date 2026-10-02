@@ -48,6 +48,7 @@ class Streamer:
                 with open( "./configs/capture-{}.log".format(self.name), "a" ) as capture_log:
                     capture_log.write( "\n=== {} capture start {} ===\n".format(self.name, time.strftime("%Y-%m-%d %H:%M:%S")) )
                     capture_log.flush()
+                    launched_at = time.time()
                     self.stream = subprocess.Popen( process_args, 0, stdout=capture_log, stderr=capture_log, start_new_session=True )
             except OSError:
                 self.daemon.logger.exception("Failed to launch yt-dlp for {}".format(self.name))
@@ -67,6 +68,7 @@ class Streamer:
                     # self.daemon.logger.info("Stream for {} appears to be healthy - validating.".format(self.name))
                     if self.ensure_valid_stream( ytdlp_pid = proc.pid ):
                         self.daemon.logger.info("Started to record {}.".format(self.name))
+                        self.finalize_prior_parts( launched_at )
                         self.started = True
                         self.wait_with_watchdog( proc )
                         self.cleanup_ffmpeg()
@@ -143,6 +145,31 @@ class Streamer:
         if ffmpeg_pid:
             self.daemon.logger.info("Killing orphaned ffmpeg (PID {}) for {}".format(ffmpeg_pid, self.name))
             os.kill( ffmpeg_pid, signal.SIGTERM )
+
+    def finalize_prior_parts( self, before ):
+        # Any .part last written before this recording launched belongs to an
+        # earlier stream that yt-dlp never finalized.
+        video_dir = os.path.join("videos", self.name)
+        try:
+            names = os.listdir(video_dir)
+        except OSError:
+            self.daemon.logger.exception("Failed to list {}".format(video_dir))
+            return
+        for part_name in names:
+            if not part_name.endswith('.part'):
+                continue
+            part_path = os.path.join(video_dir, part_name)
+            target_path = part_path[:-len('.part')]
+            try:
+                if os.path.getmtime(part_path) >= before:
+                    continue
+                if os.path.exists(target_path):
+                    self.daemon.logger.info("Not renaming {}: {} already exists.".format(part_path, target_path))
+                    continue
+                os.rename(part_path, target_path)
+                self.daemon.logger.info("Renamed {} -> {}".format(part_path, target_path))
+            except OSError:
+                self.daemon.logger.exception("Failed to rename {}".format(part_path))
 
     def stop( self, signal_child = True ):
         stream = self.stream
