@@ -183,6 +183,16 @@ decide whether to call `start()`, while the streamer thread writes to
 
 Entry point. Invoked as `python cli.py <command> [args]`.
 
+**Interpreter**: before its third-party imports, `cli.py` compares
+`realpath(sys.prefix)` with `realpath(venv/)` beside it. When they differ and
+`venv/bin/python` exists, it calls `os.execv(venv/bin/python, ...)` with the same
+arguments, so `./cli.py` runs under the project venv without activation.
+
+**Flow for `enable`, `disable`, `status`**: `service()` runs `service.sh <command>`
+from the directory containing `cli.py` and exits with its return code;
+`service.sh` implements the launchd management (see
+[launchd Integration](#launchd-integration)).
+
 **Flow for `start`**:
 
 1. Attempts to register a Zeroconf service to check if the daemon is already
@@ -679,9 +689,11 @@ dispatching to `cli.py`. It also provides `enable`/`disable`/`status` commands
 for managing the macOS launchd service. Use this for day-to-day operation.
 
 **`cli.py`** is the Python entry point. It imports project dependencies
-(`psutil`, `zeroconf`) directly, so the virtual environment **must** be
-activated before invocation (`source venv/bin/activate`). Use this when you are
-already working inside the venv or on systems where `service.sh` is not
+(`psutil`, `zeroconf`) directly, so when launched with any interpreter other
+than `venv/bin/python` it re-execs itself under `venv/bin/python` first; no
+activation is needed. `./cli.py enable`, `./cli.py disable` and
+`./cli.py status` run `service.sh` with the same subcommand. Use this when you
+are already working inside the venv or on systems where `service.sh` is not
 available.
 
 All examples in this section use `cli.py` for clarity (the direct Python
@@ -692,7 +704,7 @@ identically for any command shown.
 
 ```bash
 ./service.sh start          # recommended (handles venv)
-python cli.py start         # direct (requires venv activation)
+python cli.py start         # direct (re-execs under venv)
 ```
 
 The process double-forks and returns immediately. The daemon runs in the

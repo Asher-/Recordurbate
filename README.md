@@ -96,14 +96,18 @@ provides `enable`/`disable`/`status` commands for macOS launchd integration
 ### cli.py — direct
 
 `cli.py` is the Python entry point. It imports project dependencies (`psutil`,
-`zeroconf`) directly, so the virtual environment **must** be activated first:
+`zeroconf`) directly, so when it is launched with any interpreter other than the
+project's `venv/bin/python` it re-execs itself under `venv/bin/python` first. No
+activation step is needed:
 
 ```bash
-source venv/bin/activate
-python cli.py start
-python cli.py add <username>
+./cli.py start
+./cli.py add <username>
 # etc. — same commands as service.sh
 ```
+
+`./cli.py enable`, `./cli.py disable` and `./cli.py status` run `service.sh`
+with the same subcommand (see [macOS launchd](#macos-launchd) below).
 
 Use `cli.py` directly when you are already working inside the venv, or when
 `service.sh` is not available (e.g. on Linux without bash).
