@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 
+import os
 import sys
 import time
 import socket
 import gc
+import subprocess
+
+# Re-run under the project's venv when launched with any other interpreter.
+venv_dir = os.path.join( os.path.dirname( os.path.abspath(__file__) ), "venv" )
+if os.path.realpath( sys.prefix ) != os.path.realpath( venv_dir ) and os.path.exists( os.path.join( venv_dir, "bin", "python" ) ):
+    venv_python = os.path.join( venv_dir, "bin", "python" )
+    os.execv( venv_python, [venv_python, os.path.abspath(__file__)] + sys.argv[1:] )
 
 from zeroconf import ServiceInfo, Zeroconf, NonUniqueNameException
 
@@ -173,6 +181,13 @@ def upgrade():
     daemon = Daemon()
     daemon.start()
 
+#################### Service ####################
+
+def service():
+    # enable / disable / status are launchd management, implemented by service.sh
+    script = os.path.join( os.path.dirname( os.path.abspath(__file__) ), "service.sh" )
+    sys.exit( subprocess.call( [script, sys.argv[1]] ) )
+
 #################### Usage ####################
 
 def ipc( command ):
@@ -187,6 +202,7 @@ def usage():
     padding = "       "
     print(  "\nUsage: Recordurbate [add | del] username" )
     print( padding + "Recordurbate [start | stop | restart | upgrade]" )
+    print( padding + "Recordurbate [enable | disable | status]" )
     print( padding + "Recordurbate list" )
     print( padding + "Recordurbate import list.txt" )
     print( padding + "Recordurbate export [file location]\n" )
@@ -202,7 +218,10 @@ argument_map = {
     "start": start, 
     "stop": stop, 
     "restart": restart,
-    "upgrade": upgrade
+    "upgrade": upgrade,
+    "enable": service,
+    "disable": service,
+    "status": service
 }
 
 #################### __main__ ####################
