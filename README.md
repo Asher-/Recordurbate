@@ -109,8 +109,8 @@ activation step is needed:
 `./cli.py enable`, `./cli.py disable` and `./cli.py status` run `service.sh`
 with the same subcommand (see [macOS launchd](#macos-launchd) below).
 
-Use `cli.py` directly when you are already working inside the venv, or when
-`service.sh` is not available (e.g. on Linux without bash).
+Use `cli.py` directly from any shell, with or without the venv activated, or
+when `service.sh` is not available (e.g. on Linux without bash).
 
 ### Foreground mode
 

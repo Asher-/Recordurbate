@@ -692,9 +692,9 @@ for managing the macOS launchd service. Use this for day-to-day operation.
 (`psutil`, `zeroconf`) directly, so when launched with any interpreter other
 than `venv/bin/python` it re-execs itself under `venv/bin/python` first; no
 activation is needed. `./cli.py enable`, `./cli.py disable` and
-`./cli.py status` run `service.sh` with the same subcommand. Use this when you
-are already working inside the venv or on systems where `service.sh` is not
-available.
+`./cli.py status` run `service.sh` with the same subcommand. Use this from any
+shell, with or without the venv activated, or on systems where `service.sh` is
+not available.
 
 All examples in this section use `cli.py` for clarity (the direct Python
 interface is what ARCHITECTURE.md documents), but `./service.sh <cmd>` works
