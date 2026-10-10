@@ -98,6 +98,40 @@ def test_enable_logs_outside_project_and_status_reports_last_exit(tmp_path, pyth
         subprocess.run([str(script), "disable"], env=env, capture_output=True)
 
 
+def poll_status(script, env, line):
+    # launchd runs the job asynchronously, so wait for status to report its exit
+    status = ""
+    deadline = time.monotonic() + LAUNCHD_DEADLINE_SECONDS
+    while line + "\n" not in status and time.monotonic() < deadline:
+        time.sleep(0.2)
+        status = subprocess.run([str(script), "status"], env=env, capture_output=True, text=True).stdout
+    return status
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="service.sh manages launchd")
+def test_enable_reloads_loaded_job_from_regenerated_plist(tmp_path):
+    label = "com.recordurbate.test-" + uuid.uuid4().hex
+    first = install_service_copy(tmp_path / "first", label, "exit 3")
+    second = install_service_copy(tmp_path / "second", label, "exit 4")
+    home = tmp_path / "home"
+    env = dict(os.environ, HOME=str(home))
+    try:
+        subprocess.run([str(first), "enable"], env=env, check=True, capture_output=True)
+        assert "Exited:  3\n" in poll_status(first, env, "Exited:  3")
+
+        # The job is loaded now, so this enable takes the reload route; only the
+        # second project's job exits 4
+        subprocess.run([str(second), "enable"], env=env, check=True, capture_output=True)
+        status = poll_status(second, env, "Exited:  4")
+
+        with open(home / "Library" / "LaunchAgents" / (label + ".plist"), "rb") as plist_file:
+            plist = plistlib.load(plist_file)
+        assert plist["WorkingDirectory"] == str(tmp_path / "second" / "project")
+        assert "Exited:  4\n" in status
+    finally:
+        subprocess.run([str(second), "disable"], env=env, capture_output=True)
+
+
 # usage
 
 def test_usage_lists_service_commands(capsys):
