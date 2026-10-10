@@ -22,7 +22,7 @@ PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PLIST_SRC="${PROJECT_DIR}/launchd.plist"
 PLIST_DST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
 # launchd opens its log files itself before the daemon runs, and fails the job
-# (exit 78) when it may not; it may not open them inside the project.
+# (exit 78) when it may not; it was refused configs/launchd.stdout.log.
 LOG_DIR="${HOME}/Library/Logs/Recordurbate"
 VENV_PYTHON="${PROJECT_DIR}/venv/bin/python"
 
