@@ -198,7 +198,7 @@ automatically at login:
 ```bash
 ./service.sh enable                   # generate plist, install, and load
 ./service.sh disable                  # unload and remove
-./service.sh status                   # show loaded/running state and PID
+./service.sh status                   # show loaded/running state, PID and last exit
 ```
 
 When enabled, launchd starts the daemon in foreground mode (`--foreground`) so
@@ -206,8 +206,8 @@ it can supervise the process directly — the daemon skips the double-fork and
 launchd handles restart-on-crash (throttled to 30s intervals).
 
 Logs:
-- stdout: `configs/launchd.stdout.log`
-- stderr: `configs/launchd.stderr.log`
+- stdout: `~/Library/Logs/Recordurbate/launchd.stdout.log`
+- stderr: `~/Library/Logs/Recordurbate/launchd.stderr.log`
 
 The generated plist is installed to
 `~/Library/LaunchAgents/com.recordurbate.daemon.plist`.

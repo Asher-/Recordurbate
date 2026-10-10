@@ -790,11 +790,11 @@ sample <PID> 1
 
 ### Log Files
 
-| File                         | Contents                                       |
-| :--------------------------- | :--------------------------------------------- |
-| `configs/rb.log`             | Daemon log (start/stop, stream events, errors) |
-| `configs/launchd.stdout.log` | stdout from launchd (if using plist)           |
-| `configs/launchd.stderr.log` | stderr from launchd (if using plist)           |
+| File                                             | Contents                                       |
+| :----------------------------------------------- | :--------------------------------------------- |
+| `configs/rb.log`                                 | Daemon log (start/stop, stream events, errors) |
+| `~/Library/Logs/Recordurbate/launchd.stdout.log` | stdout from launchd (if using plist)           |
+| `~/Library/Logs/Recordurbate/launchd.stderr.log` | stderr from launchd (if using plist)           |
 
 Log format: `[timestamp filename:line - function()] - message`
 
@@ -805,7 +805,7 @@ Log format: `[timestamp filename:line - function()] - message`
 ```bash
 ./service.sh enable       # generate plist, install to ~/Library/LaunchAgents/, load
 ./service.sh disable      # unload and remove
-./service.sh status       # show loaded/running state and PID
+./service.sh status       # show loaded/running state, PID and last exit
 ```
 
 `enable` generates `launchd.plist` from the current project directory (so paths
@@ -820,7 +820,8 @@ supervises the process directly — no double-fork. This means:
   `ThrottleInterval: 30` ensures a 30s delay if the process exits and is
   restarted manually.
 - `RunAtLoad: true` — the daemon starts automatically at login.
-- Logs go to `configs/launchd.stdout.log` and `configs/launchd.stderr.log`.
+- Logs go to `~/Library/Logs/Recordurbate/launchd.stdout.log` and
+  `~/Library/Logs/Recordurbate/launchd.stderr.log`.
 
 ---
 
