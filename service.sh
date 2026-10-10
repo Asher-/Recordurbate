@@ -122,15 +122,16 @@ cmd_status() {
             echo "PID:     ${pid}"
         else
             echo "PID:     (not running)"
-        fi
-        # Show how the last run ended; launchd reports it as a wait status
-        local status
-        status=$(launchctl list "$LABEL" 2>/dev/null | awk -F'[=;]' '/"LastExitStatus"/{gsub(/ /,"",$2); print $2}')
-        if [[ "$status" =~ ^[0-9]+$ ]]; then
-            if (( status & 0x7f )); then
-                echo "Exited:  signal $(( status & 0x7f ))"
-            else
-                echo "Exited:  $(( status >> 8 ))"
+            # Show how the last run ended; launchd reports it as a wait status,
+            # and reports 0 for a job still on its first run, so only here
+            local status
+            status=$(launchctl list "$LABEL" 2>/dev/null | awk -F'[=;]' '/"LastExitStatus"/{gsub(/ /,"",$2); print $2}')
+            if [[ "$status" =~ ^[0-9]+$ ]]; then
+                if (( status & 0x7f )); then
+                    echo "Exited:  signal $(( status & 0x7f ))"
+                else
+                    echo "Exited:  $(( status >> 8 ))"
+                fi
             fi
         fi
     else

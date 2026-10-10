@@ -132,6 +132,85 @@ def test_enable_reloads_loaded_job_from_regenerated_plist(tmp_path):
         subprocess.run([str(second), "disable"], env=env, capture_output=True)
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="service.sh manages launchd")
+def test_enable_without_venv_python_installs_nothing(tmp_path):
+    label = "com.recordurbate.test-" + uuid.uuid4().hex
+    script = install_service_copy(tmp_path, label, "exit 3")
+    venv_python = tmp_path / "project" / "venv" / "bin" / "python"
+    venv_python.unlink()
+    home = tmp_path / "home"
+    env = dict(os.environ, HOME=str(home))
+    try:
+        result = subprocess.run([str(script), "enable"], env=env, capture_output=True, text=True)
+
+        assert result.returncode == 1
+        assert result.stderr == "error: venv not found at {}\n".format(venv_python)
+        assert not (home / "Library" / "LaunchAgents" / (label + ".plist")).exists()
+        assert subprocess.run(["launchctl", "list", label], capture_output=True).returncode != 0
+    finally:
+        subprocess.run([str(script), "disable"], env=env, capture_output=True)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="service.sh manages launchd")
+def test_status_of_job_never_enabled(tmp_path):
+    label = "com.recordurbate.test-" + uuid.uuid4().hex
+    script = install_service_copy(tmp_path, label, "exit 3")
+    home = tmp_path / "home"
+    env = dict(os.environ, HOME=str(home))
+
+    result = subprocess.run([str(script), "status"], env=env, capture_output=True, text=True)
+
+    plist_path = home / "Library" / "LaunchAgents" / (label + ".plist")
+    assert result.stdout == "Label:   {}\nPlist:   {}\nEnabled: no\nLoaded:  no\n".format(label, plist_path)
+
+
+def running_pid_lines(status):
+    return [line for line in status.splitlines() if line.startswith("PID:     ") and line[9:].isdigit()]
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="service.sh manages launchd")
+def test_status_reports_pid_while_job_runs(tmp_path):
+    label = "com.recordurbate.test-" + uuid.uuid4().hex
+    script = install_service_copy(tmp_path, label, "exec sleep 60")
+    env = dict(os.environ, HOME=str(tmp_path / "home"))
+    try:
+        subprocess.run([str(script), "enable"], env=env, check=True, capture_output=True)
+        status = ""
+        deadline = time.monotonic() + LAUNCHD_DEADLINE_SECONDS
+        while not running_pid_lines(status) and time.monotonic() < deadline:
+            time.sleep(0.2)
+            status = subprocess.run([str(script), "status"], env=env, capture_output=True, text=True).stdout
+
+        assert running_pid_lines(status)
+        assert "Exited:" not in status
+    finally:
+        subprocess.run([str(script), "disable"], env=env, capture_output=True)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="service.sh manages launchd")
+def test_disable_unloads_job_and_removes_plist(tmp_path):
+    label = "com.recordurbate.test-" + uuid.uuid4().hex
+    script = install_service_copy(tmp_path, label, "exit 3")
+    home = tmp_path / "home"
+    env = dict(os.environ, HOME=str(home))
+    try:
+        subprocess.run([str(script), "enable"], env=env, check=True, capture_output=True)
+        assert "Exited:  3\n" in poll_status(script, env, "Exited:  3")
+
+        loaded = subprocess.run([str(script), "disable"], env=env, capture_output=True, text=True)
+        status = subprocess.run([str(script), "status"], env=env, capture_output=True, text=True).stdout
+        # The job is unloaded now, so this disable takes the not-loaded route
+        not_loaded = subprocess.run([str(script), "disable"], env=env, capture_output=True, text=True)
+
+        assert loaded.stdout == "Disabled: {}\n".format(label)
+        assert "Enabled: no\nLoaded:  no\n" in status
+        assert not_loaded.returncode == 0
+        assert not_loaded.stdout == "Disabled: {}\n".format(label)
+        assert not (home / "Library" / "LaunchAgents" / (label + ".plist")).exists()
+    finally:
+        subprocess.run([str(script), "disable"], env=env, capture_output=True)
+
+
 # usage
 
 def test_usage_lists_service_commands(capsys):
