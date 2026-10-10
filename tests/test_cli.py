@@ -1,6 +1,9 @@
 import os
+import plistlib
 import subprocess
 import sys
+import time
+import uuid
 
 import pytest
 
@@ -46,6 +49,53 @@ def test_status_through_cli_matches_service_sh():
     assert direct.stdout.startswith("Label:   com.recordurbate.daemon\n")
     assert via_cli.stdout == direct.stdout
     assert via_cli.returncode == direct.returncode
+
+
+LAUNCHD_DEADLINE_SECONDS = 30
+
+
+def install_service_copy(tmp_path, label, python_body):
+    # The real service.sh in a project of its own, under a launchd label of its own
+    bin_dir = tmp_path / "project" / "venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    with open(os.path.join(REPO, "service.sh")) as source_file:
+        source = source_file.read()
+    script = tmp_path / "project" / "service.sh"
+    script.write_text(source.replace('LABEL="com.recordurbate.daemon"', 'LABEL="{}"'.format(label), 1))
+    script.chmod(0o755)
+    # Never let a copy reach the real com.recordurbate.daemon job
+    assert 'LABEL="{}"'.format(label) in script.read_text()
+    (bin_dir / "activate").write_text('PATH="{}:$PATH"\n'.format(bin_dir))
+    python = bin_dir / "python"
+    python.write_text("#!/bin/bash\n" + python_body + "\n")
+    python.chmod(0o755)
+    return script
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="service.sh manages launchd")
+@pytest.mark.parametrize("python_body, exited", [("exit 3", "Exited:  3"), ("kill -TERM $$", "Exited:  signal 15")])
+def test_enable_logs_outside_project_and_status_reports_last_exit(tmp_path, python_body, exited):
+    label = "com.recordurbate.test-" + uuid.uuid4().hex
+    script = install_service_copy(tmp_path, label, python_body)
+    home = tmp_path / "home"
+    log_dir = home / "Library" / "Logs" / "Recordurbate"
+    env = dict(os.environ, HOME=str(home))
+    try:
+        subprocess.run([str(script), "enable"], env=env, check=True, capture_output=True)
+        status = ""
+        deadline = time.monotonic() + LAUNCHD_DEADLINE_SECONDS
+        while exited + "\n" not in status and time.monotonic() < deadline:
+            time.sleep(0.2)
+            status = subprocess.run([str(script), "status"], env=env, capture_output=True, text=True).stdout
+
+        with open(home / "Library" / "LaunchAgents" / (label + ".plist"), "rb") as plist_file:
+            plist = plistlib.load(plist_file)
+        assert plist["StandardOutPath"] == str(log_dir / "launchd.stdout.log")
+        assert plist["StandardErrorPath"] == str(log_dir / "launchd.stderr.log")
+        assert (log_dir / "launchd.stdout.log").exists()
+        assert exited + "\n" in status
+    finally:
+        subprocess.run([str(script), "disable"], env=env, capture_output=True)
 
 
 # usage

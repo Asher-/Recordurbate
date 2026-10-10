@@ -21,6 +21,9 @@ LABEL="com.recordurbate.daemon"
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PLIST_SRC="${PROJECT_DIR}/launchd.plist"
 PLIST_DST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
+# launchd opens its log files itself before the daemon runs, and fails the job
+# (exit 78) when it may not; it may not open them inside the project.
+LOG_DIR="${HOME}/Library/Logs/Recordurbate"
 VENV_PYTHON="${PROJECT_DIR}/venv/bin/python"
 
 # ── helpers ──────────────────────────────────────────────────────────
@@ -63,10 +66,10 @@ generate_plist() {
     <string>${PROJECT_DIR}</string>
 
     <key>StandardOutPath</key>
-    <string>${PROJECT_DIR}/configs/launchd.stdout.log</string>
+    <string>${LOG_DIR}/launchd.stdout.log</string>
 
     <key>StandardErrorPath</key>
-    <string>${PROJECT_DIR}/configs/launchd.stderr.log</string>
+    <string>${LOG_DIR}/launchd.stderr.log</string>
 
     <key>ThrottleInterval</key>
     <integer>30</integer>
@@ -81,7 +84,7 @@ cmd_enable() {
     [[ -x "$VENV_PYTHON" ]] || die "venv not found at ${VENV_PYTHON}"
 
     generate_plist
-    mkdir -p "$(dirname "$PLIST_DST")"
+    mkdir -p "$(dirname "$PLIST_DST")" "$LOG_DIR"
     cp "$PLIST_SRC" "$PLIST_DST"
 
     if is_loaded; then
@@ -119,6 +122,16 @@ cmd_status() {
             echo "PID:     ${pid}"
         else
             echo "PID:     (not running)"
+        fi
+        # Show how the last run ended; launchd reports it as a wait status
+        local status
+        status=$(launchctl list "$LABEL" 2>/dev/null | awk -F'[=;]' '/"LastExitStatus"/{gsub(/ /,"",$2); print $2}')
+        if [[ "$status" =~ ^[0-9]+$ ]]; then
+            if (( status & 0x7f )); then
+                echo "Exited:  signal $(( status & 0x7f ))"
+            else
+                echo "Exited:  $(( status >> 8 ))"
+            fi
         fi
     else
         echo "Loaded:  no"

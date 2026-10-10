@@ -28,10 +28,10 @@
     <string>/Users/asher/Movies/Recordurbate</string>
 
     <key>StandardOutPath</key>
-    <string>/Users/asher/Movies/Recordurbate/configs/launchd.stdout.log</string>
+    <string>/Users/asher/Library/Logs/Recordurbate/launchd.stdout.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/asher/Movies/Recordurbate/configs/launchd.stderr.log</string>
+    <string>/Users/asher/Library/Logs/Recordurbate/launchd.stderr.log</string>
 
     <key>ThrottleInterval</key>
     <integer>30</integer>
