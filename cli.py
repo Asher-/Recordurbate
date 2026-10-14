@@ -42,18 +42,12 @@ def check_num_args(min, max = None):
 #################### Daemon ####################
 
 def discover_port():
-    discover = DiscoverPort( "Recordurbate" )
-    discover.start()
-    timeout = 0
-    while ( discover.port is None and timeout < port_timeout ):
-        time.sleep(1)
-        timeout += 1
-    if discover.port is None:
+    discovered = DiscoverPort( ZeroconfConfig.service_name ).discover( port_timeout )
+    if discovered is None:
         raise ValueError("Unable to discover port.")
     else:
         global port
-        port = discover.port
-    discover.stop()
+        port = discovered
 
 #################### Add / Remove ####################
 

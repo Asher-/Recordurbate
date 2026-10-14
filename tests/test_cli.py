@@ -19,6 +19,9 @@ if os.path.exists(os.path.join(VENV, "bin", "python")) and os.path.realpath(sys.
     pytest.skip("run the suite with " + os.path.join(VENV, "bin", "python"), allow_module_level=True)
 
 import cli
+import zeroconf._engine as zeroconf_engine
+from ipc.zeroconf_config import ZeroconfConfig
+from zeroconf import ServiceInfo, Zeroconf
 
 
 # service
@@ -283,3 +286,36 @@ def test_other_interpreter_reexecs_under_project_venv():
 
     assert result.returncode == 0, result.stderr
     assert USAGE_LINE in result.stdout
+
+
+# discovery
+
+DISCOVERY_BLACKOUT_SECONDS = 6
+
+
+def test_discover_port_outlasts_lost_answers(monkeypatch):
+    # The service is advertised throughout, but every answer reaching the CLI in
+    # its first seconds is lost, as on a network blip
+    service_name = "test-" + uuid.uuid4().hex
+    service_type = ZeroconfConfig.service_type
+    info = ServiceInfo(service_type, service_name + "." + service_type, addresses=["127.0.0.1"], port=4242, server="localhost.")
+    registrar = Zeroconf()
+    registrar.register_service(info)
+    try:
+        blackout_ends = time.monotonic() + DISCOVERY_BLACKOUT_SECONDS
+
+        class LossyListener(zeroconf_engine.AsyncListener):
+            def datagram_received(self, data, addrs):
+                if time.monotonic() >= blackout_ends:
+                    super().datagram_received(data, addrs)
+
+        monkeypatch.setattr(zeroconf_engine, "AsyncListener", LossyListener)
+        monkeypatch.setattr(ZeroconfConfig, "service_name", service_name)
+        monkeypatch.setattr(cli, "port", 0)
+
+        cli.discover_port()
+
+        assert cli.port == 4242
+    finally:
+        registrar.unregister_service(info)
+        registrar.close()

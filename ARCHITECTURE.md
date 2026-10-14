@@ -96,7 +96,7 @@ Recordurbate/
 │   ├── client.py               # TCP socket client (CLI side)
 │   ├── client_response.py      # Response writer for server→client communication
 │   ├── terminator.py           # End-of-message sentinel (0xDEADBEEF)
-│   ├── discover_port.py        # Zeroconf service browser for port discovery
+│   ├── discover_port.py        # Zeroconf lookup of the daemon's port
 │   └── zeroconf_config.py      # Shared Zeroconf service type/name constants
 ├── configs/
 │   ├── config.json             # Main configuration (streamers list, options)
@@ -205,7 +205,9 @@ from the directory containing `cli.py` and exits with its return code;
 
 **Flow for all other commands** (`stop`, `add`, `del`, `list`, etc.):
 
-1. Discovers the daemon's TCP port via Zeroconf (`DiscoverPort`).
+1. Discovers the daemon's TCP port by resolving its Zeroconf service by name
+   (`DiscoverPort`), raising `ValueError("Unable to discover port.")` when no
+   answer arrives within `port_timeout`.
 2. Opens a `SocketClient` connection to the daemon.
 3. Sends the command string over TCP.
 4. Reads and prints the response until the terminator sentinel is received.
@@ -411,12 +413,13 @@ of each `recv()` for this pattern to know when the response is complete.
 
 ### ipc/discover\_port.py
 
-`DiscoverPort` — Zeroconf service browser.
+`DiscoverPort` — Zeroconf lookup of the daemon's port.
 
-Uses `ServiceBrowser` to listen for `_recordurbate._tcp.local.` services. When
-a matching service is found, stores its port in `self.port`. The CLI polls
-`self.port` in a loop (up to `port_timeout` seconds, default 10) until
-discovery succeeds.
+`discover(timeout)` resolves the service by its full name,
+`Recordurbate._recordurbate._tcp.local.`, with `Zeroconf.get_service_info`,
+which asks again about every second until `timeout` (the CLI passes
+`port_timeout`, default 10 seconds). Returns the service's port, or `None` when
+no answer arrives in time.
 
 ---
 
