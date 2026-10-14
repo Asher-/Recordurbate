@@ -290,6 +290,40 @@ def test_other_interpreter_reexecs_under_project_venv():
 
 # discovery
 
+def fake_discover_port(monkeypatch, discovered):
+    calls = []
+
+    class FakeDiscoverPort:
+        def __init__(self, service_name):
+            calls.append(service_name)
+
+        def discover(self, timeout):
+            calls.append(timeout)
+            return discovered
+
+    monkeypatch.setattr(cli, "DiscoverPort", FakeDiscoverPort)
+    monkeypatch.setattr(cli, "port", 0)
+    return calls
+
+
+def test_discover_port_sets_port_when_discovered(monkeypatch):
+    calls = fake_discover_port(monkeypatch, 4242)
+
+    cli.discover_port()
+
+    assert calls == ["Recordurbate", 10]
+    assert cli.port == 4242
+
+
+def test_discover_port_raises_when_undiscovered(monkeypatch):
+    fake_discover_port(monkeypatch, None)
+
+    with pytest.raises(ValueError, match=r"^Unable to discover port\.$"):
+        cli.discover_port()
+
+    assert cli.port == 0
+
+
 DISCOVERY_BLACKOUT_SECONDS = 6
 
 
