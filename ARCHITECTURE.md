@@ -557,8 +557,9 @@ Service type: _recordurbate._tcp.local.
 Service name: Recordurbate._recordurbate._tcp.local.
 ```
 
-The CLI discovers the port by creating a `ServiceBrowser` that listens for this
-service type. Once found, the port is extracted from the `ServiceInfo`.
+The CLI discovers the port by resolving this service name with
+`Zeroconf.get_service_info`, which asks again about every second until
+`port_timeout`, and takes the port from the returned `ServiceInfo`.
 
 This avoids the need for a PID file or hardcoded port. The Zeroconf
 registration also serves as a singleton check — if the service name is already
