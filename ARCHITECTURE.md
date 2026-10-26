@@ -229,7 +229,8 @@ for each name in the config, registers SIGINT/SIGTERM handlers.
 3. Second `os.fork()` — intermediate child exits, grandchild continues.
 4. Grandchild is the daemon: detached from terminal, PPID becomes 1.
 5. Starts the IPC socket server's accept loop on the inherited socket.
-6. Closes stdin/stdout/stderr to complete daemonization.
+6. Closes stdin/stdout/stderr and points fds 0-2 at `/dev/null`, releasing any
+   terminal or pipe the caller attached, to complete daemonization.
 
 **`run()`**: Starts the run loop in a non-daemon thread:
 
@@ -446,7 +447,7 @@ cli.py start
               │
               ├── self.pid = os.getpid()
               ├── ipc_client.start()        # start the accept loop
-              ├── close stdin/stdout/stderr
+              ├── close stdin/stdout/stderr; fds 0-2 → /dev/null
               └── return to start() → run()
 ```
 
