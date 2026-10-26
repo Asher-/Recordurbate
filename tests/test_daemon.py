@@ -1,5 +1,7 @@
 import logging
+import os
 import socket
+import threading
 
 import pytest
 
@@ -57,3 +59,34 @@ def test_start_foreground_reports_held_port_before_running(monkeypatch, capsys):
     assert exited.value.code == 1
     assert capsys.readouterr().out == "Already started.\n"
     assert runs == []
+
+
+def test_run_loop_starts_no_further_streamers_once_stop_is_requested(monkeypatch):
+    monkeypatch.setattr(daemon, "find_running_ytdlp", lambda: {})
+    instance = bare_daemon()
+    instance.pid = os.getpid()
+    instance.config = {"auto_reload_config": False, "rate_limit_time": 0}
+    instance.streamers_lock = threading.Lock()
+    started = []
+
+    class StopRequestingStreamer:
+        stream = None
+
+        def __init__(self, name):
+            self.name = name
+
+        def start(self):
+            started.append(self.name)
+            # stop and handoff both clear pid; this one arrives mid-pass
+            instance.pid = None
+
+        def stop(self):
+            pass
+
+    instance.streamers = {name: StopRequestingStreamer(name) for name in ["first", "second", "third"]}
+
+    thread = instance.run()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert started == ["first"]

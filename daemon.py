@@ -286,6 +286,9 @@ class Daemon:
                     with self.streamers_lock:
                         streamer_snapshot = dict(self.streamers)
                     for name, streamer in streamer_snapshot.items():
+                        # stop and handoff clear pid; leave the pass at once
+                        if not self.pid:
+                            break
                         if not streamer.stream:
                             streamer.start()
                         if self.config["rate_limit_time"]:
