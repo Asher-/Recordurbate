@@ -6,6 +6,7 @@ import time
 import socket
 import gc
 import subprocess
+import errno
 
 # Re-run under the project's venv when launched with any other interpreter.
 venv_dir = os.path.join( os.path.dirname( os.path.abspath(__file__) ), "venv" )
@@ -13,22 +14,14 @@ if os.path.realpath( sys.prefix ) != os.path.realpath( venv_dir ) and os.path.ex
     venv_python = os.path.join( venv_dir, "bin", "python" )
     os.execv( venv_python, [venv_python, os.path.abspath(__file__)] + sys.argv[1:] )
 
-from zeroconf import ServiceInfo, Zeroconf, NonUniqueNameException
-
 from ipc.client import SocketClient
-from ipc.discover_port import DiscoverPort
-from ipc.zeroconf_config import ZeroconfConfig
+from ipc.ipc_config import IpcConfig
 
 from daemon import Daemon
 
 daemon = None
-host = "localhost"
-ip = "127.0.0.1"
-port = 0
 args = None
 socket_client = None
-
-port_timeout = 10
 
 #################### Args ####################
 
@@ -41,13 +34,19 @@ def check_num_args(min, max = None):
 
 #################### Daemon ####################
 
-def discover_port():
-    discovered = DiscoverPort( ZeroconfConfig.service_name ).discover( port_timeout )
-    if discovered is None:
-        raise ValueError("Unable to discover port.")
-    else:
-        global port
-        port = discovered
+def port_in_use():
+    # Binding the daemon's port fails exactly while a daemon holds it
+    probe = socket.socket( socket.AF_INET, socket.SOCK_STREAM )
+    probe.setsockopt( socket.SOL_SOCKET, socket.SO_REUSEADDR, 1 )
+    try:
+        probe.bind( (IpcConfig.host, IpcConfig.port) )
+    except OSError as e:
+        if e.errno != errno.EADDRINUSE:
+            raise
+        return True
+    finally:
+        probe.close()
+    return False
 
 #################### Add / Remove ####################
 
@@ -92,29 +91,10 @@ def start():
     if not check_num_args(2): 
         print("Encountered unexpected extra arguments {}.".format(" ".join(sys.argv[2:])))      
         return
-    def ensure_service_not_started():
-        global host, ip, port
-        server_address = socket.inet_aton( ip )
-        info = ServiceInfo(
-            ZeroconfConfig.service_type,
-            f"{ZeroconfConfig.service_name}.{ZeroconfConfig.service_type}",
-            addresses=[ip],
-            port=port,
-            properties={},
-            server=host, 
-        )
-        publish_zeroconf = Zeroconf()
-        try:
-            publish_zeroconf.register_service(info)
-        except NonUniqueNameException:
-            print("Already started.")
-            sys.exit(1)
-        publish_zeroconf.unregister_service(info)
-        return True
-    if ensure_service_not_started():
-        foreground = "--foreground" in sys.argv
-        daemon = Daemon()
-        daemon.start(foreground=foreground)
+    # The daemon reports "Already started." itself when it cannot bind its port
+    foreground = "--foreground" in sys.argv
+    daemon = Daemon()
+    daemon.start(foreground=foreground)
 
 def stop():
     if not check_num_args(2): 
@@ -143,27 +123,7 @@ def upgrade():
     max_wait = 15
     for i in range(max_wait):
         time.sleep(1)
-        try:
-            global host, ip, port
-            server_address = socket.inet_aton( ip )
-            info = ServiceInfo(
-                ZeroconfConfig.service_type,
-                f"{ZeroconfConfig.service_name}.{ZeroconfConfig.service_type}",
-                addresses=[ip],
-                port=0,
-                properties={},
-                server=host,
-            )
-            publish_zeroconf = Zeroconf()
-            try:
-                publish_zeroconf.register_service(info)
-                publish_zeroconf.unregister_service(info)
-                publish_zeroconf.close()
-                break
-            except NonUniqueNameException:
-                publish_zeroconf.close()
-                continue
-        except Exception:
+        if not port_in_use():
             break
     else:
         print("Old daemon did not exit within {}s.".format(max_wait))
@@ -187,9 +147,12 @@ def service():
 def ipc( command ):
     global socket_client
     if socket_client is None:
-        discover_port()
-        socket_client = SocketClient( host, port )
-        socket_client.start()
+        socket_client = SocketClient( IpcConfig.host, IpcConfig.port )
+        try:
+            socket_client.start()
+        except ConnectionRefusedError:
+            socket_client = None
+            raise ValueError("Daemon is not running.")
     socket_client.ipc( command )
 
 def usage():

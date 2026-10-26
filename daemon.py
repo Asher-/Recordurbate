@@ -5,6 +5,7 @@ import signal
 import time
 import threading
 from ipc.server import SocketServer
+from ipc.ipc_config import IpcConfig
 
 from streamer import Streamer
 from pid import find_running_ytdlp
@@ -52,8 +53,10 @@ class Daemon:
         if not self.pid:
             self.logger.info("Starting daemon")
 
-            # start socket server for ipc            
-            self.ipc_client = SocketServer( daemon=self, hostname="localhost" )
+            # start socket server for ipc, binding before the fork so a second
+            # daemon fails while this process can still report it
+            self.ipc_client = SocketServer( daemon=self, hostname=IpcConfig.host, port=IpcConfig.port )
+            self.ipc_client.bind()
 
             self.logger.debug("calling os.fork()")
 
@@ -124,7 +127,8 @@ class Daemon:
         """Run without daemonizing — for use under launchd or other supervisors."""
         self.pid = os.getpid()
         self.logger.info("Starting in foreground mode, pid: {}".format(self.pid))
-        self.ipc_client = SocketServer( daemon=self, hostname="localhost" )
+        self.ipc_client = SocketServer( daemon=self, hostname=IpcConfig.host, port=IpcConfig.port )
+        self.ipc_client.bind()
         self.ipc_client.start()
         thread = self.run()
         thread.join()

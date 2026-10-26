@@ -1,5 +1,8 @@
+import errno
+import logging
 import os
 import plistlib
+import socket
 import subprocess
 import sys
 import time
@@ -19,9 +22,8 @@ if os.path.exists(os.path.join(VENV, "bin", "python")) and os.path.realpath(sys.
     pytest.skip("run the suite with " + os.path.join(VENV, "bin", "python"), allow_module_level=True)
 
 import cli
-import zeroconf._engine as zeroconf_engine
-from ipc.zeroconf_config import ZeroconfConfig
-from zeroconf import ServiceInfo, Zeroconf
+from ipc.ipc_config import IpcConfig
+from ipc.server import SocketServer
 
 
 # service
@@ -229,10 +231,11 @@ class Execed(Exception):
 
 
 def run_reexec_block(monkeypatch, directory, prefix):
-    # cli.py's re-exec block is the module code before its first third-party import
+    # cli.py's re-exec block is the module code before its first project import,
+    # whose modules import the third-party packages
     with open(CLI) as source_file:
         source = source_file.read()
-    block = compile(source[:source.index("from zeroconf")], CLI, "exec")
+    block = compile(source[:source.index("from ipc.client")], CLI, "exec")
     calls = []
 
     def fake_execv(path, argv):
@@ -279,8 +282,8 @@ def test_other_interpreter_reexecs_under_project_venv():
     if not os.path.exists(os.path.join(VENV, "bin", "python")):
         pytest.skip("no project venv at " + VENV)
     base = sys._base_executable
-    probe = subprocess.run([base, "-c", "import zeroconf"], capture_output=True)
-    assert probe.returncode != 0, base + " imports zeroconf, so a passing run would not show the re-exec"
+    probe = subprocess.run([base, "-c", "import psutil"], capture_output=True)
+    assert probe.returncode != 0, base + " imports psutil, so a passing run would not show the re-exec"
 
     result = subprocess.run([base, os.path.join(REPO, "cli.py"), "help"], capture_output=True, text=True, cwd=REPO)
 
@@ -288,68 +291,78 @@ def test_other_interpreter_reexecs_under_project_venv():
     assert USAGE_LINE in result.stdout
 
 
-# discovery
+# ipc
 
-def fake_discover_port(monkeypatch, discovered):
-    calls = []
+class EchoDaemon:
+    # Answers each command through client_response, as Daemon.ipc does
+    def __init__(self):
+        self.logger = logging.getLogger("test_cli")
+        self.pid = os.getpid()
 
-    class FakeDiscoverPort:
-        def __init__(self, service_name):
-            calls.append(service_name)
-
-        def discover(self, timeout):
-            calls.append(timeout)
-            return discovered
-
-    monkeypatch.setattr(cli, "DiscoverPort", FakeDiscoverPort)
-    monkeypatch.setattr(cli, "port", 0)
-    return calls
+    def ipc(self, command, client_response):
+        client_response.print("received " + command)
 
 
-def test_discover_port_sets_port_when_discovered(monkeypatch):
-    calls = fake_discover_port(monkeypatch, 4242)
-
-    cli.discover_port()
-
-    assert calls == ["Recordurbate", 10]
-    assert cli.port == 4242
-
-
-def test_discover_port_raises_when_undiscovered(monkeypatch):
-    fake_discover_port(monkeypatch, None)
-
-    with pytest.raises(ValueError, match=r"^Unable to discover port\.$"):
-        cli.discover_port()
-
-    assert cli.port == 0
+def serve_echo(monkeypatch):
+    server = SocketServer(daemon=EchoDaemon(), hostname=IpcConfig.host, port=0)
+    server.bind()
+    server.start()
+    monkeypatch.setattr(IpcConfig, "port", server.ipc.getsockname()[1])
+    monkeypatch.setattr(cli, "socket_client", None)
+    return server
 
 
-DISCOVERY_BLACKOUT_SECONDS = 6
+def stop_serving(server):
+    if cli.socket_client is not None:
+        cli.socket_client.server.close()
+    server.daemon.pid = None
+    server.ipc.close()
 
 
-def test_discover_port_outlasts_lost_answers(monkeypatch):
-    # The service is advertised throughout, but every answer reaching the CLI in
-    # its first seconds is lost, as on a network blip
-    service_name = "test-" + uuid.uuid4().hex
-    service_type = ZeroconfConfig.service_type
-    info = ServiceInfo(service_type, service_name + "." + service_type, addresses=["127.0.0.1"], port=4242, server="localhost.")
-    registrar = Zeroconf()
-    registrar.register_service(info)
+def test_ipc_sends_command_to_daemon_on_configured_port(monkeypatch, capsys):
+    server = serve_echo(monkeypatch)
     try:
-        blackout_ends = time.monotonic() + DISCOVERY_BLACKOUT_SECONDS
-
-        class LossyListener(zeroconf_engine.AsyncListener):
-            def datagram_received(self, data, addrs):
-                if time.monotonic() >= blackout_ends:
-                    super().datagram_received(data, addrs)
-
-        monkeypatch.setattr(zeroconf_engine, "AsyncListener", LossyListener)
-        monkeypatch.setattr(ZeroconfConfig, "service_name", service_name)
-        monkeypatch.setattr(cli, "port", 0)
-
-        cli.discover_port()
-
-        assert cli.port == 4242
+        cli.ipc("list")
     finally:
-        registrar.unregister_service(info)
-        registrar.close()
+        stop_serving(server)
+
+    assert "received list" in capsys.readouterr().out
+
+
+def hold_port(monkeypatch):
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    holder.bind((IpcConfig.host, 0))
+    monkeypatch.setattr(IpcConfig, "port", holder.getsockname()[1])
+    return holder
+
+
+def test_ipc_without_daemon_reports_not_running(monkeypatch):
+    # Released before connecting, so nothing holds the port and connecting is refused
+    hold_port(monkeypatch).close()
+    monkeypatch.setattr(cli, "socket_client", None)
+
+    with pytest.raises(ValueError, match="Daemon is not running."):
+        cli.ipc("stop")
+
+    assert cli.socket_client is None
+
+
+def test_port_in_use_while_held_and_free_once_released(monkeypatch):
+    holder = hold_port(monkeypatch)
+    holder.listen(1)
+    try:
+        assert cli.port_in_use()
+    finally:
+        holder.close()
+
+    assert not cli.port_in_use()
+
+
+def test_port_in_use_raises_other_bind_errors(monkeypatch):
+    # 192.0.2.1 is reserved for documentation, so no interface on this host carries it
+    monkeypatch.setattr(IpcConfig, "host", "192.0.2.1")
+
+    with pytest.raises(OSError) as raised:
+        cli.port_in_use()
+
+    assert raised.value.errno == errno.EADDRNOTAVAIL
