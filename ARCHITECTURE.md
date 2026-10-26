@@ -237,6 +237,7 @@ for each name in the config, registers SIGINT/SIGTERM handlers.
 while self.pid:
     reload_config()                    # pick up config changes
     for each streamer:
+        if not self.pid: break         # stop/handoff ends the pass
         if not streaming: start()      # launch yt-dlp
         rate_limit_sleep()
     sleep 60s (in 1s intervals, checking self.pid)
