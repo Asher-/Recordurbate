@@ -94,6 +94,12 @@ class Daemon:
             sys.stdin.close()
             sys.stdout.close()
             sys.stderr.close()
+            # Closing the streams leaves fds 0-2 open on whatever the caller
+            # attached, such as a pipe; pointing them at /dev/null releases it
+            devnull = os.open( os.devnull, os.O_RDWR )
+            for fd in (0, 1, 2):
+                os.dup2( devnull, fd )
+            os.close( devnull )
 
             self.logger.info("Successfully started daemon, pid: {}".format(self.pid))
 

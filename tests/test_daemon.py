@@ -1,13 +1,20 @@
+import json
 import logging
 import os
+import signal
 import socket
+import subprocess
+import sys
 import threading
+import time
 
 import pytest
 
 import daemon
 from daemon import Daemon
 from ipc.ipc_config import IpcConfig
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def bare_daemon():
@@ -90,3 +97,57 @@ def test_run_loop_starts_no_further_streamers_once_stop_is_requested(monkeypatch
 
     assert not thread.is_alive()
     assert started == ["first"]
+
+
+# Daemonizes a bare Daemon on a free port, then reports from the daemon process
+# whether fds 0-2 are /dev/null and stays alive, as a running daemon would
+DAEMONIZE_SCRIPT = """
+import json, logging, os, sys, time
+from daemon import Daemon
+from ipc.ipc_config import IpcConfig
+
+IpcConfig.port = 0
+instance = Daemon.__new__(Daemon)
+instance.logger = logging.getLogger("test_daemon")
+instance.pid = None
+instance.daemonize()
+devnull = os.stat(os.devnull)
+report = {
+    "pid": os.getpid(),
+    "devnull": [(lambda s: (s.st_dev, s.st_ino) == (devnull.st_dev, devnull.st_ino))(os.fstat(fd)) for fd in (0, 1, 2)],
+}
+with open(sys.argv[1] + ".tmp", "w") as report_file:
+    json.dump(report, report_file)
+os.rename(sys.argv[1] + ".tmp", sys.argv[1])
+time.sleep(30)
+"""
+
+DAEMON_REPORT_DEADLINE_SECONDS = 10
+
+
+def test_daemonize_releases_the_callers_stdio(tmp_path):
+    report_path = tmp_path / "report.json"
+    caller = subprocess.Popen(
+        [sys.executable, "-c", DAEMONIZE_SCRIPT, str(report_path)],
+        cwd=REPO, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    report = None
+    try:
+        # Returns only once every process holding the caller's pipes has let go
+        caller.communicate(timeout=DAEMON_REPORT_DEADLINE_SECONDS)
+        deadline = time.monotonic() + DAEMON_REPORT_DEADLINE_SECONDS
+        while not report_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        report = json.loads(report_path.read_text())
+
+        os.kill(report["pid"], 0)  # the daemon is still running
+        assert report["devnull"] == [True, True, True]
+    finally:
+        caller.kill()
+        if report is None and report_path.exists():
+            report = json.loads(report_path.read_text())
+        if report is not None:
+            try:
+                os.kill(report["pid"], signal.SIGKILL)
+            except ProcessLookupError:
+                pass
