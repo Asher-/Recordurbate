@@ -16,13 +16,12 @@
   - [ipc/client.py](#ipcclientpy)
   - [ipc/client\_response.py](#ipcclient_responsepy)
   - [ipc/terminator.py](#ipcterminatorpy)
-  - [ipc/discover\_port.py](#ipcdiscover_portpy)
-  - [ipc/zeroconf\_config.py](#ipczeroconf_configpy)
+  - [ipc/ipc\_config.py](#ipcipc_configpy)
 - [Daemonization](#daemonization)
 - [Streamer Lifecycle](#streamer-lifecycle)
 - [Stream Validation](#stream-validation)
 - [IPC Protocol](#ipc-protocol)
-  - [Service Discovery](#service-discovery)
+  - [Daemon Address](#daemon-address)
   - [TCP Socket Protocol](#tcp-socket-protocol)
   - [Command Dispatch](#command-dispatch)
 - [Signal Handling](#signal-handling)
@@ -76,8 +75,8 @@ process in turn spawns an ffmpeg child to handle the actual stream download.
 The daemon monitors these process trees, validates stream health, and cleans up
 orphaned processes when streams end or crash.
 
-Service discovery uses Zeroconf (mDNS) so the CLI client can find the daemon's
-dynamically-assigned TCP port without a PID file or fixed port.
+The daemon listens on a fixed localhost TCP port, so the CLI connects to it
+directly, and a second daemon cannot bind the port while the first holds it.
 
 ---
 
@@ -96,8 +95,7 @@ Recordurbate/
 │   ├── client.py               # TCP socket client (CLI side)
 │   ├── client_response.py      # Response writer for server→client communication
 │   ├── terminator.py           # End-of-message sentinel (0xDEADBEEF)
-│   ├── discover_port.py        # Zeroconf lookup of the daemon's port
-│   └── zeroconf_config.py      # Shared Zeroconf service type/name constants
+│   └── ipc_config.py           # The daemon's fixed IPC host and port
 ├── configs/
 │   ├── config.json             # Main configuration (streamers list, options)
 │   ├── youtube-dl.config       # yt-dlp command-line options
@@ -183,10 +181,11 @@ decide whether to call `start()`, while the streamer thread writes to
 
 Entry point. Invoked as `python cli.py <command> [args]`.
 
-**Interpreter**: before its third-party imports, `cli.py` compares
-`realpath(sys.prefix)` with `realpath(venv/)` beside it. When they differ and
-`venv/bin/python` exists, it calls `os.execv(venv/bin/python, ...)` with the same
-arguments, so `./cli.py` runs under the project venv without activation.
+**Interpreter**: before its project imports, which load third-party packages,
+`cli.py` compares `realpath(sys.prefix)` with `realpath(venv/)` beside it. When
+they differ and `venv/bin/python` exists, it calls
+`os.execv(venv/bin/python, ...)` with the same arguments, so `./cli.py` runs
+under the project venv without activation.
 
 **Flow for `enable`, `disable`, `status`**: `service()` runs `service.sh <command>`
 from the directory containing `cli.py` and exits with its return code;
@@ -195,22 +194,20 @@ from the directory containing `cli.py` and exits with its return code;
 
 **Flow for `start`**:
 
-1. Attempts to register a Zeroconf service to check if the daemon is already
-   running. If registration fails with `NonUniqueNameException`, the daemon is
-   already running — exits with error.
-2. Unregisters the temporary service.
-3. Creates a `Daemon` instance and calls `daemon.start()`.
-4. The parent and intermediate fork processes exit via `sys.exit(0)` inside
+1. Creates a `Daemon` instance and calls `daemon.start()`.
+2. The daemon binds its fixed port before forking or running (see
+   [Daemon Address](#daemon-address)). If another daemon holds the port, it
+   prints "Already started." and exits with status 1.
+3. The parent and intermediate fork processes exit via `sys.exit(0)` inside
    `daemonize()`. Only the final child continues.
 
 **Flow for all other commands** (`stop`, `add`, `del`, `list`, etc.):
 
-1. Discovers the daemon's TCP port by resolving its Zeroconf service by name
-   (`DiscoverPort`), raising `ValueError("Unable to discover port.")` when no
-   answer arrives within `port_timeout`.
-2. Opens a `SocketClient` connection to the daemon.
-3. Sends the command string over TCP.
-4. Reads and prints the response until the terminator sentinel is received.
+1. Opens a `SocketClient` connection to the daemon at `IpcConfig.host` and
+   `IpcConfig.port`, raising `ValueError("Daemon is not running.")` when the
+   connection is refused.
+2. Sends the command string over TCP.
+3. Reads and prints the response until the terminator sentinel is received.
 
 **Global state**: `socket_client` is lazily initialized on the first IPC call
 and reused for the lifetime of the CLI process.
@@ -226,11 +223,12 @@ for each name in the config, registers SIGINT/SIGTERM handlers.
 
 **`daemonize()`**: Classic UNIX double-fork:
 
-1. Creates the `SocketServer` (but does not start it yet).
+1. Creates the `SocketServer` and binds its fixed port, so a second daemon
+   prints "Already started." and exits here, in the process the user started.
 2. First `os.fork()` — parent exits, child continues.
 3. Second `os.fork()` — intermediate child exits, grandchild continues.
 4. Grandchild is the daemon: detached from terminal, PPID becomes 1.
-5. Starts the IPC socket server.
+5. Starts the IPC socket server's accept loop on the inherited socket.
 6. Closes stdin/stdout/stderr to complete daemonization.
 
 **`run()`**: Starts the run loop in a non-daemon thread:
@@ -352,13 +350,15 @@ Simple JSON config loader/saver.
 **Lifecycle**:
 
 1. `__init__` — resolves hostname/IP, stores daemon reference.
-2. `start()` — creates a TCP socket with `SO_REUSEADDR`, binds to an
-   OS-assigned port (port 0), sets a 2s accept timeout, registers the service
-   via Zeroconf, and starts the accept loop.
-3. `loop()` — runs in a daemon thread. Calls `accept()` in a loop (with 2s
+2. `bind()` — creates a TCP socket with `SO_REUSEADDR`, binds it to the given
+   port, listens, and sets a 2s accept timeout. When the port is already bound
+   (`EADDRINUSE`) it prints "Already started." and exits with status 1; any
+   other bind error is raised.
+3. `start()` — starts the accept loop.
+4. `loop()` — runs in a daemon thread. Calls `accept()` in a loop (with 2s
    timeout so it can check `self.daemon.pid` for shutdown). Each accepted
    connection is dispatched to `handle_connection()` in its own daemon thread.
-4. `handle_connection()` — sets a 10s recv timeout on the client socket, reads
+5. `handle_connection()` — sets a 10s recv timeout on the client socket, reads
    the command, creates a `ClientResponse`, dispatches to `daemon.ipc()`.
    Uses `try/finally` to guarantee `client_response.close()` (sends
    terminator) and `connected_socket.close()` always execute, even if the
@@ -411,29 +411,18 @@ of each `recv()` for this pattern to know when the response is complete.
 
 ---
 
-### ipc/discover\_port.py
+### ipc/ipc\_config.py
 
-`DiscoverPort` — Zeroconf lookup of the daemon's port.
-
-`discover(timeout)` resolves the service by its full name,
-`Recordurbate._recordurbate._tcp.local.`, with `Zeroconf.get_service_info`,
-which asks again about every second until `timeout` (the CLI passes
-`port_timeout`, default 10 seconds). Returns the service's port, or `None` when
-no answer arrives in time.
-
----
-
-### ipc/zeroconf\_config.py
-
-`ZeroconfConfig` — shared constants for Zeroconf registration/discovery.
+`IpcConfig` — the daemon's fixed IPC address.
 
 ```python
-service_type = "_recordurbate._tcp.local."
-service_name = "Recordurbate"
+host = "127.0.0.1"
+port = 47391
 ```
 
-Both the server (registration) and client (discovery) reference these to ensure
-they agree on the service identifier.
+The daemon binds this address and the CLI connects to it, so both agree on
+where the daemon listens without any lookup (see
+[Daemon Address](#daemon-address)).
 
 ---
 
@@ -444,6 +433,8 @@ The daemon uses the classic UNIX double-fork pattern:
 ```
 cli.py start
   │
+  ├── ipc_client.bind()               # bind the fixed port; exit if it is held
+  │
   ├── os.fork() ──► Parent (original process): sys.exit(0)
   │
   └── Child 1
@@ -453,7 +444,7 @@ cli.py start
         └── Child 2 (the daemon)
               │
               ├── self.pid = os.getpid()
-              ├── ipc_client.start()        # start TCP server
+              ├── ipc_client.start()        # start the accept loop
               ├── close stdin/stdout/stderr
               └── return to start() → run()
 ```
@@ -547,23 +538,20 @@ streamer's Chaturbate username.
 
 ## IPC Protocol
 
-### Service Discovery
+### Daemon Address
 
-The daemon binds to port 0 (OS-assigned) and registers itself via Zeroconf
-(mDNS) under:
+The daemon listens on a fixed address, `IpcConfig.host`:`IpcConfig.port`
+(`127.0.0.1:47391`), and the CLI connects to it directly.
 
-```
-Service type: _recordurbate._tcp.local.
-Service name: Recordurbate._recordurbate._tcp.local.
-```
+The port also keeps the daemon single. Binding it fails with `EADDRINUSE` while
+a daemon holds it, so a second daemon prints "Already started." and exits
+before it forks or runs. The kernel releases the port when the holding process
+exits, however it exits, so nothing stale is left behind; `SO_REUSEADDR` lets
+the next daemon bind while connections the old one closed are still in
+`TIME_WAIT`.
 
-The CLI discovers the port by resolving this service name with
-`Zeroconf.get_service_info`, which asks again about every second until
-`port_timeout`, and takes the port from the returned `ServiceInfo`.
-
-This avoids the need for a PID file or hardcoded port. The Zeroconf
-registration also serves as a singleton check — if the service name is already
-registered, `NonUniqueNameException` is raised, preventing duplicate daemons.
+The port lies below macOS's ephemeral range (49152–65535), so the kernel never
+assigns it to an outgoing connection.
 
 ### TCP Socket Protocol
 
@@ -585,7 +573,6 @@ the sentinel at the end of a `recv()` chunk.
 | Server recv    | 10s     | Prevents misbehaving client from freezing   |
 | Client connect | 30s     | Prevents hang if daemon is dead             |
 | Client select  | 30s     | Prevents hang if server dies mid-response   |
-| Port discovery | 10s     | Maximum wait for Zeroconf service to appear |
 
 ### Command Dispatch
 
@@ -693,7 +680,7 @@ dispatching to `cli.py`. It also provides `enable`/`disable`/`status` commands
 for managing the macOS launchd service. Use this for day-to-day operation.
 
 **`cli.py`** is the Python entry point. It imports project dependencies
-(`psutil`, `zeroconf`) directly, so when launched with any interpreter other
+(`psutil`) directly, so when launched with any interpreter other
 than `venv/bin/python` it re-execs itself under `venv/bin/python` first; no
 activation is needed. `./cli.py enable`, `./cli.py disable` and
 `./cli.py status` run `service.sh` with the same subcommand. Use this from any
@@ -1041,11 +1028,11 @@ CLI: python cli.py upgrade
   │      ├── yt-dlp children are reparented to PID 1 (launchd)
   │      └── Old daemon process exits
   │
-  ├── 3. CLI polls Zeroconf until old service disappears (up to 15s)
+  ├── 3. CLI polls until the old daemon's port can be bound (up to 15s)
   │
   ├── 4. CLI creates new Daemon() and calls daemon.start()
-  │      ├── Double-fork daemonization
-  │      └── Registers new Zeroconf service
+  │      ├── Binds the fixed IPC port
+  │      └── Double-fork daemonization
   │
   └── 5. New daemon's run() calls adopt_existing():
          ├── find_running_ytdlp() scans all processes for yt-dlp
@@ -1112,8 +1099,8 @@ continue uninterrupted through the new daemon.
 
 **`cli.py`**:
 
-- `upgrade()` — sends `"handoff"` via IPC, polls Zeroconf until the old
-  service disappears, then starts a new daemon.
+- `upgrade()` — sends `"handoff"` via IPC, polls `port_in_use()` until the old
+  daemon has released its port, then starts a new daemon.
 
 ---
 

@@ -21,9 +21,9 @@ dedicated thread, validates that both yt-dlp and ffmpeg are alive, and cleans
 up orphaned processes when streams end or crash.
 
 Runtime management (add/remove streamers, start/stop, list status) is done via
-a TCP IPC interface. The daemon binds to a dynamic port and registers itself
-via Zeroconf (mDNS), so the CLI client can discover it without a PID file or
-fixed port.
+a TCP IPC interface. The daemon listens on a fixed localhost port, which the
+CLI connects to directly; while one daemon holds the port, a second cannot bind
+it and exits with "Already started."
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical breakdown
 (process hierarchy, thread model, signal handling, IPC protocol, etc.).
@@ -34,7 +34,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical breakdown
 - **Python 3.10+**
 - **yt-dlp**
 - **ffmpeg**
-- **Python packages**: `psutil`, `zeroconf`
+- **Python packages**: `psutil`
 
 ### macOS
 
@@ -55,7 +55,7 @@ git clone https://github.com/oliverjrose99/Recordurbate.git
 cd Recordurbate
 python3 -m venv venv
 source venv/bin/activate
-pip install yt-dlp psutil zeroconf
+pip install yt-dlp psutil
 ```
 
 Streams are saved to `videos/<streamer_name>/` by default. This can be changed
@@ -95,8 +95,8 @@ provides `enable`/`disable`/`status` commands for macOS launchd integration
 
 ### cli.py — direct
 
-`cli.py` is the Python entry point. It imports project dependencies (`psutil`,
-`zeroconf`) directly, so when it is launched with any interpreter other than the
+`cli.py` is the Python entry point. It imports project dependencies (`psutil`)
+directly, so when it is launched with any interpreter other than the
 project's `venv/bin/python` it re-execs itself under `venv/bin/python` first. No
 activation step is needed:
 
