@@ -26,7 +26,13 @@ def make_daemon(**overrides):
         "process_poll_wait_time": 0,
     }
     config.update(overrides)
-    return types.SimpleNamespace(logger=FakeLogger(), config=config)
+    launches = []
+    return types.SimpleNamespace(
+        logger=FakeLogger(),
+        config=config,
+        launches=launches,
+        record_launch=lambda error=None: launches.append(error),
+    )
 
 
 def write(path, mtime, data=b"data"):
@@ -197,6 +203,8 @@ def start_harness(workdir, monkeypatch):
 
     def fake_popen(*args, **kwargs):
         calls["popen_at"] = time.time()
+        kwargs["stdout"].write(calls.get("output", ""))
+        kwargs["stdout"].flush()
         return calls.get("proc_factory", FakeProc)()
 
     def fake_finalize(self, before):
@@ -275,3 +283,113 @@ def test_start_logs_and_stops_when_validation_raises(start_harness, monkeypatch)
     assert start_harness["finalize"] == []
     assert s.stream is None
     assert any("stream_thread error for alice" in m for m in daemon.logger.messages)
+
+
+@pytest.mark.parametrize("state", [
+    "Room is currently offline",
+    "Room is currently in a private show",
+    "Performer is currently away",
+    "Room is password protected",
+    "Hidden session in progress",
+])
+def test_room_state_counts_as_reaching_the_site(start_harness, state):
+    start_harness["proc_factory"] = ExitedProc
+    start_harness["output"] = "ERROR: [Chaturbate] alice: {}\n".format(state)
+    daemon = make_daemon()
+
+    run_start(Streamer(daemon, "alice"))
+
+    assert daemon.launches == [None]
+
+
+@pytest.mark.parametrize("error", [
+    "ERROR: [Chaturbate] alice: Unable to download webpage: curl: (60) unable to get local issuer certificate",
+    "ERROR: [Chaturbate] alice: Unable to find stream URL",
+    "ERROR: './chaturbate.com_cookies.txt' does not look like a Netscape format cookies file",
+])
+def test_any_other_error_is_reported_as_not_reaching_the_site(start_harness, error):
+    start_harness["proc_factory"] = ExitedProc
+    start_harness["output"] = error + "\n"
+    daemon = make_daemon()
+
+    run_start(Streamer(daemon, "alice"))
+
+    assert daemon.launches == [error]
+
+
+def test_last_error_decides_when_ytdlp_warned_first(start_harness):
+    # yt-dlp falls back to the webpage when its API call fails
+    start_harness["proc_factory"] = ExitedProc
+    start_harness["output"] = (
+        "WARNING: [Chaturbate] alice: Unable to download JSON metadata: curl: (60)\n"
+        "ERROR: [Chaturbate] alice: Room is currently offline\n"
+    )
+    daemon = make_daemon()
+
+    run_start(Streamer(daemon, "alice"))
+
+    assert daemon.launches == [None]
+
+
+def test_exit_without_an_error_is_not_reaching_the_site(start_harness):
+    start_harness["proc_factory"] = ExitedProc
+    daemon = make_daemon()
+
+    run_start(Streamer(daemon, "alice"))
+
+    assert daemon.launches == [streamer.NO_ERROR]
+
+
+def test_earlier_launches_in_the_capture_log_are_not_read(start_harness, workdir):
+    (workdir / "configs/capture-alice.log").write_text("ERROR: [Chaturbate] alice: Room is currently offline\n")
+    start_harness["proc_factory"] = ExitedProc
+    daemon = make_daemon()
+
+    run_start(Streamer(daemon, "alice"))
+
+    assert daemon.launches == [streamer.NO_ERROR]
+
+
+def test_started_recording_counts_once_as_reaching_the_site(start_harness, monkeypatch):
+    monkeypatch.setattr(Streamer, "ensure_valid_stream", validation_returning(start_harness, True))
+    daemon = make_daemon()
+
+    run_start(Streamer(daemon, "alice"))
+
+    assert daemon.launches == [None]
+
+
+def test_failed_validation_is_not_reaching_the_site(start_harness, monkeypatch):
+    monkeypatch.setattr(Streamer, "ensure_valid_stream", validation_returning(start_harness, False))
+    daemon = make_daemon()
+
+    run_start(Streamer(daemon, "alice"))
+
+    assert daemon.launches == [streamer.NO_ERROR]
+
+
+def test_stop_during_launch_reports_nothing(start_harness, monkeypatch):
+    def stopped_during_validation(self, **kwargs):
+        self.stop()
+        return False
+
+    monkeypatch.setattr(Streamer, "ensure_valid_stream", stopped_during_validation)
+    daemon = make_daemon()
+
+    run_start(Streamer(daemon, "alice"))
+
+    assert daemon.launches == []
+
+
+def test_real_process_output_is_read_back_from_the_capture_log(workdir):
+    error = "ERROR: [Chaturbate] alice: Unable to download webpage: curl: (6) Could not resolve host"
+    (workdir / "configs").mkdir()
+    (workdir / "configs/capture-alice.log").write_text("ERROR: [Chaturbate] alice: Room is currently offline\n")
+    script = workdir / "yt-dlp"
+    script.write_text("#!/bin/sh\necho '{}' >&2\nexit 1\n".format(error))
+    script.chmod(0o755)
+    daemon = make_daemon(**{"youtube-dl_cmd": str(script), "process_poll_wait_time": 5})
+
+    run_start(Streamer(daemon, "alice"))
+
+    assert daemon.launches == [error]

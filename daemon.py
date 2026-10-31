@@ -20,11 +20,14 @@ class Daemon:
     ipc_client = None
     streamers = {}
     _handoff = False
+    failed_launches = 0
+    site_unreachable = False
 
     logfile = "./configs/rb.log"
     
     def __init__( self ):
         self.streamers_lock = threading.Lock()
+        self.launches_lock = threading.Lock()
         self.initLogger()
         self.init_config()
         self.init_signals()
@@ -157,6 +160,22 @@ class Daemon:
             else:
                 self.logger.info("Found yt-dlp PID {} for {} but streamer not in config, ignoring.".format(pid, name))
         self.logger.info("Adopted {} existing streams.".format(adopted))
+
+    def record_launch( self, error = None ):
+        # error is what yt-dlp printed for a launch that did not reach the site.
+        # Single misses are routine, so rb.log hears once, after as many in a row
+        # as there are streamers, and once more when a launch gets through.
+        with self.launches_lock:
+            if error is None:
+                if self.site_unreachable:
+                    self.logger.info("A launch reached chaturbate.com again after {} that did not.".format(self.failed_launches))
+                self.site_unreachable = False
+                self.failed_launches = 0
+            else:
+                self.failed_launches += 1
+                if not self.site_unreachable and self.failed_launches >= len(self.streamers):
+                    self.site_unreachable = True
+                    self.logger.warning("No launch has reached chaturbate.com in {} attempts, so no new recording can start. Latest: {}".format(self.failed_launches, error))
 
     def stop(self, client_response = None):
         if self.pid:

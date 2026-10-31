@@ -99,6 +99,51 @@ def test_run_loop_starts_no_further_streamers_once_stop_is_requested(monkeypatch
     assert started == ["first"]
 
 
+def counting_daemon(*streamers):
+    instance = bare_daemon()
+    instance.launches_lock = threading.Lock()
+    instance.streamers = dict.fromkeys(streamers)
+    return instance
+
+
+def test_warns_once_when_a_pass_worth_of_launches_fail(caplog):
+    instance = counting_daemon("first", "second")
+    caplog.set_level(logging.DEBUG, logger="test_daemon")
+
+    instance.record_launch("ERROR: one")
+    assert caplog.records == []
+
+    instance.record_launch("ERROR: two")
+    instance.record_launch("ERROR: three")
+
+    assert [record.levelno for record in caplog.records] == [logging.WARNING]
+    assert "ERROR: two" in caplog.records[0].getMessage()
+
+
+def test_launch_reaching_the_site_restarts_the_count(caplog):
+    instance = counting_daemon("first", "second")
+    caplog.set_level(logging.DEBUG, logger="test_daemon")
+
+    instance.record_launch("ERROR: one")
+    instance.record_launch()
+    instance.record_launch("ERROR: two")
+
+    assert caplog.records == []
+
+
+def test_logs_recovery_once_and_warns_again_on_the_next_outage(caplog):
+    instance = counting_daemon("only")
+    caplog.set_level(logging.DEBUG, logger="test_daemon")
+
+    instance.record_launch("ERROR: first outage")
+    instance.record_launch()
+    instance.record_launch()
+    instance.record_launch("ERROR: second outage")
+
+    assert [record.levelno for record in caplog.records] == [logging.WARNING, logging.INFO, logging.WARNING]
+    assert "ERROR: second outage" in caplog.records[2].getMessage()
+
+
 # Daemonizes a bare Daemon on a free port, then reports from the daemon process
 # whether fds 0-2 are /dev/null and stays alive, as a running daemon would
 DAEMONIZE_SCRIPT = """

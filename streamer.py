@@ -6,6 +6,16 @@ import signal
 
 from pid import process_active, get_pid_by_name_and_args, AdoptedProcess
 
+# yt-dlp's Chaturbate extractor raises these for a room that is up but has no public stream
+ROOM_STATES = (
+    "Room is currently offline",
+    "Room is currently in a private show",
+    "Performer is currently away",
+    "Room is password protected",
+    "Hidden session in progress",
+)
+NO_ERROR = "yt-dlp printed no error"
+
 class Streamer:
   
     name = None
@@ -45,9 +55,11 @@ class Streamer:
 
             try:
                 process_args = self.daemon.config["youtube-dl_cmd"].split(" ") + ["https://chaturbate.com/{}/".format(self.name), "--config-location", self.daemon.config["youtube-dl_config"]]
-                with open( "./configs/capture-{}.log".format(self.name), "a" ) as capture_log:
+                capture_path = "./configs/capture-{}.log".format(self.name)
+                with open( capture_path, "a" ) as capture_log:
                     capture_log.write( "\n=== {} capture start {} ===\n".format(self.name, time.strftime("%Y-%m-%d %H:%M:%S")) )
                     capture_log.flush()
+                    capture_offset = capture_log.tell()
                     launched_at = time.time()
                     self.stream = subprocess.Popen( process_args, 0, stdout=capture_log, stderr=capture_log, start_new_session=True )
             except OSError:
@@ -68,10 +80,15 @@ class Streamer:
                     # self.daemon.logger.info("Stream for {} appears to be healthy - validating.".format(self.name))
                     if self.ensure_valid_stream( ytdlp_pid = proc.pid ):
                         self.daemon.logger.info("Started to record {}.".format(self.name))
+                        self.daemon.record_launch()
                         self.finalize_prior_parts( launched_at )
                         self.started = True
                         self.wait_with_watchdog( proc )
                         self.cleanup_ffmpeg()
+                        return
+                # stop clears stream, and a stopped launch says nothing about the site
+                if self.stream:
+                    self.daemon.record_launch( self.launch_error( capture_path, capture_offset ) )
             except Exception:
                 self.daemon.logger.exception("stream_thread error for {}".format(self.name))
             finally:
@@ -81,6 +98,18 @@ class Streamer:
         thread.daemon = True
         thread.start()
         return thread
+
+    def launch_error( self, capture_path, offset ):
+        # The last error yt-dlp printed for this launch, or None when it named a
+        # room state, which it can only have heard from the site.
+        with open( capture_path, "r", errors="replace" ) as capture_log:
+            capture_log.seek( offset )
+            errors = [ line.strip() for line in capture_log if line.startswith("ERROR:") ]
+        if not errors:
+            return NO_ERROR
+        if errors[-1].endswith( ROOM_STATES ):
+            return None
+        return errors[-1]
 
     def adopt( self, pid ):
         def adopted_thread():
