@@ -233,3 +233,7 @@ brew upgrade ffmpeg    # macOS
 
 Check that yt-dlp, ffmpeg, and cookies are configured correctly. Check
 `configs/rb.log` for errors. Ensure the `videos/` directory is writable.
+
+If launches stop reaching the site, `configs/rb.log` logs `No launch has reached
+chaturbate.com` with yt-dlp's error. Each streamer's own output is in
+`configs/capture-<name>.log`.

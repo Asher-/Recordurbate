@@ -291,6 +291,12 @@ The `Streamer` class manages a single streamer's yt-dlp process.
 5. On exit, calls `cleanup_ffmpeg()` to kill any orphaned ffmpeg, then
    `stop(signal_child=False)`.
 
+**`launch_error()`**: After a launch that did not start recording, reads what
+yt-dlp wrote to `configs/capture-<name>.log` for this launch. A last `ERROR:`
+line naming a room state (offline, private show, away, password protected,
+hidden) returns `None`, since only the site can report one. Anything else,
+including no error at all, is returned for `Daemon.record_launch()` to count.
+
 **`ensure_valid_stream()`**: Validates that a healthy stream exists:
 
 - If yt-dlp is alive and ffmpeg is found → `True` (valid stream).
@@ -860,6 +866,15 @@ re-launches yt-dlp for that streamer.
 With 96+ streamers and `rate_limit_time: 0`, all offline streamers are cycled
 rapidly. Each cycle creates a short-lived yt-dlp process that exits
 immediately. This is normal and expected.
+
+### Unreachable Site Warning
+
+A launch that starts recording or reports a room state has reached the site.
+Any other outcome is a miss, and `Daemon.record_launch()` counts misses in a
+row. When the count reaches the number of streamers it writes one line to
+`configs/rb.log` with yt-dlp's latest error, and one more line when a launch
+next gets through. Single misses are routine, and a launch the daemon stopped
+itself is not counted.
 
 ---
 
