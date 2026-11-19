@@ -170,6 +170,22 @@ def test_stop_ends_the_run_loops_wait_at_once(monkeypatch):
     assert not thread.is_alive()
 
 
+@pytest.mark.parametrize("method", ["stop", "handoff"])
+def test_stop_and_handoff_clear_pid_and_set_wake(monkeypatch, method):
+    monkeypatch.setattr(daemon.time, "sleep", lambda seconds: None)
+    instance = bare_daemon()
+    instance.pid = os.getpid()
+    instance.wake = threading.Event()
+
+    with pytest.raises(SystemExit) as exited:
+        getattr(instance, method)()
+
+    assert exited.value.code == 0
+    assert instance.pid is None
+    assert instance.wake.is_set()
+    assert instance._handoff == (method == "handoff")
+
+
 class AdoptingStreamer:
     def __init__(self, stream=None):
         self.stream = stream
