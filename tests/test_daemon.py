@@ -69,7 +69,7 @@ def test_start_foreground_reports_held_port_before_running(monkeypatch, capsys):
 
 
 def test_run_loop_starts_no_further_streamers_once_stop_is_requested(monkeypatch):
-    monkeypatch.setattr(daemon, "find_running_ytdlp", lambda: {})
+    monkeypatch.setattr(daemon, "recorded_recorder", lambda name: None)
     instance = bare_daemon()
     instance.pid = os.getpid()
     instance.config = {"auto_reload_config": False, "rate_limit_time": 0}
@@ -142,6 +142,30 @@ def test_logs_recovery_once_and_warns_again_on_the_next_outage(caplog):
 
     assert [record.levelno for record in caplog.records] == [logging.WARNING, logging.INFO, logging.WARNING]
     assert "ERROR: second outage" in caplog.records[2].getMessage()
+
+
+class AdoptingStreamer:
+    def __init__(self, stream=None):
+        self.stream = stream
+        self.adopted = []
+
+    def adopt(self, pid):
+        self.adopted.append(pid)
+
+
+def test_adopt_existing_adopts_each_recorded_recorder_once(monkeypatch):
+    records = {"alice": 41, "bob": None, "carol": 43}
+    monkeypatch.setattr(daemon, "recorded_recorder", lambda name: records[name])
+    instance = bare_daemon()
+    instance.streamers_lock = threading.Lock()
+    # carol's streamer already has a stream, so her record is left alone
+    instance.streamers = {"alice": AdoptingStreamer(), "bob": AdoptingStreamer(), "carol": AdoptingStreamer(stream=object())}
+
+    instance.adopt_existing()
+
+    assert instance.streamers["alice"].adopted == [41]
+    assert instance.streamers["bob"].adopted == []
+    assert instance.streamers["carol"].adopted == []
 
 
 # Daemonizes a bare Daemon on a free port, then reports from the daemon process

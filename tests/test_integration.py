@@ -1,7 +1,7 @@
 """Daemon-side seams composed with a real recorder.py.
 
 Streamer.start launches the real recorder.py through a real Popen, and a
-running recorder is found by find_running_ytdlp and adopted by Streamer.adopt.
+running recorder is found through its PID record and adopted by Streamer.adopt.
 FakeHls (the CDN) and fake_ytdlp.py (yt-dlp) are the only stand-ins.
 """
 import json
@@ -21,7 +21,7 @@ sys.path.insert( 0, TESTS )
 import test_recorder
 from test_recorder import FakeHls, probe
 from streamer import Streamer
-from pid import find_running_ytdlp
+from pid import record_recorder, recorded_recorder
 
 def setUpModule():
     test_recorder.setUpModule()
@@ -48,8 +48,7 @@ class RoomDir( unittest.TestCase ):
         self.cwd = tempfile.mkdtemp()
         os.makedirs( os.path.join(self.cwd, "configs") )
         self.config = { "youtube-dl_cmd": "{} {}".format(sys.executable, os.path.join(TESTS, "fake_ytdlp.py")),
-                        "youtube-dl_config": "configs/unused.config",
-                        "process_poll_wait_time": 3 }
+                        "youtube-dl_config": "configs/unused.config" }
         with open( os.path.join(self.cwd, "configs", "config.json"), "w" ) as f:
             json.dump( self.config, f )
         os.symlink( os.path.join(ROOT, "recorder.py"), os.path.join(self.cwd, "recorder.py") )
@@ -85,7 +84,7 @@ class StreamerLaunchesRecorderTest( RoomDir ):
             self.assertIn( "Stream ended", f.read() )
 
     def test_offline_room_reported_after_the_poll_window_is_not_started( self ):
-        # yt-dlp answers only after process_poll_wait_time has passed.
+        # yt-dlp answers 5s after launch, so Streamer waits through the lookup.
         os.environ[ "FAKE_YTDLP_MODE" ] = "offline"
         os.environ[ "FAKE_YTDLP_DELAY" ] = "5"
         daemon = FakeDaemon( self.config )
@@ -112,21 +111,28 @@ class StreamerLaunchesRecorderTest( RoomDir ):
         codecs, container, duration = probe( self.recording() )
         self.assertEqual( codecs, [ "aac", "h264" ] )
 
-class AdoptRunningRecorderTest( RoomDir ):
+class AdoptRecordedRecorderTest( RoomDir ):
 
-    def test_running_recorder_is_found_and_adopted( self ):
-        recorder = subprocess.Popen( [ sys.executable, "recorder.py", "https://chaturbate.com/room/" ],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True )
+    def test_recorded_recorder_is_found_and_adopted( self ):
+        # Launched and recorded as Streamer.start does; the readiness pipe says
+        # when the room has resolved.
+        ready_fd, write_fd = os.pipe()
+        recorder = subprocess.Popen( [ sys.executable, "recorder.py", "https://chaturbate.com/room/", str(write_fd) ],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, pass_fds=(write_fd,) )
+        os.close( write_fd )
+        record_recorder( "room", recorder.pid )
         try:
-            time.sleep( 2 )
-            self.assertEqual( find_running_ytdlp().get("room"), recorder.pid )
+            self.assertEqual( os.read( ready_fd, 16 ), b"ready\n" )
+            os.close( ready_fd )
+            self.assertEqual( recorded_recorder("room"), recorder.pid )
             streamer = Streamer( FakeDaemon(self.config), "room" )
-            thread = streamer.adopt( recorder.pid )
-            time.sleep( 1 )
-            self.assertTrue( streamer.started )
-            thread.join( 60 )
+            with self.assertLogs( "test-integration", level="INFO" ) as logs:
+                thread = streamer.adopt( recorded_recorder("room") )
+                thread.join( 60 )
             self.assertFalse( thread.is_alive() )
+            self.assertTrue( any( "Adopted stream for room validated." in line for line in logs.output ) )
             self.assertIsNone( streamer.stream )
+            self.assertFalse( os.path.exists( "configs/pid-room" ) )
         finally:
             if recorder.poll() is None:
                 recorder.kill()

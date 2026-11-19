@@ -74,7 +74,7 @@ class StartTest( InTempDir ):
 
     def test_launches_recorder_for_the_room( self ):
         os.makedirs( "configs" )
-        daemon = FakeDaemon( { "process_poll_wait_time": 2 } )
+        daemon = FakeDaemon( {} )
         launched = []
         def fake_popen( args, *rest, **kwargs ):
             launched.append( (args, kwargs) )

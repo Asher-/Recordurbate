@@ -149,7 +149,6 @@ Two config files in the `configs/` directory:
 | `auto_reload_config`      | `bool`   | `true`                        | Reload config every loop iteration (60s). Allows live streamer list edits.     |
 | `rate_limit`              | `bool`   | `true`                        | Whether to rate-limit between launching streamers.                             |
 | `rate_limit_time`         | `number` | `0`                           | Seconds to sleep between streamer launches. `0` = no delay.                    |
-| `process_poll_wait_time`  | `number` | `15`                          | Seconds to poll (1s intervals) after launching recorder.py before validation.  |
 | `default_export_location` | `string` | `"./list.txt"`                | Default file path for the `export` command.                                |
 | `streamers`               | `array`  | `[]`                          | Chaturbate usernames to record.                                            |
 

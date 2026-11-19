@@ -8,7 +8,7 @@ from ipc.server import SocketServer
 from ipc.ipc_config import IpcConfig
 
 from streamer import Streamer
-from pid import find_running_ytdlp
+from pid import recorded_recorder
 import config as Config
 
 class Daemon:
@@ -143,22 +143,16 @@ class Daemon:
         thread.join()
 
     def adopt_existing( self ):
-        running = find_running_ytdlp()
-        if not running:
-            self.logger.info("No existing yt-dlp processes found to adopt.")
-            return
+        # Each configured room's recorder, as recorded when it was launched
         with self.streamers_lock:
             streamer_snapshot = dict(self.streamers)
         adopted = 0
-        for name, pid in running.items():
-            if name in streamer_snapshot:
-                streamer = streamer_snapshot[ name ]
-                if not streamer.stream:
-                    streamer.adopt( pid )
-                    adopted += 1
-                    self.logger.info("Adopting yt-dlp PID {} for {}.".format(pid, name))
-            else:
-                self.logger.info("Found yt-dlp PID {} for {} but streamer not in config, ignoring.".format(pid, name))
+        for name, streamer in streamer_snapshot.items():
+            pid = recorded_recorder( name )
+            if pid and not streamer.stream:
+                streamer.adopt( pid )
+                adopted += 1
+                self.logger.info("Adopting recorder PID {} for {}.".format(pid, name))
         self.logger.info("Adopted {} existing streams.".format(adopted))
 
     def record_launch( self, error = None ):

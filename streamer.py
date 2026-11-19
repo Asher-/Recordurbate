@@ -6,7 +6,7 @@ import os
 import sys
 import signal
 
-from pid import process_active, get_pid_by_name_and_args, AdoptedProcess
+from pid import process_active, AdoptedProcess, record_recorder, forget_recorder
 
 # yt-dlp's Chaturbate extractor raises these for a room that is up but has no public stream
 ROOM_STATES = (
@@ -48,7 +48,6 @@ class Streamer:
                     capture_log.write( "\n=== {} capture start {} ===\n".format(self.name, time.strftime("%Y-%m-%d %H:%M:%S")) )
                     capture_log.flush()
                     capture_offset = capture_log.tell()
-                    launched_at = time.time()
                     # recorder.py signals on write_fd once the room has resolved
                     ready_fd, write_fd = os.pipe()
                     process_args = [ sys.executable, "recorder.py", "https://chaturbate.com/{}/".format(self.name), str(write_fd) ]
@@ -64,24 +63,14 @@ class Streamer:
             proc = self.stream
 
             try:
-                # poll in 1s intervals to detect early exit (e.g. streamer offline)
-                poll_wait_time = self.daemon.config["process_poll_wait_time"]
-                if poll_wait_time is None:
-                    poll_wait_time = 10
-                for _ in range(poll_wait_time):
-                    if not self.stream or proc.poll() is not None:
-                        break
-                    time.sleep(1)
-                if self.stream and proc.poll() is None:
-                    # self.daemon.logger.info("Stream for {} appears to be healthy - validating.".format(self.name))
-                    if self.recorder_ready( ready_fd ) and self.ensure_valid_stream( pid = proc.pid ):
-                        self.daemon.logger.info("Started to record {}.".format(self.name))
-                        self.daemon.record_launch()
-                        self.finalize_prior_parts( launched_at )
-                        self.started = True
-                        proc.wait()
-                        self.cleanup_ffmpeg()
-                        return
+                # a restarted daemon adopts this recorder from the record
+                record_recorder( self.name, proc.pid )
+                if self.recorder_ready( ready_fd ) and self.ensure_valid_stream( pid = proc.pid ):
+                    self.daemon.logger.info("Started to record {}.".format(self.name))
+                    self.daemon.record_launch()
+                    self.started = True
+                    proc.wait()
+                    return
                 # stop clears stream, and a stopped launch says nothing about the site
                 if self.stream:
                     self.daemon.record_launch( self.launch_error( capture_path, capture_offset ) )
@@ -124,7 +113,6 @@ class Streamer:
                     self.started = True
                     self.daemon.logger.info("Adopted stream for {} validated.".format(self.name))
                     self.stream.wait()
-                    self.cleanup_ffmpeg()
                 else:
                     self.daemon.logger.info("Adopted stream for {} failed validation, will restart.".format(self.name))
             except Exception:
@@ -136,37 +124,6 @@ class Streamer:
         thread.daemon = True
         thread.start()
         return thread
-
-    def cleanup_ffmpeg( self ):
-        ffmpeg_pid = get_pid_by_name_and_args('ffmpeg', args_substring='/' + self.name + '/')
-        if ffmpeg_pid:
-            self.daemon.logger.info("Killing orphaned ffmpeg (PID {}) for {}".format(ffmpeg_pid, self.name))
-            os.kill( ffmpeg_pid, signal.SIGTERM )
-
-    def finalize_prior_parts( self, before ):
-        # Any .part last written before this recording launched belongs to an
-        # earlier stream that yt-dlp never finalized.
-        video_dir = os.path.join("videos", self.name)
-        try:
-            names = os.listdir(video_dir)
-        except OSError:
-            self.daemon.logger.exception("Failed to list {}".format(video_dir))
-            return
-        for part_name in names:
-            if not part_name.endswith('.part'):
-                continue
-            part_path = os.path.join(video_dir, part_name)
-            target_path = part_path[:-len('.part')]
-            try:
-                if os.path.getmtime(part_path) >= before:
-                    continue
-                if os.path.exists(target_path):
-                    self.daemon.logger.info("Not renaming {}: {} already exists.".format(part_path, target_path))
-                    continue
-                os.rename(part_path, target_path)
-                self.daemon.logger.info("Renamed {} -> {}".format(part_path, target_path))
-            except OSError:
-                self.daemon.logger.exception("Failed to rename {}".format(part_path))
 
     def stop( self, signal_child = True ):
         stream = self.stream
@@ -184,5 +141,6 @@ class Streamer:
             if stream.poll() is None:
                 stream.terminate()
                 stream.wait()
+            forget_recorder( self.name, stream.pid )
             self.stream = None
 
