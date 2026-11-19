@@ -1,8 +1,7 @@
 # Recordurbate
 
 Automatically records Chaturbate live streams. Runs as a background daemon that
-monitors a list of streamers and records any that go live using yt-dlp and
-ffmpeg.
+monitors a list of streamers and records any that go live.
 
 This is a full rewrite of the original
 [oliverjrose99/Recordurbate](https://github.com/oliverjrose99/Recordurbate).
@@ -12,13 +11,17 @@ The daemon, process management, and IPC layers have been rebuilt from scratch.
 
 The daemon runs in the background (via UNIX double-fork) and loops every 60
 seconds over a list of streamers. For each streamer that isn't already being
-recorded, it launches a yt-dlp subprocess targeting their Chaturbate page.
-yt-dlp handles stream detection and spawns ffmpeg to download the video.
+recorded, it launches `recorder.py` for their Chaturbate page.
 
-Each yt-dlp process runs in its own session (`setsid`) so it is isolated from
-the daemon's signal environment. The daemon monitors each process in a
-dedicated thread, validates that both yt-dlp and ffmpeg are alive, and cleans
-up orphaned processes when streams end or crash.
+The recorder asks yt-dlp for the room's video and audio playlists, downloads
+every segment itself with short timeouts, and has a local ffmpeg mux them into
+an MPEG-TS file. A segment that cannot be fetched becomes a gap in the same
+file rather than ending the recording; unreachable playlists are re-resolved
+within seconds.
+
+Each recorder runs in its own session (`setsid`) so it is isolated from the
+daemon's signal environment. The daemon monitors each recorder in a dedicated
+thread and relaunches it when the stream ends.
 
 Runtime management (add/remove streamers, start/stop, list status) is done via
 a TCP IPC interface. The daemon listens on a fixed localhost port, which the
@@ -55,11 +58,11 @@ git clone https://github.com/oliverjrose99/Recordurbate.git
 cd Recordurbate
 python3 -m venv venv
 source venv/bin/activate
-pip install yt-dlp psutil
+pip install yt-dlp psutil requests
 ```
 
-Streams are saved to `videos/<streamer_name>/` by default. This can be changed
-in `configs/youtube-dl.config`.
+Streams are saved to `videos/<streamer_name>/<title>.ts`. MPEG-TS plays while
+it is still being written (VLC, mpv, IINA).
 
 ## Running Recordurbate
 
@@ -127,8 +130,7 @@ python cli.py start --foreground
 
 The `upgrade` command performs a graceful handoff: the running daemon stops
 accepting new streams, hands its child process table to a new daemon instance,
-and exits. Active yt-dlp/ffmpeg recordings continue uninterrupted across the
-restart.
+and exits. Active recordings continue uninterrupted across the restart.
 
 ```bash
 ./service.sh upgrade
@@ -142,47 +144,46 @@ Two config files in the `configs/` directory:
 
 | Key                       | Type     | Default                       | Description                                                                |
 | :------------------------ | :------- | :---------------------------- | :------------------------------------------------------------------------- |
-| `youtube-dl_cmd`          | `string` | `"yt-dlp"`                    | Command to invoke yt-dlp. Can be an absolute path.                         |
-| `youtube-dl_config`       | `string` | `"configs/youtube-dl.config"` | Path to yt-dlp config, passed via `--config-location`.                     |
-| `auto_reload_config`      | `bool`   | `true`                        | Reload config every loop iteration (60s). Allows live streamer list edits. |
-| `rate_limit`              | `bool`   | `true`                        | Whether to rate-limit between launching streamers.                         |
-| `rate_limit_time`         | `number` | `0`                           | Seconds to sleep between streamer launches. `0` = no delay.                |
-| `process_poll_wait_time`  | `number` | `15`                          | Seconds to poll (1s intervals) after launching yt-dlp before validation.   |
-| `stale_stream_timeout`    | `number` | `300`                         | Seconds of `.part` file inactivity before killing a stale stream.          |
+| `youtube-dl_cmd`          | `string` | `"yt-dlp"`                    | Command `recorder.py` runs to resolve a room. Can be an absolute path.         |
+| `youtube-dl_config`       | `string` | `"configs/youtube-dl.config"` | Path to yt-dlp config, passed via `--config-location`.                         |
+| `auto_reload_config`      | `bool`   | `true`                        | Reload config every loop iteration (60s). Allows live streamer list edits.     |
+| `rate_limit`              | `bool`   | `true`                        | Whether to rate-limit between launching streamers.                             |
+| `rate_limit_time`         | `number` | `0`                           | Seconds to sleep between streamer launches. `0` = no delay.                    |
+| `process_poll_wait_time`  | `number` | `15`                          | Seconds to poll (1s intervals) after launching recorder.py before validation.  |
+| `stale_stream_timeout`    | `number` | `300`                         | Seconds of `.ts`/`.part` inactivity before the backstop kills a recorder.      |
 | `default_export_location` | `string` | `"./list.txt"`                | Default file path for the `export` command.                                |
 | `streamers`               | `array`  | `[]`                          | Chaturbate usernames to record.                                            |
 
 ### youtube-dl.config
 
-Passed to yt-dlp via `--config-location`. Controls output format, quality, and
-yt-dlp behavior. Default settings:
+Passed to yt-dlp via `--config-location` when `recorder.py` resolves a room.
+yt-dlp only resolves the stream; `recorder.py` downloads it and writes
+`videos/<streamer_name>/<title>.ts`, so output and downloader options have no
+effect. The options that matter:
 
 ```
--o "videos/%(id)s/%(title)s.%(ext)s"
---quiet
---hls-use-mpegts
 --cookies ./chaturbate.com_cookies.txt
 ```
 
 Quality can be limited to reduce file size and bandwidth:
 
 ```
--f 'best[height<1080][fps<?60]' -o "videos/%(id)s/%(title)s.%(ext)s"
+-f 'bv*[height<1080]+ba'
 ```
 
 See the [yt-dlp documentation](https://github.com/yt-dlp/yt-dlp#usage-and-options)
-for all available options.
+for format selection.
 
 ## Monitoring
 
-yt-dlp processes run in their own sessions and won't appear in `ps -u`. Use:
+Recorder processes run in their own sessions and won't appear in `ps -u`. Use:
 
 ```bash
-# all yt-dlp processes
-ps aux | grep yt-dlp
+# all recorders
+ps aux | grep recorder.py
 
 # detailed: PID, parent PID, status, uptime, command
-ps -eo pid,ppid,stat,etime,command | grep yt-dlp
+ps -eo pid,ppid,stat,etime,command | grep recorder.py
 
 # check for zombies
 ps aux | awk '$8 ~ /Z/'
@@ -217,16 +218,23 @@ The generated plist is installed to
 ### Large files and bandwidth
 
 Streams are captured at the source quality (up to 4K/60fps). This produces
-large files and heavy bandwidth usage. Use yt-dlp config options to limit
-quality if needed.
+large files and heavy bandwidth usage. Use a `-f` format filter in
+`configs/youtube-dl.config` to limit quality if needed.
 
-### Recordings lag or freeze
+### Gaps in a recording
 
-Usually caused by outdated yt-dlp or ffmpeg. Update both:
+When the CDN drops connections, `recorder.py` skips the segments it could not
+fetch and keeps writing the same file, so the recording has a gap instead of
+ending. Each gap is logged in `configs/capture-<name>.log` as a lost or failed
+segment.
+
+### Rooms no longer resolve
+
+yt-dlp resolves each room's playlists. If launches fail with extractor errors,
+update it:
 
 ```bash
 pip3 install -U yt-dlp
-brew upgrade ffmpeg    # macOS
 ```
 
 ### No files appearing

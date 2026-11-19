@@ -2,6 +2,7 @@ import subprocess
 import threading
 import time
 import os
+import sys
 import signal
 
 from pid import process_active, get_pid_by_name_and_args, AdoptedProcess
@@ -27,34 +28,18 @@ class Streamer:
       self.name = name
       self.daemon = daemon
     
-    def ensure_valid_stream( self, ytdlp_pid = None, ffmpeg_pid = None, recursion=0):
+    def ensure_valid_stream( self, ytdlp_pid = None ):
+        # recorder.py exits as soon as yt-dlp cannot resolve the room, so one
+        # still running after the launch poll is fetching its segments.
         if not ytdlp_pid and self.stream:
             ytdlp_pid = self.stream.pid
-        if ytdlp_pid and not process_active(ytdlp_pid):
-            ytdlp_pid = None
-        ffmpeg_pid = get_pid_by_name_and_args('ffmpeg', args_substring='/' + self.name + '/')#, exe_path=os.getcwd() + '/venv/bin') 
-        if ytdlp_pid:
-            if ffmpeg_pid:
-                return True
-            elif recursion > 5:
-                return False
-            else:
-                time.sleep(5)
-                # If we have yt-dlp but not ffmpeg it probably hasn't started yet.
-                # Maybe we want to add a recursion count but it hasn't been an issue yet.
-                return self.ensure_valid_stream(recursion=recursion+1)
-        else:
-            if ffmpeg_pid:
-                self.daemon.logger.exception("Lost parent yt-dlp; killing stranded ffmpeg with PID {}".format(ffmpeg_pid))
-                os.kill( ffmpeg_pid, signal.SIGTERM )
-            else:
-                return False
+        return bool( ytdlp_pid and process_active(ytdlp_pid) )
  
     def start(self):
         def stream_thread():
 
             try:
-                process_args = self.daemon.config["youtube-dl_cmd"].split(" ") + ["https://chaturbate.com/{}/".format(self.name), "--config-location", self.daemon.config["youtube-dl_config"]]
+                process_args = [ sys.executable, "recorder.py", "https://chaturbate.com/{}/".format(self.name) ]
                 capture_path = "./configs/capture-{}.log".format(self.name)
                 with open( capture_path, "a" ) as capture_log:
                     capture_log.write( "\n=== {} capture start {} ===\n".format(self.name, time.strftime("%Y-%m-%d %H:%M:%S")) )
@@ -148,7 +133,7 @@ class Streamer:
                 pass
 
             try:
-                part_files = [f for f in os.listdir(video_dir) if f.endswith('.part')]
+                part_files = [f for f in os.listdir(video_dir) if f.endswith(('.part', '.ts'))]
                 if part_files:
                     newest = max(part_files, key=lambda f: os.path.getmtime(os.path.join(video_dir, f)))
                     current_mtime = os.path.getmtime(os.path.join(video_dir, newest))

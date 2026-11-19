@@ -91,7 +91,10 @@ def find_running_ytdlp():
             if not cmdline:
                 continue
             cmdline_str = ' '.join( cmdline )
-            if 'yt-dlp' not in cmdline_str and 'yt_dlp' not in cmdline_str:
+            if 'recorder.py' not in cmdline_str and 'yt-dlp' not in cmdline_str and 'yt_dlp' not in cmdline_str:
+                continue
+            # recorder.py's own short-lived yt-dlp lookup is not a recording
+            if '--dump-single-json' in cmdline_str:
                 continue
             match = pattern.search( cmdline_str )
             if match:
