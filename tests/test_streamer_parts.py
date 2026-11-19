@@ -1,5 +1,4 @@
 import os
-import threading
 import time
 import types
 
@@ -429,13 +428,23 @@ def test_real_process_output_is_read_back_from_the_capture_log(workdir):
     assert daemon.launches == [error]
 
 
-def slow_lookup(output, exit_code):
-    # A recorder whose yt-dlp lookup finishes 1.5s after launch, past the
-    # launch poll window: it writes output to the capture log, then signals
-    # ready when exit_code is None, or exits with exit_code.
+def on_readiness_wait(monkeypatch, action):
+    # Runs action as Streamer enters its readiness wait, then waits for real,
+    # so the event provably lands inside the wait.
+    real_select = streamer.select.select
+    def select_after_action(*args):
+        action()
+        return real_select(*args)
+    monkeypatch.setattr(streamer.select, "select", select_after_action)
+
+
+def slow_lookup(output, exit_code, monkeypatch):
+    # A recorder whose yt-dlp lookup finishes once Streamer is waiting for it,
+    # past the launch poll window: it writes output to the capture log, then
+    # signals ready when exit_code is None, or exits with exit_code.
     class SlowLookup(FakeProc):
         def start(self):
-            threading.Timer(1.5, self.finish).start()
+            on_readiness_wait(monkeypatch, self.finish)
 
         def finish(self):
             with open("configs/capture-alice.log", "a") as f:
@@ -450,7 +459,7 @@ def slow_lookup(output, exit_code):
 
 def test_offline_room_reported_after_the_poll_window_is_not_started(start_harness, monkeypatch):
     start_harness["output"] = ""
-    start_harness["proc_factory"] = slow_lookup("ERROR: [Chaturbate] alice: Room is currently offline\n", 1)
+    start_harness["proc_factory"] = slow_lookup("ERROR: [Chaturbate] alice: Room is currently offline\n", 1, monkeypatch)
     monkeypatch.setattr(Streamer, "ensure_valid_stream", validation_returning(start_harness, True))
     daemon = make_daemon()
 
@@ -464,7 +473,7 @@ def test_offline_room_reported_after_the_poll_window_is_not_started(start_harnes
 
 def test_recording_line_after_the_poll_window_starts_recording(start_harness, monkeypatch):
     start_harness["output"] = ""
-    start_harness["proc_factory"] = slow_lookup(READY_LINE, None)
+    start_harness["proc_factory"] = slow_lookup(READY_LINE, None, monkeypatch)
     monkeypatch.setattr(Streamer, "ensure_valid_stream", validation_returning(start_harness, True))
     daemon = make_daemon()
 
@@ -496,11 +505,9 @@ def test_stop_during_the_readiness_wait_reports_nothing(start_harness, monkeypat
     monkeypatch.setattr(Streamer, "ensure_valid_stream", validation_returning(start_harness, True))
     daemon = make_daemon()
     s = Streamer(daemon, "alice")
-    stopper = threading.Timer(1.5, s.stop)
-    stopper.start()
+    on_readiness_wait(monkeypatch, s.stop)
 
     run_start(s)
-    stopper.join()
 
     assert daemon.launches == []
     assert start_harness["validated"] == 0
