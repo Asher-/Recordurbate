@@ -82,7 +82,8 @@ class StartTest( InTempDir ):
         with mock.patch.object( streamer.subprocess, "Popen", fake_popen ):
             Streamer( daemon, "someroom" ).start().join( 10 )
         args, kwargs = launched[0]
-        self.assertEqual( args, [ sys.executable, "recorder.py", "https://chaturbate.com/someroom/" ] )
+        self.assertEqual( args[:3], [ sys.executable, "recorder.py", "https://chaturbate.com/someroom/" ] )
+        self.assertEqual( kwargs["pass_fds"], ( int(args[3]), ) )
         self.assertTrue( kwargs["start_new_session"] )
         self.assertEqual( daemon.launches, [ NO_ERROR ] )
 

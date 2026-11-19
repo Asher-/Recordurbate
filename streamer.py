@@ -1,4 +1,5 @@
 import subprocess
+import select
 import threading
 import time
 import os
@@ -40,16 +41,24 @@ class Streamer:
     def start(self):
         def stream_thread():
 
+            ready_fd = None
             try:
-                process_args = [ sys.executable, "recorder.py", "https://chaturbate.com/{}/".format(self.name) ]
                 capture_path = "./configs/capture-{}.log".format(self.name)
                 with open( capture_path, "a" ) as capture_log:
                     capture_log.write( "\n=== {} capture start {} ===\n".format(self.name, time.strftime("%Y-%m-%d %H:%M:%S")) )
                     capture_log.flush()
                     capture_offset = capture_log.tell()
                     launched_at = time.time()
-                    self.stream = subprocess.Popen( process_args, 0, stdout=capture_log, stderr=capture_log, start_new_session=True )
+                    # recorder.py signals on write_fd once the room has resolved
+                    ready_fd, write_fd = os.pipe()
+                    process_args = [ sys.executable, "recorder.py", "https://chaturbate.com/{}/".format(self.name), str(write_fd) ]
+                    try:
+                        self.stream = subprocess.Popen( process_args, 0, stdout=capture_log, stderr=capture_log, start_new_session=True, pass_fds=(write_fd,) )
+                    finally:
+                        os.close( write_fd )
             except OSError:
+                if ready_fd is not None:
+                    os.close( ready_fd )
                 self.daemon.logger.exception("Failed to launch recorder for {}".format(self.name))
                 return
             proc = self.stream
@@ -65,7 +74,7 @@ class Streamer:
                     time.sleep(1)
                 if self.stream and proc.poll() is None:
                     # self.daemon.logger.info("Stream for {} appears to be healthy - validating.".format(self.name))
-                    if self.recorder_ready( proc, capture_path, capture_offset ) and self.ensure_valid_stream( pid = proc.pid ):
+                    if self.recorder_ready( ready_fd ) and self.ensure_valid_stream( pid = proc.pid ):
                         self.daemon.logger.info("Started to record {}.".format(self.name))
                         self.daemon.record_launch()
                         self.finalize_prior_parts( launched_at )
@@ -79,6 +88,7 @@ class Streamer:
             except Exception:
                 self.daemon.logger.exception("stream_thread error for {}".format(self.name))
             finally:
+                os.close( ready_fd )
                 self.stop( signal_child=False )
             return
         thread = threading.Thread(target=stream_thread, args=())
@@ -98,24 +108,12 @@ class Streamer:
             return None
         return errors[-1]
 
-    def recorder_ready( self, proc, capture_path, offset ):
-        # recorder.py logs "Recording <name> to <path>" once yt-dlp has resolved
-        # the room; until then it may still exit reporting the room offline.
-        # One handle follows the recorder's output as it is appended, so each
-        # line is read once.
-        marker = "] Recording {} to ".format(self.name)
-        deadline = time.time() + READY_TIMEOUT
-        with open( capture_path, "r", errors="replace" ) as capture_log:
-            capture_log.seek( offset )
-            partial = ""
-            while True:
-                lines = ( partial + capture_log.read() ).split("\n")
-                partial = lines.pop()
-                if any( marker in line for line in lines ):
-                    return True
-                if not self.stream or proc.poll() is not None or time.time() >= deadline:
-                    return False
-                time.sleep(1)
+    def recorder_ready( self, ready_fd ):
+        # recorder.py writes to ready_fd once yt-dlp has resolved the room, then
+        # closes it. The pipe reaches end of file without a write when the
+        # recorder exits first, including when stop() terminates it.
+        readable, _, _ = select.select( [ready_fd], [], [], READY_TIMEOUT )
+        return bool( readable ) and os.read( ready_fd, 16 ) != b""
 
     def adopt( self, pid ):
         def adopted_thread():

@@ -39,6 +39,15 @@ CLOSE_TIMEOUT = 3        # seconds each muxer shutdown phase may take
 def log( message ):
     print( "[recorder {}] {}".format( time.strftime("%Y-%m-%d %H:%M:%S"), message ), flush=True )
 
+def signal_ready( fd ):
+    # Tells the daemon that launched this recorder that the room resolved. The
+    # daemon may have handed off and exited, so a closed pipe is not an error.
+    try:
+        os.write( fd, b"ready\n" )
+    except OSError:
+        pass
+    os.close( fd )
+
 def extract( url, config, stop ):
     # Resolves the room through yt-dlp. Returns ("ok", (title, urls, headers)),
     # ("unavailable", reason) when yt-dlp names a room state, or
@@ -224,6 +233,8 @@ def main():
     os.makedirs( os.path.join("videos", name), exist_ok=True )
     path = os.path.join( "videos", name, title + ".ts" )
     log( "Recording {} to {}".format(name, path) )
+    if len( sys.argv ) > 2:
+        signal_ready( int(sys.argv[2]) )
 
     session = requests.Session()
     session.headers.update( headers )

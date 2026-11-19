@@ -131,22 +131,47 @@ READY_LINE = "[recorder 2026-10-01 12:00:00] Recording alice to videos/alice/ali
 
 class FakeProc:
     pid = 4242
+    ready_fd = None
 
     def __init__(self):
         self.returncode = None
+
+    def release(self):
+        # The recorder's end of the readiness pipe closes when it exits.
+        if self.ready_fd is not None:
+            os.close(self.ready_fd)
+            self.ready_fd = None
 
     def poll(self):
         return self.returncode
 
     def wait(self, timeout=None):
         self.returncode = 0
+        self.release()
         return 0
 
     def terminate(self):
         self.returncode = -15
+        self.release()
 
     def send_signal(self, sig):
         self.returncode = -2
+        self.release()
+
+
+def launch(factory, popen_kwargs, ready):
+    # Holds the recorder's copy of the readiness pipe's write end, which
+    # Streamer closes in the daemon right after Popen, as a real child would.
+    proc = factory()
+    proc.ready_fd = os.dup(popen_kwargs["pass_fds"][0])
+    if ready:
+        os.write(proc.ready_fd, b"ready\n")
+        proc.release()
+    elif proc.returncode is not None:
+        proc.release()
+    if hasattr(proc, "start"):
+        proc.start()
+    return proc
 
 
 @pytest.fixture
@@ -157,9 +182,7 @@ def fake_launch(workdir, monkeypatch):
 
     def fake_popen(*args, **kwargs):
         write(new_part, time.time())
-        kwargs["stdout"].write(READY_LINE)
-        kwargs["stdout"].flush()
-        return FakeProc()
+        return launch(FakeProc, kwargs, ready=True)
 
     (workdir / "configs").mkdir()
     monkeypatch.setattr(streamer.subprocess, "Popen", fake_popen)
@@ -208,9 +231,10 @@ def start_harness(workdir, monkeypatch):
 
     def fake_popen(*args, **kwargs):
         calls["popen_at"] = time.time()
-        kwargs["stdout"].write(calls.get("output", READY_LINE))
+        output = calls.get("output", READY_LINE)
+        kwargs["stdout"].write(output)
         kwargs["stdout"].flush()
-        return calls.get("proc_factory", FakeProc)()
+        return launch(calls.get("proc_factory", FakeProc), kwargs, ready="] Recording " in output)
 
     def fake_finalize(self, before):
         calls["finalize"].append(before)
@@ -406,21 +430,21 @@ def test_real_process_output_is_read_back_from_the_capture_log(workdir):
 
 
 def slow_lookup(output, exit_code):
-    # A recorder whose yt-dlp lookup finishes on its third poll, after the
-    # launch poll window: it writes output to the capture log and, unless
-    # exit_code is None, exits with it.
+    # A recorder whose yt-dlp lookup finishes 1.5s after launch, past the
+    # launch poll window: it writes output to the capture log, then signals
+    # ready when exit_code is None, or exits with exit_code.
     class SlowLookup(FakeProc):
-        def __init__(self):
-            super().__init__()
-            self.polls = 0
+        def start(self):
+            threading.Timer(1.5, self.finish).start()
 
-        def poll(self):
-            self.polls += 1
-            if self.polls == 3:
-                with open("configs/capture-alice.log", "a") as f:
-                    f.write(output)
+        def finish(self):
+            with open("configs/capture-alice.log", "a") as f:
+                f.write(output)
+            if exit_code is None:
+                os.write(self.ready_fd, b"ready\n")
+            else:
                 self.returncode = exit_code
-            return self.returncode
+            self.release()
     return SlowLookup
 
 
