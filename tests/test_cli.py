@@ -2,10 +2,10 @@ import errno
 import logging
 import os
 import plistlib
+import select
 import socket
 import subprocess
 import sys
-import time
 import uuid
 
 import pytest
@@ -71,8 +71,11 @@ def install_service_copy(tmp_path, label, python_body):
     # Never let a copy reach the real com.recordurbate.daemon job
     assert 'LABEL="{}"'.format(label) in script.read_text()
     (bin_dir / "activate").write_text('PATH="{}:$PATH"\n'.format(bin_dir))
+    # The job writes its PID to this FIFO as it starts; see job_pid
+    started = tmp_path / "project" / "started"
+    os.mkfifo(started)
     python = bin_dir / "python"
-    python.write_text("#!/bin/bash\n" + python_body + "\n")
+    python.write_text("#!/bin/bash\necho $$ > '{}'\n".format(started) + python_body + "\n")
     python.chmod(0o755)
     return script
 
@@ -87,11 +90,7 @@ def test_enable_logs_outside_project_and_status_reports_last_exit(tmp_path, pyth
     env = dict(os.environ, HOME=str(home))
     try:
         subprocess.run([str(script), "enable"], env=env, check=True, capture_output=True)
-        status = ""
-        deadline = time.monotonic() + LAUNCHD_DEADLINE_SECONDS
-        while exited + "\n" not in status and time.monotonic() < deadline:
-            time.sleep(0.2)
-            status = subprocess.run([str(script), "status"], env=env, capture_output=True, text=True).stdout
+        status = status_after_exit(script, env)
 
         with open(home / "Library" / "LaunchAgents" / (label + ".plist"), "rb") as plist_file:
             plist = plistlib.load(plist_file)
@@ -103,14 +102,25 @@ def test_enable_logs_outside_project_and_status_reports_last_exit(tmp_path, pyth
         subprocess.run([str(script), "disable"], env=env, capture_output=True)
 
 
-def poll_status(script, env, line):
-    # launchd runs the job asynchronously, so wait for status to report its exit
-    status = ""
-    deadline = time.monotonic() + LAUNCHD_DEADLINE_SECONDS
-    while line + "\n" not in status and time.monotonic() < deadline:
-        time.sleep(0.2)
-        status = subprocess.run([str(script), "status"], env=env, capture_output=True, text=True).stdout
-    return status
+def job_pid(script):
+    # Blocks until launchd has started the job and it has written its PID
+    with open(script.parent / "started") as started:
+        return int(started.read())
+
+
+def status_after_exit(script, env):
+    # launchd runs the job asynchronously; status is read once the job has exited
+    pid = job_pid(script)
+    queue = select.kqueue()
+    try:
+        exit_event = select.kevent(pid, select.KQ_FILTER_PROC, select.KQ_EV_ADD | select.KQ_EV_ONESHOT, select.KQ_NOTE_EXIT)
+        try:
+            assert queue.control([exit_event], 1, LAUNCHD_DEADLINE_SECONDS)
+        except ProcessLookupError:
+            pass  # exited before the event was registered
+    finally:
+        queue.close()
+    return subprocess.run([str(script), "status"], env=env, capture_output=True, text=True).stdout
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="service.sh manages launchd")
@@ -122,12 +132,12 @@ def test_enable_reloads_loaded_job_from_regenerated_plist(tmp_path):
     env = dict(os.environ, HOME=str(home))
     try:
         subprocess.run([str(first), "enable"], env=env, check=True, capture_output=True)
-        assert "Exited:  3\n" in poll_status(first, env, "Exited:  3")
+        assert "Exited:  3\n" in status_after_exit(first, env)
 
         # The job is loaded now, so this enable takes the reload route; only the
         # second project's job exits 4
         subprocess.run([str(second), "enable"], env=env, check=True, capture_output=True)
-        status = poll_status(second, env, "Exited:  4")
+        status = status_after_exit(second, env)
 
         with open(home / "Library" / "LaunchAgents" / (label + ".plist"), "rb") as plist_file:
             plist = plistlib.load(plist_file)
@@ -180,11 +190,10 @@ def test_status_reports_pid_while_job_runs(tmp_path):
     env = dict(os.environ, HOME=str(tmp_path / "home"))
     try:
         subprocess.run([str(script), "enable"], env=env, check=True, capture_output=True)
-        status = ""
-        deadline = time.monotonic() + LAUNCHD_DEADLINE_SECONDS
-        while not running_pid_lines(status) and time.monotonic() < deadline:
-            time.sleep(0.2)
-            status = subprocess.run([str(script), "status"], env=env, capture_output=True, text=True).stdout
+        pid = job_pid(script)  # the job is running once it has reported
+        status = subprocess.run([str(script), "status"], env=env, capture_output=True, text=True).stdout
+
+        assert "PID:     {}".format(pid) in status.splitlines()
 
         assert running_pid_lines(status)
         assert "Exited:" not in status
@@ -200,7 +209,7 @@ def test_disable_unloads_job_and_removes_plist(tmp_path):
     env = dict(os.environ, HOME=str(home))
     try:
         subprocess.run([str(script), "enable"], env=env, check=True, capture_output=True)
-        assert "Exited:  3\n" in poll_status(script, env, "Exited:  3")
+        assert "Exited:  3\n" in status_after_exit(script, env)
 
         loaded = subprocess.run([str(script), "disable"], env=env, capture_output=True, text=True)
         status = subprocess.run([str(script), "status"], env=env, capture_output=True, text=True).stdout

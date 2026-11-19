@@ -172,16 +172,17 @@ class Daemon:
                     self.site_unreachable = True
                     self.logger.warning("No launch has reached chaturbate.com in {} attempts, so no new recording can start. Latest: {}".format(self.failed_launches, error))
 
+    # stop and handoff end the run loop; the process exits when start's join
+    # of the run-loop thread returns. Each answers its client first, since
+    # the process may exit before the IPC handler's own close runs.
     def stop(self, client_response = None):
         if self.pid:
             self.logger.info("Caught stop signal, stopping")
             if client_response:
-                client_response.close() # Since we exit we have to do this here
+                client_response.close()
             self.pid = None
             if self.wake:
                 self.wake.set()
-            time.sleep(1)
-            sys.exit(0)
 
     def handoff( self, client_response = None ):
         if self.pid:
@@ -193,8 +194,6 @@ class Daemon:
             self.pid = None
             if self.wake:
                 self.wake.set()
-            time.sleep(1)
-            sys.exit(0)
 
     def restart(self, client_response):
         self.stop()
@@ -325,7 +324,9 @@ class Daemon:
 
                 except Exception:
                     self.logger.exception("loop error")
-                    time.sleep(1)
+                    # retry on the normal one-minute cadence; stop and handoff wake it
+                    if self.pid:
+                        self.wake.wait(60)
 
             # loop ended
             if not self._handoff:

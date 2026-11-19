@@ -6,13 +6,13 @@ import socket
 import subprocess
 import sys
 import threading
-import time
 
 import pytest
 
 import daemon
 from daemon import Daemon
 from ipc.ipc_config import IpcConfig
+from streamer import Streamer
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -172,18 +172,104 @@ def test_stop_ends_the_run_loops_wait_at_once(monkeypatch):
 
 @pytest.mark.parametrize("method", ["stop", "handoff"])
 def test_stop_and_handoff_clear_pid_and_set_wake(monkeypatch, method):
-    monkeypatch.setattr(daemon.time, "sleep", lambda seconds: None)
+    def no_sleep(seconds):
+        raise AssertionError("{} slept {}s".format(method, seconds))
+    monkeypatch.setattr(daemon.time, "sleep", no_sleep)
     instance = bare_daemon()
     instance.pid = os.getpid()
     instance.wake = threading.Event()
 
-    with pytest.raises(SystemExit) as exited:
-        getattr(instance, method)()
+    # Returns rather than exiting; the process ends when start's join returns
+    assert getattr(instance, method)() is None
 
-    assert exited.value.code == 0
     assert instance.pid is None
     assert instance.wake.is_set()
     assert instance._handoff == (method == "handoff")
+
+
+def test_run_loop_waits_for_wake_after_an_error(monkeypatch):
+    monkeypatch.setattr(daemon, "recorded_recorder", lambda name: None)
+    slept = []
+    monkeypatch.setattr(daemon.time, "sleep", slept.append)
+    instance = bare_daemon()
+    instance.pid = os.getpid()
+    instance.config = {"auto_reload_config": False, "rate_limit_time": 0}
+    instance.streamers_lock = threading.Lock()
+    failed = threading.Event()
+
+    class FailingStreamer:
+        stream = None
+
+        def start(self):
+            failed.set()
+            raise RuntimeError("launch failed")
+
+        def stop(self):
+            pass
+
+    instance.streamers = {"room": FailingStreamer()}
+
+    thread = instance.run()
+    assert failed.wait(timeout=5)
+    instance.stop()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert slept == []
+
+
+@pytest.mark.parametrize("method", ["stop", "handoff"])
+def test_run_with_a_real_recorder_ends_on_stop_and_handoff(monkeypatch, tmp_path, method):
+    # Daemon.run launches recorder.py through Streamer. fake_ytdlp.py resolves
+    # the room to a server that accepts connections and never answers, so the
+    # recorder runs until the daemon ends it.
+    unanswering = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    unanswering.bind(("127.0.0.1", 0))
+    unanswering.listen(16)
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "configs" / "config.json").write_text(json.dumps({
+        "youtube-dl_cmd": "{} {}".format(sys.executable, os.path.join(REPO, "tests", "fake_ytdlp.py")),
+        "youtube-dl_config": "configs/unused.config",
+    }))
+    (tmp_path / "recorder.py").symlink_to(os.path.join(REPO, "recorder.py"))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FAKE_HLS_BASE", "http://127.0.0.1:{}".format(unanswering.getsockname()[1]))
+    monkeypatch.setattr(daemon, "recorded_recorder", lambda name: None)
+    instance = counting_daemon()
+    instance.pid = os.getpid()
+    instance.config = {"auto_reload_config": False, "rate_limit_time": 0}
+    instance.streamers_lock = threading.Lock()
+    streamer = Streamer(instance, "room")
+    instance.streamers = {"room": streamer}
+    launched = threading.Event()
+    real_record_launch = instance.record_launch
+
+    def record_and_report(error=None):
+        real_record_launch(error)
+        launched.set()
+
+    instance.record_launch = record_and_report
+
+    thread = instance.run()
+    recorder = None
+    try:
+        assert launched.wait(timeout=30)
+        recorder = streamer.stream
+        assert recorder is not None and recorder.poll() is None
+
+        getattr(instance, method)()
+        thread.join(timeout=30)
+
+        assert not thread.is_alive()
+        if method == "stop":
+            assert recorder.poll() is not None
+        else:
+            assert recorder.poll() is None
+    finally:
+        if recorder is not None and recorder.poll() is None:
+            os.killpg(recorder.pid, signal.SIGKILL)
+            recorder.wait()
+        unanswering.close()
 
 
 class AdoptingStreamer:
@@ -227,9 +313,8 @@ report = {
     "pid": os.getpid(),
     "devnull": [(lambda s: (s.st_dev, s.st_ino) == (devnull.st_dev, devnull.st_ino))(os.fstat(fd)) for fd in (0, 1, 2)],
 }
-with open(sys.argv[1] + ".tmp", "w") as report_file:
+with open(sys.argv[1], "w") as report_file:  # a FIFO the test is reading
     json.dump(report, report_file)
-os.rename(sys.argv[1] + ".tmp", sys.argv[1])
 time.sleep(30)
 """
 
@@ -238,6 +323,7 @@ DAEMON_REPORT_DEADLINE_SECONDS = 10
 
 def test_daemonize_releases_the_callers_stdio(tmp_path):
     report_path = tmp_path / "report.json"
+    os.mkfifo(report_path)
     caller = subprocess.Popen(
         [sys.executable, "-c", DAEMONIZE_SCRIPT, str(report_path)],
         cwd=REPO, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -246,17 +332,13 @@ def test_daemonize_releases_the_callers_stdio(tmp_path):
     try:
         # Returns only once every process holding the caller's pipes has let go
         caller.communicate(timeout=DAEMON_REPORT_DEADLINE_SECONDS)
-        deadline = time.monotonic() + DAEMON_REPORT_DEADLINE_SECONDS
-        while not report_path.exists() and time.monotonic() < deadline:
-            time.sleep(0.1)
+        # Blocks until the daemon opens the FIFO, writes its report and closes it
         report = json.loads(report_path.read_text())
 
         os.kill(report["pid"], 0)  # the daemon is still running
         assert report["devnull"] == [True, True, True]
     finally:
         caller.kill()
-        if report is None and report_path.exists():
-            report = json.loads(report_path.read_text())
         if report is not None:
             try:
                 os.kill(report["pid"], signal.SIGKILL)

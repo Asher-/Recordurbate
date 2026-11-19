@@ -208,6 +208,11 @@ class FakeHls:
         self.outage = outage
         self.hang = hang
         self.started = time.time()
+        # set once two media segments of each track have been served: the
+        # recorder fetches a track in order, so its first has reached the muxer
+        self.served = threading.Event()
+        self.served_lock = threading.Lock()
+        self.served_counts = {}
         fake = self
         class Handler( http.server.BaseHTTPRequestHandler ):
             def log_message( self, *args ):
@@ -255,6 +260,11 @@ class FakeHls:
         request.send_header( "Content-Length", str(len(body)) )
         request.end_headers()
         request.wfile.write( body )
+        if name.startswith( "seg_" ):
+            with self.served_lock:
+                self.served_counts[ letter ] = self.served_counts.get( letter, 0 ) + 1
+                if len( self.served_counts ) == 2 and min( self.served_counts.values() ) >= 2:
+                    self.served.set()
 
     def close( self ):
         self.server.shutdown()
@@ -304,7 +314,7 @@ class RecorderRunTest( unittest.TestCase ):
             proc = subprocess.Popen( [ sys.executable, os.path.join(ROOT, "recorder.py"), "https://chaturbate.com/room/" ],
                                      cwd=self.cwd, env=dict(os.environ, FAKE_HLS_BASE=hls.base),
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True )
-            time.sleep( 4 )
+            self.assertTrue( hls.served.wait( 15 ) )
             proc.send_signal( 2 )
             out, _ = proc.communicate( timeout=15 )
         finally:
