@@ -144,6 +144,32 @@ def test_logs_recovery_once_and_warns_again_on_the_next_outage(caplog):
     assert "ERROR: second outage" in caplog.records[2].getMessage()
 
 
+def test_stop_ends_the_run_loops_wait_at_once(monkeypatch):
+    monkeypatch.setattr(daemon, "recorded_recorder", lambda name: None)
+    instance = bare_daemon()
+    instance.pid = os.getpid()
+    instance.config = {"auto_reload_config": False, "rate_limit_time": 0}
+    instance.streamers_lock = threading.Lock()
+    instance.streamers = {}
+    waiting = threading.Event()
+
+    thread = instance.run()
+    real_wait = instance.wake.wait
+    # the loop is inside its minute wait once this wrapper runs
+    def wait_and_report(timeout):
+        waiting.set()
+        return real_wait(timeout)
+    instance.wake.wait = wait_and_report
+    instance.wake.set()  # ends a wait that began before the wrapper
+    instance.wake.clear()
+    assert waiting.wait(timeout=65)
+    instance.pid = None
+    instance.wake.set()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+
+
 class AdoptingStreamer:
     def __init__(self, stream=None):
         self.stream = stream
