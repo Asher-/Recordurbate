@@ -232,27 +232,30 @@ class Muxer:
 def run():
     # Entry point: recorder.py https://chaturbate.com/<name>/ [<ready fd>]
     url = sys.argv[1]
-    name = url.rstrip("/").rsplit("/", 1)[-1]
-    config = Config.load_config()
     ready_fd = int( sys.argv[2] ) if len( sys.argv ) > 2 else None
 
-    # Recorded before anything else, by this process itself, so a daemon
-    # started after a handoff or a crash can adopt it.
+    # The main thread only takes signals; everything else runs on a worker.
+    stop = Stop()
+    def on_signal( signum, frame ):
+        stop.set()
+    signal.signal( signal.SIGINT, on_signal )
+    signal.signal( signal.SIGTERM, on_signal )
+    outcome = { "exit_code": 1 }
+    worker = threading.Thread( target=recording, args=(url, ready_fd, stop, outcome) )
+    worker.start()
+    worker.join()
+    sys.exit( outcome["exit_code"] )
+
+def recording( url, ready_fd, stop, outcome ):
+    # On run()'s worker: records this process's PID before anything else, so
+    # a daemon started after a handoff or a crash can adopt it, records the
+    # room, and forgets the PID as it ends.
+    name = url.rstrip("/").rsplit("/", 1)[-1]
     record_recorder( name, os.getpid() )
     try:
-        # The main thread only takes signals; the recording runs on a worker.
-        stop = Stop()
-        def on_signal( signum, frame ):
-            stop.set()
-        signal.signal( signal.SIGINT, on_signal )
-        signal.signal( signal.SIGTERM, on_signal )
-        outcome = { "exit_code": 1 }
-        worker = threading.Thread( target=main, args=(url, config, ready_fd, stop, outcome) )
-        worker.start()
-        worker.join()
+        main( url, Config.load_config(), ready_fd, stop, outcome )
     finally:
         forget_recorder( name, os.getpid() )
-    sys.exit( outcome["exit_code"] )
 
 def main( url, config, ready_fd, stop, outcome ):
     # Records the room until it ends or stop is set. outcome["exit_code"]
