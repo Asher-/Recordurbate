@@ -987,23 +987,6 @@ full daemon restart.
 - Empty `recv()` (server closed connection) now breaks the loop.
 - Catches `ValueError`/`OSError` on `select` for connection loss.
 
-### Timing Improvements
-
-**Problem**: Cleanup of hung or offline yt-dlp processes took up to 145 seconds.
-
-| Parameter                     | Before               | After           | Location                  |
-| :---------------------------- | :------------------- | :-------------- | :------------------------ |
-| `ensure_valid_stream` retries |                   10 |               5 | `streamer.py` (hardcoded) |
-| `ensure_valid_stream` sleep   | 10s                  | 5s              | `streamer.py` (hardcoded) |
-| **Worst-case cleanup**        | **145s**             | **40s**         |                           |
-| **Offline streamer recycle**  | **45s**              | **~3s**         |                           |
-
-The blind `time.sleep(poll_wait_time)` was replaced with a 1s polling loop
-that checks `stream.poll()` each iteration and breaks immediately when the
-process exits.
-
----
-
 ## Changes (Feb 25, 2026)
 
 ### Stranded Sleeping Process Fixes

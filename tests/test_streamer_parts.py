@@ -309,7 +309,7 @@ def on_readiness_wait(monkeypatch, action):
 
 def slow_lookup(output, exit_code, monkeypatch):
     # A recorder whose yt-dlp lookup finishes once Streamer is waiting for it,
-    # past the launch poll window: it writes output to the capture log, then
+    # while Streamer is in its readiness wait: it writes output to the capture log, then
     # signals ready when exit_code is None, or exits with exit_code.
     class SlowLookup(FakeProc):
         def start(self):
