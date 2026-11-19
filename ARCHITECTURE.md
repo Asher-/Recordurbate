@@ -87,7 +87,7 @@ Recordurbate/
 ├── daemon.py                   # Daemon class: fork, run loop, streamer management
 ├── streamer.py                 # Streamer class: recorder lifecycle, validation, cleanup
 ├── recorder.py                 # Per-room LL-HLS segment fetcher and MPEG-TS muxer
-├── pid.py                      # Process utilities (active check, find by name/args)
+├── pid.py                      # Process utilities (active check, recorder PID records, AdoptedProcess)
 ├── config.py                   # Config load/save from JSON
 ├── ipc/
 │   ├── __init__.py
@@ -283,16 +283,14 @@ The `Streamer` class manages a single streamer's `recorder.py` process.
      group so it doesn't receive signals meant for the daemon.
    - `stdout` and `stderr` appended to `configs/capture-<name>.log`.
    - `pass_fds` carrying the write end of a readiness pipe.
-2. Writes the recorder's PID to `configs/pid-<name>`, so a daemon started
-   after a handoff can adopt it.
-3. Calls `recorder_ready()`, which waits once in `select()`, up to 90s, for
+2. Calls `recorder_ready()`, which waits once in `select()`, up to 90s, for
    `recorder.py` to write `ready` on the pipe after the room has resolved. The
    pipe reaches end of file without a write when the recorder exits first,
    including an offline room and a `stop()`. Then `ensure_valid_stream()`.
    Without the signal the launch did not start recording.
-4. If valid, sets `started = True` and blocks in `proc.wait()` until the
+3. If valid, sets `started = True` and blocks in `proc.wait()` until the
    recorder exits.
-5. On exit, calls `stop(signal_child=False)`.
+4. On exit, calls `stop(signal_child=False)`.
 
 **`launch_error()`**: After a launch that did not start recording, reads what
 the recorder and its yt-dlp lookup wrote to `configs/capture-<name>.log` for
@@ -310,7 +308,6 @@ is alive, via `pid.process_active()`.
   `wait()` for graceful shutdown.
 - Regardless: checks `poll()` — if the child is still alive, sends `SIGTERM`
   via `terminate()` and `wait()`. This is the safety net for hung processes.
-- Removes `configs/pid-<name>` when it still names this recorder.
 - Sets `self.stream = None`.
 
 ---
@@ -370,11 +367,19 @@ Process utility functions using `psutil`.
 **`process_active(pid)`**: Returns `True` if the PID exists and is not in
 `STATUS_DEAD` or `STATUS_ZOMBIE` state.
 
-**`get_pid_by_name_and_args(process_name, args_substring, exe_path)`**: Iterates
-all system processes to find one matching by name (case-insensitive), optionally
-filtering by a substring in the command-line arguments and/or executable path.
-Returns the first matching PID or `None`. Used to find ffmpeg processes
-associated with a specific streamer.
+**`record_recorder(name, pid)`**: Called by `recorder.py` for itself as it
+starts. Writes `configs/pid-<name>` through a temporary file renamed into
+place, so a crash never leaves a partial record.
+
+**`forget_recorder(name, pid)`**: Removes `configs/pid-<name>` when it still
+names `pid`. `recorder.py` calls it as it exits.
+
+**`recorded_recorder(name)`**: The PID in `configs/pid-<name>` when that process
+is alive and its command line holds `recorder.py` and
+`chaturbate.com/<name>/`; otherwise forgets the record and returns `None`.
+
+**`AdoptedProcess.wait(timeout)`**: Registers a kqueue `NOTE_EXIT` event for a
+PID that is not a child and blocks once until it fires.
 
 ---
 
@@ -528,17 +533,16 @@ to finish (which only happens when `self.pid` is set to `None`).
                     │                                             │
                     │  1. Popen(recorder.py, new session,         │
                     │           pass_fds=readiness pipe)          │
-                    │  2. configs/pid-<name> ← recorder PID       │
-                    │  3. recorder_ready()                        │
+                    │     (recorder.py writes configs/pid-<name>) │
+                    │  2. recorder_ready()                        │
                     │     └─ one select(): ready, EOF or 90s      │
                     │     ensure_valid_stream()                   │
                     │     └─ recorder alive → True                │
-                    │  4. If valid:                               │
+                    │  3. If valid:                               │
                     │     ├─ started = True                       │
                     │     └─ proc.wait() (until recorder exits)   │
-                    │  5. stop(signal_child=False)                │
+                    │  4. stop(signal_child=False)                │
                     │     ├─ If child still alive: terminate+wait │
-                    │     ├─ remove configs/pid-<name>            │
                     │     └─ stream = None                        │
                     └─────────────────────────────────────────────┘
                                    │
@@ -550,10 +554,10 @@ to finish (which only happens when `self.pid` is set to `None`).
                     └─────────────────────────────────────────────┘
 ```
 
-**Timing**: after the poll loop (≤15s), `recorder_ready()` waits up to
-`READY_TIMEOUT` (90s) for the recorder's ready signal. The yt-dlp lookup can take
-longer than the poll loop; for an offline streamer `recorder.py` then exits
-during the readiness wait, which detects the exit within 1s.
+**Timing**: right after `Popen`, `recorder_ready()` waits up to `READY_TIMEOUT`
+(90s) for the recorder's ready signal. For an offline streamer `recorder.py`
+exits during that wait, and `select()` returns at once on the pipe's end of
+file.
 
 ---
 
@@ -885,8 +889,8 @@ recorder PIDs.
 ### Offline Streamer Cycling
 
 When a streamer is offline, the recorder's yt-dlp lookup reports the room
-state and the recorder exits. The launch poll or the readiness wait detects
-this within 1 additional second. The streamer thread cleans up and sets
+state and the recorder exits. The readiness wait sees the pipe's end of file
+at once. The streamer thread cleans up and sets
 `stream = None`. On the next run loop iteration (up to 60s later), the daemon
 re-launches the recorder for that streamer.
 
@@ -939,8 +943,6 @@ itself is not counted.
 
 **Added to `streamer.py`**:
 
-- `cleanup_ffmpeg()` — kills orphaned ffmpeg after `wait()` returns (replaces
-  the crash handling that was in the SIGCHLD handler's `clear_child`).
 - Safety net in `stop()` — `poll()` + `terminate()` + `wait()` before dropping
   the `Popen` reference.
 - `start_new_session=True` on `Popen` — session isolation for yt-dlp.
@@ -991,10 +993,8 @@ full daemon restart.
 
 | Parameter                     | Before               | After           | Location                  |
 | :---------------------------- | :------------------- | :-------------- | :------------------------ |
-| `process_poll_wait_time`      | 45s                  | 15s             | `configs/config.json`     |
 | `ensure_valid_stream` retries |                   10 |               5 | `streamer.py` (hardcoded) |
 | `ensure_valid_stream` sleep   | 10s                  | 5s              | `streamer.py` (hardcoded) |
-| Initial poll method           | blind `time.sleep()` | 1s polling loop | `streamer.py`             |
 | **Worst-case cleanup**        | **145s**             | **40s**         |                           |
 | **Offline streamer recycle**  | **45s**              | **~3s**         |                           |
 
@@ -1080,7 +1080,7 @@ CLI: python cli.py upgrade
   │
   └── 5. New daemon's run() calls adopt_existing():
          ├── For each configured streamer, recorded_recorder(name) reads
-         │   configs/pid-<name>, written when that recorder was launched
+         │   configs/pid-<name>, which that recorder wrote as it started
          ├── A PID that is alive and whose command line holds recorder.py
          │   and chaturbate.com/<name>/:
          │   └── streamer.adopt(pid) wraps the PID in AdoptedProcess
@@ -1127,14 +1127,15 @@ continue uninterrupted through the new daemon.
 - `AdoptedProcess` class — Popen-compatible wrapper for a PID that is not a
   child.
 - `record_recorder(name, pid)`, `forget_recorder(name, pid)` and
-  `recorded_recorder(name)` — write, remove and read back
-  `configs/pid-<name>`. `recorded_recorder` returns the PID only while it is
-  a live `recorder.py` for that room, so `recorder.py`'s own
-  `--dump-single-json` lookup is never adopted.
+  `recorded_recorder(name)` — write (atomically), remove and read back
+  `configs/pid-<name>`. `recorder.py` records and forgets itself.
+  `recorded_recorder` returns the PID only while it is a live `recorder.py`
+  for that room, so `recorder.py`'s own `--dump-single-json` lookup is never
+  adopted.
 
 **`streamer.py`**:
 
-- `start()` records each launched recorder's PID; `stop()` removes the record.
+- `start()` passes the recorder its readiness pipe; the recorder records its own PID.
 - `adopt(pid)` — creates a daemon thread that wraps the PID in
   `AdoptedProcess`, validates the stream, and blocks on `wait()` until the
   recorder exits. On exit, resets `self.stream`.
@@ -1170,5 +1171,5 @@ has stalled; `recorder.py` ends a stalled recording itself (see
 | Re-resolution    | `recorder.py` | fresh playlist URLs from yt-dlp after 15s unreachable     |
 | Give-up          | `recorder.py` | exit after 120s without a new segment                     |
 
-A yt-dlp process adopted from an older daemon has no give-up of its own; its
-thread waits until that process exits.
+Only a `recorder.py` is ever adopted, so every recording ends through these
+layers.
