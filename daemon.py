@@ -20,6 +20,7 @@ class Daemon:
     ipc_client = None
     streamers = {}
     _handoff = False
+    wake = None  # set by stop and handoff to end the run loop's wait at once
     failed_launches = 0
     site_unreachable = False
 
@@ -177,6 +178,8 @@ class Daemon:
             if client_response:
                 client_response.close() # Since we exit we have to do this here
             self.pid = None
+            if self.wake:
+                self.wake.set()
             time.sleep(1)
             sys.exit(0)
 
@@ -188,6 +191,8 @@ class Daemon:
                 client_response.print("Handoff initiated, daemon exiting.")
                 client_response.close()
             self.pid = None
+            if self.wake:
+                self.wake.set()
             time.sleep(1)
             sys.exit(0)
 
@@ -295,6 +300,7 @@ class Daemon:
                     client_response.print('- ' + streamer.name)
 
     def run(self):
+        self.wake = threading.Event()
         def daemon_run_loop():
             self.adopt_existing()
             while self.pid:
@@ -313,11 +319,10 @@ class Daemon:
                         if self.config["rate_limit_time"]:
                             time.sleep(self.config["rate_limit_time"])
 
-                    for i in range(60): # wait 1 min in 1 second intervals
-                        if not self.pid:
-                            break
-                        time.sleep(1)
-                    
+                    # wait a minute; stop and handoff clear pid and set wake
+                    if self.pid:
+                        self.wake.wait(60)
+
                 except Exception:
                     self.logger.exception("loop error")
                     time.sleep(1)
