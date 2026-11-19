@@ -355,7 +355,7 @@ class ExtractTest( unittest.TestCase ):
     def extract( self, mode, stop = None ):
         with mock.patch.dict( os.environ, { "FAKE_YTDLP_MODE": mode, "FAKE_HLS_BASE": "http://h" } ), \
              mock.patch.object( recorder.sys, "stderr", new_callable=lambda: open(os.devnull, "w") ):
-            return recorder.extract( "https://chaturbate.com/room/", self.CONFIG, stop or threading.Event() )
+            return recorder.extract( "https://chaturbate.com/room/", self.CONFIG, stop or recorder.Stop() )
 
     def test_ok( self ):
         status, (title, urls, headers) = self.extract( "ok" )
@@ -378,11 +378,36 @@ class ExtractTest( unittest.TestCase ):
         self.assertIn( "unreadable yt-dlp output", reason )
 
     def test_stop_interrupts_a_hanging_lookup( self ):
-        stop = threading.Event()
-        threading.Timer( 1, stop.set ).start()
-        started = time.time()
+        # stop is set as the lookup starts waiting, so it provably lands
+        # inside the wait; the lookup itself would hang until killed.
+        stop = recorder.Stop()
+        real_communicate = subprocess.Popen.communicate
+        def stop_then_communicate( proc, *args, **kwargs ):
+            stop.set()
+            return real_communicate( proc, *args, **kwargs )
+        with mock.patch.object( recorder.subprocess.Popen, "communicate", stop_then_communicate ):
+            self.assertEqual( self.extract("hang", stop), ("error", "yt-dlp lookup interrupted") )
+
+    def test_stop_set_before_the_lookup_starts_kills_it( self ):
+        stop = recorder.Stop()
+        stop.set()
         self.assertEqual( self.extract("hang", stop), ("error", "yt-dlp lookup interrupted") )
-        self.assertLess( time.time() - started, 5 )
+
+class SignalReadyTest( unittest.TestCase ):
+
+    def test_writes_ready_and_closes_its_end( self ):
+        read_fd, write_fd = os.pipe()
+        recorder.signal_ready( write_fd )
+        self.assertEqual( os.read( read_fd, 16 ), b"ready\n" )
+        self.assertEqual( os.read( read_fd, 16 ), b"" )
+        os.close( read_fd )
+
+    def test_pipe_closed_by_a_handed_off_daemon_is_not_an_error( self ):
+        read_fd, write_fd = os.pipe()
+        os.close( read_fd )
+        recorder.signal_ready( write_fd )
+        with self.assertRaises( OSError ):
+            os.fstat( write_fd )
 
 if __name__ == "__main__":
     unittest.main()

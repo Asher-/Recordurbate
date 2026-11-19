@@ -48,6 +48,17 @@ def signal_ready( fd ):
         pass
     os.close( fd )
 
+class Stop( threading.Event ):
+    # Set on SIGINT or SIGTERM. Setting it also kills the yt-dlp lookup in
+    # progress, so extract waits on that process alone.
+    lookup = None
+
+    def set( self ):
+        super().set()
+        lookup = self.lookup
+        if lookup is not None and lookup.poll() is None:
+            lookup.kill()
+
 def extract( url, config, stop ):
     # Resolves the room through yt-dlp. Returns ("ok", (title, urls, headers)),
     # ("unavailable", reason) when yt-dlp names a room state, or
@@ -58,18 +69,21 @@ def extract( url, config, stop ):
         proc = subprocess.Popen( cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE )
     except OSError as e:
         return "error", "could not run yt-dlp: {}".format( e )
-    deadline = time.time() + EXTRACT_TIMEOUT
-    while True:
+    stop.lookup = proc
+    try:
+        # a stop set before the lookup was registered did not reach it
+        if stop.is_set():
+            proc.kill()
         try:
-            out, err = proc.communicate( timeout=0.5 )
-            break
+            out, err = proc.communicate( timeout=EXTRACT_TIMEOUT )
         except subprocess.TimeoutExpired:
-            if stop.is_set() or time.time() > deadline:
-                proc.kill()
-                proc.communicate()
-                if stop.is_set():
-                    return "error", "yt-dlp lookup interrupted"
-                return "error", "yt-dlp took over {}s".format( EXTRACT_TIMEOUT )
+            proc.kill()
+            proc.communicate()
+            return "error", "yt-dlp took over {}s".format( EXTRACT_TIMEOUT )
+    finally:
+        stop.lookup = None
+    if stop.is_set():
+        return "error", "yt-dlp lookup interrupted"
     text = err.decode( "utf-8", "replace" )
     sys.stderr.write( text )
     sys.stderr.flush()
@@ -216,25 +230,35 @@ class Muxer:
 
 def main():
     url = sys.argv[1]
-    name = url.rstrip("/").rsplit("/", 1)[-1]
     config = Config.load_config()
+    ready_fd = int( sys.argv[2] ) if len( sys.argv ) > 2 else None
 
-    stop = threading.Event()
+    # The main thread only takes signals; the recording runs on a worker.
+    stop = Stop()
     def on_signal( signum, frame ):
         stop.set()
     signal.signal( signal.SIGINT, on_signal )
     signal.signal( signal.SIGTERM, on_signal )
+    outcome = { "exit_code": 1 }
+    worker = threading.Thread( target=record, args=(url, config, ready_fd, stop, outcome) )
+    worker.start()
+    worker.join()
+    sys.exit( outcome["exit_code"] )
 
+def record( url, config, ready_fd, stop, outcome ):
+    # Records the room until it ends or stop is set. outcome["exit_code"]
+    # becomes 0 once a recording has run to its end.
+    name = url.rstrip("/").rsplit("/", 1)[-1]
     status, result = extract( url, config, stop )
     if status != "ok":
         log( "Cannot record {}: {}".format(name, result) )
-        sys.exit( 1 )
+        return
     title, urls, headers = result
     os.makedirs( os.path.join("videos", name), exist_ok=True )
     path = os.path.join( "videos", name, title + ".ts" )
     log( "Recording {} to {}".format(name, path) )
-    if len( sys.argv ) > 2:
-        signal_ready( int(sys.argv[2]) )
+    if ready_fd is not None:
+        signal_ready( ready_fd )
 
     session = requests.Session()
     session.headers.update( headers )
@@ -345,6 +369,7 @@ def main():
         if os.path.exists( path ) and os.path.getsize( path ) == 0:
             os.remove( path )
         log( "Stopped recording {}".format(name) )
+    outcome["exit_code"] = 0
 
 if __name__ == "__main__":
     main()
