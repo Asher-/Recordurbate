@@ -163,8 +163,7 @@ def test_stop_ends_the_run_loops_wait_at_once(monkeypatch):
     instance.wake.set()  # ends a wait that began before the wrapper
     instance.wake.clear()
     assert waiting.wait(timeout=65)
-    instance.pid = None
-    instance.wake.set()
+    instance.stop()
     thread.join(timeout=5)
 
     assert not thread.is_alive()
