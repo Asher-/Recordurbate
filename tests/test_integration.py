@@ -11,8 +11,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import signal
+import threading
 import time
 import unittest
+from unittest import mock
 
 TESTS = os.path.dirname( os.path.abspath(__file__) )
 ROOT = os.path.dirname( TESTS )
@@ -20,8 +23,10 @@ sys.path.insert( 0, ROOT )
 sys.path.insert( 0, TESTS )
 import test_recorder
 from test_recorder import FakeHls, probe
+import streamer as streamer_module
 from streamer import Streamer
-from pid import record_recorder, recorded_recorder
+from pid import recorded_recorder
+import daemon as daemon_module
 
 def setUpModule():
     test_recorder.setUpModule()
@@ -83,10 +88,25 @@ class StreamerLaunchesRecorderTest( RoomDir ):
         with open( os.path.join("configs", "capture-room.log") ) as f:
             self.assertIn( "Stream ended", f.read() )
 
-    def test_offline_room_reported_after_the_poll_window_is_not_started( self ):
-        # yt-dlp answers 5s after launch, so Streamer waits through the lookup.
+    def gate_lookup_on_readiness_wait( self ):
+        # yt-dlp answers only once Streamer is inside its readiness wait:
+        # fake_ytdlp.py blocks reading this FIFO until the wait opens and
+        # closes its write end.
+        gate = os.path.join( self.cwd, "gate" )
+        os.mkfifo( gate )
+        os.environ[ "FAKE_YTDLP_GATE" ] = gate
+        real_select = streamer_module.select.select
+        def open_gate_then_select( *args ):
+            with open( gate, "w" ):
+                pass
+            return real_select( *args )
+        patcher = mock.patch.object( streamer_module.select, "select", open_gate_then_select )
+        patcher.start()
+        self.addCleanup( patcher.stop )
+
+    def test_offline_room_reported_during_the_readiness_wait_is_not_started( self ):
         os.environ[ "FAKE_YTDLP_MODE" ] = "offline"
-        os.environ[ "FAKE_YTDLP_DELAY" ] = "5"
+        self.gate_lookup_on_readiness_wait()
         daemon = FakeDaemon( self.config )
         streamer = Streamer( daemon, "room" )
         with self.assertLogs( "test-integration", level="INFO" ) as logs:
@@ -98,8 +118,8 @@ class StreamerLaunchesRecorderTest( RoomDir ):
         self.assertFalse( any( "Started to record" in line for line in logs.output ) )
         self.assertFalse( os.path.exists( self.recording() ) )
 
-    def test_slow_lookup_of_a_live_room_records( self ):
-        os.environ[ "FAKE_YTDLP_DELAY" ] = "5"
+    def test_lookup_answered_during_the_readiness_wait_records( self ):
+        self.gate_lookup_on_readiness_wait()
         daemon = FakeDaemon( self.config )
         streamer = Streamer( daemon, "room" )
         with self.assertLogs( "test-integration", level="INFO" ) as logs:
@@ -112,33 +132,86 @@ class StreamerLaunchesRecorderTest( RoomDir ):
         self.assertEqual( codecs, [ "aac", "h264" ] )
 
 class AdoptRecordedRecorderTest( RoomDir ):
+    # A recorder launched as Streamer.start launches it, by a daemon that has
+    # since gone; it records its own PID, and the readiness pipe says when the
+    # room has resolved.
 
-    def test_recorded_recorder_is_found_and_adopted( self ):
-        # Launched and recorded as Streamer.start does; the readiness pipe says
-        # when the room has resolved.
+    def launch_recorder( self ):
         ready_fd, write_fd = os.pipe()
         recorder = subprocess.Popen( [ sys.executable, "recorder.py", "https://chaturbate.com/room/", str(write_fd) ],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, pass_fds=(write_fd,) )
         os.close( write_fd )
-        record_recorder( "room", recorder.pid )
-        try:
-            self.assertEqual( os.read( ready_fd, 16 ), b"ready\n" )
-            os.close( ready_fd )
-            self.assertEqual( recorded_recorder("room"), recorder.pid )
-            streamer = Streamer( FakeDaemon(self.config), "room" )
-            with self.assertLogs( "test-integration", level="INFO" ) as logs:
-                thread = streamer.adopt( recorded_recorder("room") )
-                thread.join( 60 )
-            self.assertFalse( thread.is_alive() )
-            self.assertTrue( any( "Adopted stream for room validated." in line for line in logs.output ) )
-            self.assertIsNone( streamer.stream )
-            self.assertFalse( os.path.exists( "configs/pid-room" ) )
-        finally:
-            if recorder.poll() is None:
-                recorder.kill()
-            recorder.wait()
+        self.addCleanup( self.end, recorder )
+        self.assertEqual( os.read( ready_fd, 16 ), b"ready\n" )
+        os.close( ready_fd )
+        return recorder
+
+    def end( self, recorder ):
+        if recorder.poll() is None:
+            recorder.kill()
+        recorder.wait()
+
+    def test_recorded_recorder_is_found_and_adopted( self ):
+        recorder = self.launch_recorder()
+        self.assertEqual( recorded_recorder("room"), recorder.pid )
+        streamer = Streamer( FakeDaemon(self.config), "room" )
+        with self.assertLogs( "test-integration", level="INFO" ) as logs:
+            thread = streamer.adopt( recorded_recorder("room") )
+            thread.join( 60 )
+        self.assertFalse( thread.is_alive() )
+        self.assertTrue( any( "Adopted stream for room validated." in line for line in logs.output ) )
+        self.assertIsNone( streamer.stream )
+        self.assertEqual( recorder.wait(), 0 )
+        # the recorder removed its own record as it exited
+        self.assertFalse( os.path.exists( "configs/pid-room" ) )
         codecs, container, duration = probe( self.recording() )
         self.assertEqual( codecs, [ "aac", "h264" ] )
+
+    def test_daemon_adopts_the_recorded_recorder_at_start( self ):
+        recorder = self.launch_recorder()
+        daemon = daemon_module.Daemon.__new__( daemon_module.Daemon )
+        daemon.logger = logging.getLogger( "test-integration" )
+        daemon.config = self.config
+        daemon.streamers_lock = threading.Lock()
+        daemon.streamers = { "room": Streamer( daemon, "room" ) }
+        threads = []
+        real_adopt = Streamer.adopt
+        def adopt_and_keep_thread( streamer, pid ):
+            threads.append( real_adopt( streamer, pid ) )
+            return threads[-1]
+        with mock.patch.object( Streamer, "adopt", adopt_and_keep_thread ), \
+             self.assertLogs( "test-integration", level="INFO" ) as logs:
+            daemon.adopt_existing()
+            self.assertEqual( len(threads), 1 )
+            threads[0].join( 60 )
+        self.assertFalse( threads[0].is_alive() )
+        self.assertTrue( any( "Adopting recorder PID {} for room.".format(recorder.pid) in line for line in logs.output ) )
+        self.assertTrue( any( "Adopted stream for room validated." in line for line in logs.output ) )
+        self.assertIsNone( daemon.streamers["room"].stream )
+
+class RecorderStopTest( RoomDir ):
+
+    def test_sigterm_during_the_lookup_ends_the_recorder_and_its_record( self ):
+        # fake_ytdlp.py blocks on this FIFO; opening its write end returns
+        # once the lookup is waiting on it, and it is never answered.
+        gate = os.path.join( self.cwd, "gate" )
+        os.mkfifo( gate )
+        os.environ[ "FAKE_YTDLP_GATE" ] = gate
+        recorder = subprocess.Popen( [ sys.executable, "recorder.py", "https://chaturbate.com/room/" ],
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True )
+        writer = open( gate, "w" )
+        try:
+            self.assertEqual( recorded_recorder("room"), recorder.pid )
+            recorder.send_signal( signal.SIGTERM )
+            out, _ = recorder.communicate( timeout=15 )
+        finally:
+            writer.close()
+            if recorder.poll() is None:
+                recorder.kill()
+                recorder.wait()
+        self.assertEqual( recorder.returncode, 1 )
+        self.assertIn( b"Cannot record room: yt-dlp lookup interrupted", out )
+        self.assertFalse( os.path.exists( "configs/pid-room" ) )
 
 if __name__ == "__main__":
     unittest.main()
