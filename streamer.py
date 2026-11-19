@@ -16,6 +16,7 @@ ROOM_STATES = (
     "Hidden session in progress",
 )
 NO_ERROR = "yt-dlp printed no error"
+READY_TIMEOUT = 90  # seconds a launch may take to log "Recording"; recorder.py's own lookup gives up after 60
 
 class Streamer:
   
@@ -29,8 +30,9 @@ class Streamer:
       self.daemon = daemon
     
     def ensure_valid_stream( self, pid = None ):
-        # recorder.py exits as soon as yt-dlp cannot resolve the room, so one
-        # still running after the launch poll is fetching its segments.
+        # Whether the recorder process is alive. start() asks only after
+        # recorder_ready has seen the recorder resolve the room; adopt() asks
+        # on liveness alone.
         if not pid and self.stream:
             pid = self.stream.pid
         return bool( pid and process_active(pid) )
@@ -63,7 +65,7 @@ class Streamer:
                     time.sleep(1)
                 if self.stream and proc.poll() is None:
                     # self.daemon.logger.info("Stream for {} appears to be healthy - validating.".format(self.name))
-                    if self.ensure_valid_stream( pid = proc.pid ):
+                    if self.recorder_ready( proc, capture_path, capture_offset ) and self.ensure_valid_stream( pid = proc.pid ):
                         self.daemon.logger.info("Started to record {}.".format(self.name))
                         self.daemon.record_launch()
                         self.finalize_prior_parts( launched_at )
@@ -95,6 +97,25 @@ class Streamer:
         if errors[-1].endswith( ROOM_STATES ):
             return None
         return errors[-1]
+
+    def recorder_ready( self, proc, capture_path, offset ):
+        # recorder.py logs "Recording <name> to <path>" once yt-dlp has resolved
+        # the room; until then it may still exit reporting the room offline.
+        # One handle follows the recorder's output as it is appended, so each
+        # line is read once.
+        marker = "] Recording {} to ".format(self.name)
+        deadline = time.time() + READY_TIMEOUT
+        with open( capture_path, "r", errors="replace" ) as capture_log:
+            capture_log.seek( offset )
+            partial = ""
+            while True:
+                lines = ( partial + capture_log.read() ).split("\n")
+                partial = lines.pop()
+                if any( marker in line for line in lines ):
+                    return True
+                if not self.stream or proc.poll() is not None or time.time() >= deadline:
+                    return False
+                time.sleep(1)
 
     def adopt( self, pid ):
         def adopted_thread():

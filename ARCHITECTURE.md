@@ -288,7 +288,10 @@ The `Streamer` class manages a single streamer's `recorder.py` process.
 2. Polls every 1s for up to `process_poll_wait_time` (default 15s) to detect
    early exit (e.g., streamer offline). Breaks immediately if the process
    exits.
-3. If the process is still alive, calls `ensure_valid_stream()`.
+3. If the process is still alive, calls `recorder_ready()`, which waits up to
+   90s for the recorder's `Recording <name> to <path>` line in this launch's
+   capture log, then `ensure_valid_stream()`. Without that line the launch did
+   not start recording.
 4. If valid, calls `finalize_prior_parts()` to strip `.part` from this
    streamer's files last written before the recorder was launched (leftovers
    of yt-dlp recordings that were never finalized), then sets
@@ -533,6 +536,8 @@ to finish (which only happens when `self.pid` is set to `None`).
                     │  2. Poll every 1s up to poll_wait_time      │
                     │     └─ break early if process exits         │
                     │  3. If still alive:                         │
+                    │     ├─ recorder_ready()                     │
+                    │     │  └─ "Recording" line within 90s       │
                     │     └─ ensure_valid_stream()                │
                     │        └─ recorder alive → True             │
                     │  4. If valid:                               │
@@ -553,18 +558,33 @@ to finish (which only happens when `self.pid` is set to `None`).
                     └─────────────────────────────────────────────┘
 ```
 
-**Timing**: validation happens once, at the end of the poll loop (≤15s). For
-offline streamers, yt-dlp reports the room state within a few seconds,
-`recorder.py` exits, and the poll loop detects the exit within 1s.
+**Timing**: after the poll loop (≤15s), `recorder_ready()` waits up to
+`READY_TIMEOUT` (90s) for the recorder's line. The yt-dlp lookup can take
+longer than the poll loop; for an offline streamer `recorder.py` then exits
+during the readiness wait, which detects the exit within 1s.
 
 ---
 
 ## Stream Validation
 
-`ensure_valid_stream` returns whether the launched (or adopted) process is
-still alive, checked with `process_active()` on its PID. `recorder.py` exits
-as soon as yt-dlp cannot resolve the room, so a recorder still running after
-the launch poll has resolved the room and is fetching its segments.
+A launch counts as started only when `recorder_ready()` finds
+`[recorder <time>] Recording <name> to <path>` in this launch's part of
+`configs/capture-<name>.log` (read from the offset taken before `Popen`).
+`recorder.py` writes that line once yt-dlp has resolved the room; until then
+it may still exit reporting a room state. `recorder_ready()` polls the log
+every 1s and returns `False` when the recorder exits, the streamer is stopped,
+or `READY_TIMEOUT` (90s, above `recorder.py`'s 60s lookup limit) passes.
+
+`ensure_valid_stream` then returns whether the launched (or adopted) process
+is still alive, checked with `process_active()` on its PID.
+
+`adopt()` checks only `ensure_valid_stream`, so it validates on liveness alone.
+A handoff can catch a recorder inside its yt-dlp lookup (up to 60s); the new
+daemon adopts it and logs `Adopted stream for <name> validated.` even if the
+lookup then reports the room offline. That recorder exits, the adopted thread
+ends and clears `stream`, and the next run loop relaunches the room. Adoption
+records no launch and finalizes no `.part` files, so the log line is the only
+effect.
 
 ---
 
@@ -872,7 +892,7 @@ recorder PIDs.
 ### Offline Streamer Cycling
 
 When a streamer is offline, the recorder's yt-dlp lookup reports the room
-state within a few seconds and the recorder exits. The polling loop detects
+state and the recorder exits. The launch poll or the readiness wait detects
 this within 1 additional second. The streamer thread cleans up and sets
 `stream = None`. On the next run loop iteration (up to 60s later), the daemon
 re-launches the recorder for that streamer.

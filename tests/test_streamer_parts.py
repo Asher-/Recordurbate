@@ -1,4 +1,5 @@
 import os
+import threading
 import time
 import types
 
@@ -125,6 +126,9 @@ def test_rename_failure_is_logged_and_part_kept(workdir, monkeypatch):
 
 # wiring into Streamer.start
 
+# What recorder.py logs once yt-dlp has resolved the room.
+READY_LINE = "[recorder 2026-10-01 12:00:00] Recording alice to videos/alice/alice 2026-10-01 12_00.ts\n"
+
 class FakeProc:
     pid = 4242
 
@@ -153,6 +157,8 @@ def fake_launch(workdir, monkeypatch):
 
     def fake_popen(*args, **kwargs):
         write(new_part, time.time())
+        kwargs["stdout"].write(READY_LINE)
+        kwargs["stdout"].flush()
         return FakeProc()
 
     (workdir / "configs").mkdir()
@@ -203,7 +209,7 @@ def start_harness(workdir, monkeypatch):
 
     def fake_popen(*args, **kwargs):
         calls["popen_at"] = time.time()
-        kwargs["stdout"].write(calls.get("output", ""))
+        kwargs["stdout"].write(calls.get("output", READY_LINE))
         kwargs["stdout"].flush()
         return calls.get("proc_factory", FakeProc)()
 
@@ -399,3 +405,82 @@ def test_real_process_output_is_read_back_from_the_capture_log(workdir):
     run_start(Streamer(daemon, "alice"))
 
     assert daemon.launches == [error]
+
+
+def slow_lookup(output, exit_code):
+    # A recorder whose yt-dlp lookup finishes on its third poll, after the
+    # launch poll window: it writes output to the capture log and, unless
+    # exit_code is None, exits with it.
+    class SlowLookup(FakeProc):
+        def __init__(self):
+            super().__init__()
+            self.polls = 0
+
+        def poll(self):
+            self.polls += 1
+            if self.polls == 3:
+                with open("configs/capture-alice.log", "a") as f:
+                    f.write(output)
+                self.returncode = exit_code
+            return self.returncode
+    return SlowLookup
+
+
+def test_offline_room_reported_after_the_poll_window_is_not_started(start_harness, monkeypatch):
+    start_harness["output"] = ""
+    start_harness["proc_factory"] = slow_lookup("ERROR: [Chaturbate] alice: Room is currently offline\n", 1)
+    monkeypatch.setattr(Streamer, "ensure_valid_stream", validation_returning(start_harness, True))
+    daemon = make_daemon()
+
+    run_start(Streamer(daemon, "alice"))
+
+    assert daemon.launches == [None]
+    assert start_harness["validated"] == 0
+    assert start_harness["finalize"] == []
+    assert not any("Started to record" in m for m in daemon.logger.messages)
+
+
+def test_recording_line_after_the_poll_window_starts_recording(start_harness, monkeypatch):
+    start_harness["output"] = ""
+    start_harness["proc_factory"] = slow_lookup(READY_LINE, None)
+    monkeypatch.setattr(Streamer, "ensure_valid_stream", validation_returning(start_harness, True))
+    daemon = make_daemon()
+
+    run_start(Streamer(daemon, "alice"))
+
+    assert daemon.launches == [None]
+    assert len(start_harness["finalize"]) == 1
+    assert any("Started to record alice." in m for m in daemon.logger.messages)
+
+
+def test_recorder_that_never_logs_recording_is_not_started(start_harness, monkeypatch):
+    start_harness["output"] = ""
+    monkeypatch.setattr(streamer, "READY_TIMEOUT", 1)
+    monkeypatch.setattr(Streamer, "ensure_valid_stream", validation_returning(start_harness, True))
+    daemon = make_daemon()
+    s = Streamer(daemon, "alice")
+
+    run_start(s)
+
+    assert daemon.launches == [streamer.NO_ERROR]
+    assert start_harness["validated"] == 0
+    assert start_harness["finalize"] == []
+    assert s.stream is None
+    assert not any("Started to record" in m for m in daemon.logger.messages)
+
+
+def test_stop_during_the_readiness_wait_reports_nothing(start_harness, monkeypatch):
+    start_harness["output"] = ""
+    monkeypatch.setattr(Streamer, "ensure_valid_stream", validation_returning(start_harness, True))
+    daemon = make_daemon()
+    s = Streamer(daemon, "alice")
+    stopper = threading.Timer(1.5, s.stop)
+    stopper.start()
+
+    run_start(s)
+    stopper.join()
+
+    assert daemon.launches == []
+    assert start_harness["validated"] == 0
+    assert start_harness["finalize"] == []
+    assert s.stream is None

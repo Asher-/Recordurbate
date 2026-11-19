@@ -85,6 +85,34 @@ class StreamerLaunchesRecorderTest( RoomDir ):
         with open( os.path.join("configs", "capture-room.log") ) as f:
             self.assertIn( "Stream ended", f.read() )
 
+    def test_offline_room_reported_after_the_poll_window_is_not_started( self ):
+        # yt-dlp answers only after process_poll_wait_time has passed.
+        os.environ[ "FAKE_YTDLP_MODE" ] = "offline"
+        os.environ[ "FAKE_YTDLP_DELAY" ] = "5"
+        daemon = FakeDaemon( self.config )
+        streamer = Streamer( daemon, "room" )
+        with self.assertLogs( "test-integration", level="INFO" ) as logs:
+            daemon.logger.info( "launching room" )
+            thread = streamer.start()
+            thread.join( 60 )
+        self.assertFalse( thread.is_alive() )
+        self.assertEqual( daemon.launches, [ None ] )
+        self.assertFalse( any( "Started to record" in line for line in logs.output ) )
+        self.assertFalse( os.path.exists( self.recording() ) )
+
+    def test_slow_lookup_of_a_live_room_records( self ):
+        os.environ[ "FAKE_YTDLP_DELAY" ] = "5"
+        daemon = FakeDaemon( self.config )
+        streamer = Streamer( daemon, "room" )
+        with self.assertLogs( "test-integration", level="INFO" ) as logs:
+            thread = streamer.start()
+            thread.join( 60 )
+        self.assertFalse( thread.is_alive() )
+        self.assertEqual( daemon.launches, [ None ] )
+        self.assertTrue( any( "Started to record room." in line for line in logs.output ) )
+        codecs, container, duration = probe( self.recording() )
+        self.assertEqual( codecs, [ "aac", "h264" ] )
+
 class AdoptRunningRecorderTest( RoomDir ):
 
     def test_running_recorder_is_found_and_adopted( self ):

@@ -4,6 +4,7 @@
 FAKE_HLS_BASE names the local test server. FAKE_YTDLP_MODE picks the outcome:
 ok (default), offline, neterror, garbage, hang, or fail-after-first, which
 answers ok once and neterror afterwards, counting calls in FAKE_YTDLP_COUNTER.
+FAKE_YTDLP_DELAY delays the outcome by that many seconds.
 """
 import json
 import os
@@ -11,6 +12,7 @@ import sys
 import time
 
 mode = os.environ.get("FAKE_YTDLP_MODE", "ok")
+time.sleep( float( os.environ.get("FAKE_YTDLP_DELAY", "0") ) )
 if mode == "fail-after-first":
     counter = os.environ["FAKE_YTDLP_COUNTER"]
     calls = int( open(counter).read() ) if os.path.exists( counter ) else 0
