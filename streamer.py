@@ -6,7 +6,7 @@ import os
 import sys
 import signal
 
-from pid import process_active, AdoptedProcess
+from pid import process_active, AdoptedProcess, forget_recorder
 
 # yt-dlp's Chaturbate extractor raises these for a room that is up but has no public stream
 ROOM_STATES = (
@@ -139,5 +139,7 @@ class Streamer:
             if stream.poll() is None:
                 stream.terminate()
                 stream.wait()
+            # recorder.py forgets its own record; one killed outright cannot
+            forget_recorder( self.name, stream.pid )
             self.stream = None
 
