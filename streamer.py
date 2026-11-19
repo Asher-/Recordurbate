@@ -70,7 +70,7 @@ class Streamer:
                         self.daemon.record_launch()
                         self.finalize_prior_parts( launched_at )
                         self.started = True
-                        self.wait_with_watchdog( proc )
+                        proc.wait()
                         self.cleanup_ffmpeg()
                         return
                 # stop clears stream, and a stopped launch says nothing about the site
@@ -125,7 +125,7 @@ class Streamer:
                 if self.ensure_valid_stream( pid=pid ):
                     self.started = True
                     self.daemon.logger.info("Adopted stream for {} validated.".format(self.name))
-                    self.wait_with_watchdog( self.stream )
+                    self.stream.wait()
                     self.cleanup_ffmpeg()
                 else:
                     self.daemon.logger.info("Adopted stream for {} failed validation, will restart.".format(self.name))
@@ -138,42 +138,6 @@ class Streamer:
         thread.daemon = True
         thread.start()
         return thread
-
-    def wait_with_watchdog( self, proc ):
-        stale_timeout = self.daemon.config.get("stale_stream_timeout", 300)
-        check_interval = 60
-        video_dir = os.path.join("videos", self.name)
-        last_mtime = None
-        stale_since = None
-
-        while True:
-            try:
-                proc.wait( timeout=check_interval )
-                return
-            except subprocess.TimeoutExpired:
-                pass
-
-            try:
-                part_files = [f for f in os.listdir(video_dir) if f.endswith(('.part', '.ts'))]
-                if part_files:
-                    newest = max(part_files, key=lambda f: os.path.getmtime(os.path.join(video_dir, f)))
-                    current_mtime = os.path.getmtime(os.path.join(video_dir, newest))
-                    if last_mtime is not None and current_mtime == last_mtime:
-                        if stale_since is None:
-                            stale_since = time.time()
-                        elif time.time() - stale_since >= stale_timeout:
-                            self.daemon.logger.info("Stale output for {} (no writes in {}s), stopping the recorder.".format(self.name, int(time.time() - stale_since)))
-                            proc.send_signal(signal.SIGINT)
-                            try:
-                                proc.wait( timeout=10 )
-                            except subprocess.TimeoutExpired:
-                                proc.terminate()
-                            return
-                    else:
-                        stale_since = None
-                    last_mtime = current_mtime
-            except (OSError, ValueError):
-                pass
 
     def cleanup_ffmpeg( self ):
         ffmpeg_pid = get_pid_by_name_and_args('ffmpeg', args_substring='/' + self.name + '/')

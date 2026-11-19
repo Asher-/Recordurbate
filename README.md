@@ -150,7 +150,6 @@ Two config files in the `configs/` directory:
 | `rate_limit`              | `bool`   | `true`                        | Whether to rate-limit between launching streamers.                             |
 | `rate_limit_time`         | `number` | `0`                           | Seconds to sleep between streamer launches. `0` = no delay.                    |
 | `process_poll_wait_time`  | `number` | `15`                          | Seconds to poll (1s intervals) after launching recorder.py before validation.  |
-| `stale_stream_timeout`    | `number` | `300`                         | Seconds of `.ts`/`.part` inactivity before the backstop kills a recorder.      |
 | `default_export_location` | `string` | `"./list.txt"`                | Default file path for the `export` command.                                |
 | `streamers`               | `array`  | `[]`                          | Chaturbate usernames to record.                                            |
 

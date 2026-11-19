@@ -56,7 +56,7 @@
   - [New IPC Command](#new-ipc-command)
   - [New CLI Command](#new-cli-command)
   - [Files Changed](#files-changed)
-- [Stale Stream Watchdog](#stale-stream-watchdog)
+- [Stream End](#stream-end)
   - [Detection Mechanism](#detection-mechanism)
   - [Configuration](#configuration-1)
   - [Defence in Depth](#defence-in-depth)
@@ -295,7 +295,7 @@ The `Streamer` class manages a single streamer's `recorder.py` process.
 4. If valid, calls `finalize_prior_parts()` to strip `.part` from this
    streamer's files last written before the recorder was launched (leftovers
    of yt-dlp recordings that were never finalized), then sets
-   `started = True` and blocks in `wait_with_watchdog()` until the stream ends.
+   `started = True` and blocks in `proc.wait()` until the recorder exits.
 5. On exit, calls `cleanup_ffmpeg()`, then `stop(signal_child=False)`.
 
 **`launch_error()`**: After a launch that did not start recording, reads what
@@ -543,7 +543,7 @@ to finish (which only happens when `self.pid` is set to `None`).
                     │  4. If valid:                               │
                     │     ├─ finalize_prior_parts()               │
                     │     ├─ started = True                       │
-                    │     ├─ wait_with_watchdog() (until end)     │
+                    │     ├─ proc.wait() (until recorder exits)   │
                     │     └─ cleanup_ffmpeg()                     │
                     │  5. stop(signal_child=False)                │
                     │     ├─ If child still alive: terminate+wait │
@@ -1158,52 +1158,19 @@ continue uninterrupted through the new daemon.
 
 ---
 
-## Stale Stream Watchdog
+## Stream End
 
-`recorder.py` handles network stalls itself (see [recorder.py](#recorderpy)):
-a segment that cannot be fetched becomes a gap, unreachable playlists trigger
-re-resolution within 15s, and the recorder exits after 120s without a new
-segment. The watchdog is a backstop for a recorder that is alive but writes
-nothing, and for adopted yt-dlp processes left by an older daemon.
+`stream_thread` and `adopted_thread` block in `proc.wait()` until the
+recorder exits, then run `cleanup_ffmpeg()` and `stop(signal_child=False)`.
+The daemon lists no directory and watches no file to decide that a recording
+has stalled; `recorder.py` ends a stalled recording itself (see
+[recorder.py](#recorderpy)):
 
-### Detection Mechanism
+| Layer            | Where         | Mechanism                                                 |
+| :--------------- | :------------ | :-------------------------------------------------------- |
+| Segment fetching | `recorder.py` | 3s connect / 5s read timeouts, 3 attempts, gap on failure |
+| Re-resolution    | `recorder.py` | fresh playlist URLs from yt-dlp after 15s unreachable     |
+| Give-up          | `recorder.py` | exit after 120s without a new segment                     |
 
-`Streamer.wait_with_watchdog(proc)` replaces a blocking `proc.wait()` call in
-both `stream_thread` and `adopted_thread`:
-
-```
-loop:
-  proc.wait(timeout=60s)
-    └── process exited → return
-    └── TimeoutExpired → check output file
-
-  scan videos/{name}/ for .ts and .part files
-  compare the newest file's mtime to last check
-    └── mtime advanced  → reset stale timer
-    └── mtime unchanged → start/continue stale timer
-        └── stale_since >= stale_stream_timeout
-            ├── SIGINT → wait(10s)
-            │   └── TimeoutExpired → SIGTERM
-            └── return (cleanup_ffmpeg + stop follow)
-```
-
-After `wait_with_watchdog` returns (either normally or via kill), the
-`cleanup_ffmpeg()` and `stop(signal_child=False)` chain runs.
-
-### Configuration
-
-| Key                    | Default | Description                                |
-| :--------------------- | :------ | :----------------------------------------- |
-| `stale_stream_timeout` | `300`   | Seconds of no output growth before killing |
-
-Set in `config.json`. The check interval is fixed at 60 seconds, so the
-effective resolution is ±60s around the configured threshold.
-
-### Defence in Depth
-
-| Layer            | Where                         | Mechanism                                                |
-| :--------------- | :---------------------------- | :------------------------------------------------------- |
-| Segment fetching | `recorder.py`                 | 3s connect / 5s read timeouts, 3 attempts, gap on failure |
-| Re-resolution    | `recorder.py`                 | fresh playlist URLs from yt-dlp after 15s unreachable    |
-| Give-up          | `recorder.py`                 | exit after 120s without a new segment                    |
-| Output watchdog  | `Streamer.wait_with_watchdog` | `.ts`/`.part` mtime staleness (default 300s)             |
+A yt-dlp process adopted from an older daemon has no give-up of its own; its
+thread waits until that process exits.

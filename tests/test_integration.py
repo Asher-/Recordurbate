@@ -49,8 +49,7 @@ class RoomDir( unittest.TestCase ):
         os.makedirs( os.path.join(self.cwd, "configs") )
         self.config = { "youtube-dl_cmd": "{} {}".format(sys.executable, os.path.join(TESTS, "fake_ytdlp.py")),
                         "youtube-dl_config": "configs/unused.config",
-                        "process_poll_wait_time": 3,
-                        "stale_stream_timeout": 300 }
+                        "process_poll_wait_time": 3 }
         with open( os.path.join(self.cwd, "configs", "config.json"), "w" ) as f:
             json.dump( self.config, f )
         os.symlink( os.path.join(ROOT, "recorder.py"), os.path.join(self.cwd, "recorder.py") )

@@ -163,7 +163,6 @@ def fake_launch(workdir, monkeypatch):
 
     (workdir / "configs").mkdir()
     monkeypatch.setattr(streamer.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(Streamer, "wait_with_watchdog", lambda self, proc: None)
     monkeypatch.setattr(Streamer, "cleanup_ffmpeg", lambda self: None)
     return new_part
 
@@ -218,7 +217,6 @@ def start_harness(workdir, monkeypatch):
 
     (workdir / "configs").mkdir()
     monkeypatch.setattr(streamer.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(Streamer, "wait_with_watchdog", lambda self, proc: None)
     monkeypatch.setattr(Streamer, "cleanup_ffmpeg", lambda self: None)
     monkeypatch.setattr(Streamer, "finalize_prior_parts", fake_finalize)
     return calls
