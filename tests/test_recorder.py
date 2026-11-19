@@ -332,11 +332,15 @@ class RecorderRunTest( unittest.TestCase ):
 
     def test_sigint_during_stalled_fetch_exits_within_15s( self ):
         hls = FakeHls( hang=True )
+        ready_fd, write_fd = os.pipe()
         try:
-            proc = subprocess.Popen( [ sys.executable, os.path.join(ROOT, "recorder.py"), "https://chaturbate.com/room/" ],
-                                     cwd=self.cwd, env=dict(os.environ, FAKE_HLS_BASE=hls.base),
+            proc = subprocess.Popen( [ sys.executable, os.path.join(ROOT, "recorder.py"), "https://chaturbate.com/room/", str(write_fd) ],
+                                     cwd=self.cwd, env=dict(os.environ, FAKE_HLS_BASE=hls.base), pass_fds=(write_fd,),
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True )
-            time.sleep( 4 )
+            os.close( write_fd )
+            # the room has resolved and the recorder is fetching from the hung server
+            self.assertEqual( os.read( ready_fd, 16 ), b"ready\n" )
+            os.close( ready_fd )
             sent = time.time()
             proc.send_signal( 2 )
             out, _ = proc.communicate( timeout=30 )
