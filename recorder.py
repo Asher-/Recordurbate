@@ -165,6 +165,7 @@ class Muxer:
         if self.proc.poll() is None:
             self.proc.kill()
         self.proc.wait()
+        self.proc.stdout.close()
         self.out.close()
 
 def main():
