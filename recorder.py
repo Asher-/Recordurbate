@@ -27,6 +27,7 @@ import requests
 
 import config as Config
 from streamer import ROOM_STATES
+from pid import record_recorder, forget_recorder
 
 POLL_INTERVAL = 1.0      # seconds between playlist reloads
 HTTP_TIMEOUT = (3, 5)    # connect, read
@@ -228,24 +229,32 @@ class Muxer:
         self.proc.stdout.close()
         self.out.close()
 
-def main():
+def run():
+    # Entry point: recorder.py https://chaturbate.com/<name>/ [<ready fd>]
     url = sys.argv[1]
+    name = url.rstrip("/").rsplit("/", 1)[-1]
     config = Config.load_config()
     ready_fd = int( sys.argv[2] ) if len( sys.argv ) > 2 else None
 
-    # The main thread only takes signals; the recording runs on a worker.
-    stop = Stop()
-    def on_signal( signum, frame ):
-        stop.set()
-    signal.signal( signal.SIGINT, on_signal )
-    signal.signal( signal.SIGTERM, on_signal )
-    outcome = { "exit_code": 1 }
-    worker = threading.Thread( target=record, args=(url, config, ready_fd, stop, outcome) )
-    worker.start()
-    worker.join()
+    # Recorded before anything else, by this process itself, so a daemon
+    # started after a handoff or a crash can adopt it.
+    record_recorder( name, os.getpid() )
+    try:
+        # The main thread only takes signals; the recording runs on a worker.
+        stop = Stop()
+        def on_signal( signum, frame ):
+            stop.set()
+        signal.signal( signal.SIGINT, on_signal )
+        signal.signal( signal.SIGTERM, on_signal )
+        outcome = { "exit_code": 1 }
+        worker = threading.Thread( target=main, args=(url, config, ready_fd, stop, outcome) )
+        worker.start()
+        worker.join()
+    finally:
+        forget_recorder( name, os.getpid() )
     sys.exit( outcome["exit_code"] )
 
-def record( url, config, ready_fd, stop, outcome ):
+def main( url, config, ready_fd, stop, outcome ):
     # Records the room until it ends or stop is set. outcome["exit_code"]
     # becomes 0 once a recording has run to its end.
     name = url.rstrip("/").rsplit("/", 1)[-1]
@@ -372,4 +381,4 @@ def record( url, config, ready_fd, stop, outcome ):
     outcome["exit_code"] = 0
 
 if __name__ == "__main__":
-    main()
+    run()

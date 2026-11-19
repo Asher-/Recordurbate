@@ -393,6 +393,45 @@ class ExtractTest( unittest.TestCase ):
         stop.set()
         self.assertEqual( self.extract("hang", stop), ("error", "yt-dlp lookup interrupted") )
 
+class RunTest( unittest.TestCase ):
+    # recorder.run in-process with main replaced, so only run's own routes run.
+
+    def run_with( self, main ):
+        previous = os.getcwd()
+        with tempfile.TemporaryDirectory() as cwd, \
+             mock.patch.object( sys, "argv", [ "recorder.py", "https://chaturbate.com/alice/" ] ), \
+             mock.patch.object( recorder.Config, "load_config", lambda: {} ), \
+             mock.patch.object( recorder, "main", main ), \
+             mock.patch.object( recorder.signal, "signal" ):
+            os.chdir( cwd )
+            try:
+                with self.assertRaises( SystemExit ) as exited:
+                    recorder.run()
+                return exited.exception.code, os.path.exists( "configs/pid-alice" )
+            finally:
+                os.chdir( previous )
+
+    def test_exits_with_the_recordings_code_and_removes_its_record( self ):
+        seen = {}
+        def main( url, config, ready_fd, stop, outcome ):
+            with open( "configs/pid-alice" ) as f:
+                seen["record"] = f.read()
+            seen["stop"] = stop
+            outcome["exit_code"] = 0
+        code, record_left = self.run_with( main )
+        self.assertEqual( code, 0 )
+        self.assertEqual( seen["record"], "{}\n".format( os.getpid() ) )
+        self.assertIsInstance( seen["stop"], recorder.Stop )
+        self.assertFalse( record_left )
+
+    def test_failed_recording_exits_1_and_removes_its_record( self ):
+        def main( url, config, ready_fd, stop, outcome ):
+            raise RuntimeError( "boom" )
+        with mock.patch.object( recorder.threading, "excepthook", lambda args: None ):
+            code, record_left = self.run_with( main )
+        self.assertEqual( code, 1 )
+        self.assertFalse( record_left )
+
 class SignalReadyTest( unittest.TestCase ):
 
     def test_writes_ready_and_closes_its_end( self ):

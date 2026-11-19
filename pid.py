@@ -19,10 +19,16 @@ def record_path( name ):
     return os.path.join( RECORD_DIR, "pid-{}".format(name) )
 
 def record_recorder( name, pid ):
-    # Written when Streamer launches a recorder, so a daemon started after a
-    # handoff can adopt it.
-    with open( record_path(name), "w" ) as f:
+    # Written by recorder.py for itself as it starts, so a daemon started
+    # after a handoff or a crash can adopt it. The record is written to a
+    # temporary file and renamed into place, so a crash never leaves a
+    # partial one.
+    os.makedirs( RECORD_DIR, exist_ok=True )
+    path = record_path( name )
+    temporary = "{}.{}.tmp".format( path, pid )
+    with open( temporary, "w" ) as f:
         f.write( "{}\n".format(pid) )
+    os.replace( temporary, path )
 
 def forget_recorder( name, pid ):
     # Removes the record when it still names pid; a newer launch may have

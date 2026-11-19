@@ -6,7 +6,7 @@ import os
 import sys
 import signal
 
-from pid import process_active, AdoptedProcess, record_recorder, forget_recorder
+from pid import process_active, AdoptedProcess
 
 # yt-dlp's Chaturbate extractor raises these for a room that is up but has no public stream
 ROOM_STATES = (
@@ -63,8 +63,6 @@ class Streamer:
             proc = self.stream
 
             try:
-                # a restarted daemon adopts this recorder from the record
-                record_recorder( self.name, proc.pid )
                 if self.recorder_ready( ready_fd ) and self.ensure_valid_stream( pid = proc.pid ):
                     self.daemon.logger.info("Started to record {}.".format(self.name))
                     self.daemon.record_launch()
@@ -141,6 +139,5 @@ class Streamer:
             if stream.poll() is None:
                 stream.terminate()
                 stream.wait()
-            forget_recorder( self.name, stream.pid )
             self.stream = None
 

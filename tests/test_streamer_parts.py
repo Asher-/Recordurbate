@@ -104,25 +104,16 @@ class ExitedProc(FakeProc):
 
 @pytest.fixture
 def start_harness(workdir, monkeypatch):
-    # calls["record_while_recording"] is configs/pid-alice as a restarted
-    # daemon would have found it while the recorder ran.
-    calls = {"validated": 0, "record_while_recording": None}
-    record = workdir / "configs/pid-alice"
-
-    class WatchedProc(FakeProc):
-        def wait(self, timeout=None):
-            calls["record_while_recording"] = record.read_text() if record.exists() else None
-            return FakeProc.wait(self, timeout)
+    calls = {"validated": 0}
 
     def fake_popen(*args, **kwargs):
         output = calls.get("output", READY_LINE)
         kwargs["stdout"].write(output)
         kwargs["stdout"].flush()
-        return launch(calls.get("proc_factory", WatchedProc), kwargs, ready="] Recording " in output)
+        return launch(calls.get("proc_factory", FakeProc), kwargs, ready="] Recording " in output)
 
     (workdir / "configs").mkdir()
     monkeypatch.setattr(streamer.subprocess, "Popen", fake_popen)
-    calls["record"] = record
     return calls
 
 
@@ -133,15 +124,13 @@ def validation_returning(calls, result):
     return ensure_valid_stream
 
 
-def test_started_recorder_is_recorded_until_it_exits(start_harness, monkeypatch):
+def test_validated_recorder_is_waited_on(start_harness, monkeypatch):
     monkeypatch.setattr(Streamer, "ensure_valid_stream", validation_returning(start_harness, True))
     daemon = make_daemon()
 
     run_start(Streamer(daemon, "alice"))
 
     assert any("Started to record alice." in m for m in daemon.logger.messages)
-    assert start_harness["record_while_recording"] == "4242\n"
-    assert not start_harness["record"].exists()
 
 
 def test_start_does_not_record_launch_started_when_validation_fails(start_harness, monkeypatch):
@@ -152,7 +141,6 @@ def test_start_does_not_record_launch_started_when_validation_fails(start_harnes
 
     assert start_harness["validated"] == 1
     assert not any("Started to record" in m for m in daemon.logger.messages)
-    assert not start_harness["record"].exists()
 
 
 def test_start_does_not_validate_when_recorder_exits_before_ready(start_harness, monkeypatch):
@@ -163,7 +151,6 @@ def test_start_does_not_validate_when_recorder_exits_before_ready(start_harness,
     run_start(Streamer(make_daemon(), "alice"))
 
     assert start_harness["validated"] == 0
-    assert not start_harness["record"].exists()
 
 
 def test_start_does_not_record_when_launch_fails(start_harness, monkeypatch):
@@ -177,7 +164,6 @@ def test_start_does_not_record_when_launch_fails(start_harness, monkeypatch):
     run_start(Streamer(daemon, "alice"))
 
     assert start_harness["validated"] == 0
-    assert not start_harness["record"].exists()
     assert any("Failed to launch recorder for alice" in m for m in daemon.logger.messages)
 
 
@@ -191,7 +177,6 @@ def test_start_logs_and_stops_when_validation_raises(start_harness, monkeypatch)
 
     run_start(s)
 
-    assert not start_harness["record"].exists()
     assert s.stream is None
     assert any("stream_thread error for alice" in m for m in daemon.logger.messages)
 
@@ -341,7 +326,7 @@ def slow_lookup(output, exit_code, monkeypatch):
     return SlowLookup
 
 
-def test_offline_room_reported_after_the_poll_window_is_not_started(start_harness, monkeypatch):
+def test_offline_room_reported_during_the_readiness_wait_is_not_started(start_harness, monkeypatch):
     start_harness["output"] = ""
     start_harness["proc_factory"] = slow_lookup("ERROR: [Chaturbate] alice: Room is currently offline\n", 1, monkeypatch)
     monkeypatch.setattr(Streamer, "ensure_valid_stream", validation_returning(start_harness, True))
@@ -351,11 +336,10 @@ def test_offline_room_reported_after_the_poll_window_is_not_started(start_harnes
 
     assert daemon.launches == [None]
     assert start_harness["validated"] == 0
-    assert not start_harness["record"].exists()
     assert not any("Started to record" in m for m in daemon.logger.messages)
 
 
-def test_recording_line_after_the_poll_window_starts_recording(start_harness, monkeypatch):
+def test_readiness_signalled_during_the_wait_starts_recording(start_harness, monkeypatch):
     start_harness["output"] = ""
     start_harness["proc_factory"] = slow_lookup(READY_LINE, None, monkeypatch)
     monkeypatch.setattr(Streamer, "ensure_valid_stream", validation_returning(start_harness, True))
@@ -364,7 +348,6 @@ def test_recording_line_after_the_poll_window_starts_recording(start_harness, mo
     run_start(Streamer(daemon, "alice"))
 
     assert daemon.launches == [None]
-    assert not start_harness["record"].exists()
     assert any("Started to record alice." in m for m in daemon.logger.messages)
 
 
@@ -379,7 +362,6 @@ def test_recorder_that_never_logs_recording_is_not_started(start_harness, monkey
 
     assert daemon.launches == [streamer.NO_ERROR]
     assert start_harness["validated"] == 0
-    assert not start_harness["record"].exists()
     assert s.stream is None
     assert not any("Started to record" in m for m in daemon.logger.messages)
 
@@ -395,7 +377,6 @@ def test_stop_during_the_readiness_wait_reports_nothing(start_harness, monkeypat
 
     assert daemon.launches == []
     assert start_harness["validated"] == 0
-    assert not start_harness["record"].exists()
     assert s.stream is None
 
 
@@ -443,7 +424,7 @@ def run_adopt(streamer_obj, pid):
     assert not thread.is_alive()
 
 
-def test_valid_adopted_recorder_is_waited_on_and_forgotten_when_it_exits(adopt_harness, monkeypatch):
+def test_valid_adopted_recorder_is_waited_on(adopt_harness, monkeypatch):
     monkeypatch.setattr(Streamer, "ensure_valid_stream", lambda self, **kwargs: True)
     daemon = make_daemon()
     s = Streamer(daemon, "alice")
@@ -455,7 +436,6 @@ def test_valid_adopted_recorder_is_waited_on_and_forgotten_when_it_exits(adopt_h
     assert daemon.launches == []
     assert s.stream is None
     assert not s.started
-    assert not adopt_harness.exists()
 
 
 def test_adopted_recorder_that_fails_validation_is_terminated(adopt_harness, monkeypatch):
@@ -468,7 +448,6 @@ def test_adopted_recorder_that_fails_validation_is_terminated(adopt_harness, mon
     assert s_terminated(FakeAdopted)
     assert any("failed validation, will restart" in m for m in daemon.logger.messages)
     assert not any("validated." in m for m in daemon.logger.messages)
-    assert not adopt_harness.exists()
     assert s.stream is None
 
 
