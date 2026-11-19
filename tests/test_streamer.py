@@ -39,7 +39,7 @@ class EnsureValidStreamTest( unittest.TestCase ):
     def test_alive_process_is_valid( self ):
         proc = subprocess.Popen( [ "sleep", "30" ] )
         try:
-            self.assertTrue( Streamer(FakeDaemon(), "x").ensure_valid_stream(ytdlp_pid=proc.pid) )
+            self.assertTrue( Streamer(FakeDaemon(), "x").ensure_valid_stream(pid=proc.pid) )
         finally:
             proc.kill()
             proc.wait()
@@ -47,7 +47,7 @@ class EnsureValidStreamTest( unittest.TestCase ):
     def test_exited_process_is_invalid( self ):
         proc = subprocess.Popen( [ "true" ] )
         proc.wait()
-        self.assertFalse( Streamer(FakeDaemon(), "x").ensure_valid_stream(ytdlp_pid=proc.pid) )
+        self.assertFalse( Streamer(FakeDaemon(), "x").ensure_valid_stream(pid=proc.pid) )
 
     def test_no_process_is_invalid( self ):
         self.assertFalse( Streamer(FakeDaemon(), "x").ensure_valid_stream() )

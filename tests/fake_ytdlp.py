@@ -1,23 +1,41 @@
 #!/usr/bin/env python3
-"""Stands in for yt-dlp --dump-single-json in tests/test_recorder.py.
+"""Stands in for yt-dlp --dump-single-json in the recorder tests.
 
-FAKE_HLS_BASE names the local test server; FAKE_YTDLP_OFFLINE makes it report
-an offline room the way yt-dlp does.
+FAKE_HLS_BASE names the local test server. FAKE_YTDLP_MODE picks the outcome:
+ok (default), offline, neterror, garbage, hang, or fail-after-first, which
+answers ok once and neterror afterwards, counting calls in FAKE_YTDLP_COUNTER.
 """
 import json
 import os
 import sys
+import time
 
-if os.environ.get("FAKE_YTDLP_OFFLINE"):
-    print("ERROR: [Chaturbate] room: Room is currently offline", file=sys.stderr)
-    sys.exit(1)
+mode = os.environ.get("FAKE_YTDLP_MODE", "ok")
+if mode == "fail-after-first":
+    counter = os.environ["FAKE_YTDLP_COUNTER"]
+    calls = int( open(counter).read() ) if os.path.exists( counter ) else 0
+    with open( counter, "w" ) as f:
+        f.write( str(calls + 1) )
+    mode = "ok" if calls == 0 else "neterror"
+
+if mode == "offline":
+    print( "ERROR: [Chaturbate] room: Room is currently offline", file=sys.stderr )
+    sys.exit( 1 )
+if mode == "neterror":
+    print( "ERROR: [Chaturbate] room: Unable to download webpage: <urlopen error [Errno 51] Network is unreachable>", file=sys.stderr )
+    sys.exit( 1 )
+if mode == "garbage":
+    print( "not json" )
+    sys.exit( 0 )
+if mode == "hang":
+    time.sleep( 120 )
 
 base = os.environ["FAKE_HLS_BASE"]
-print(json.dumps({
+print( json.dumps({
     "title": "room 2026-01-01 00_00",
     "requested_formats": [
         {"url": base + "/v/playlist.m3u8"},
         {"url": base + "/a/playlist.m3u8"},
     ],
     "http_headers": {"User-Agent": "recordurbate-test"},
-}))
+}) )

@@ -28,12 +28,12 @@ class Streamer:
       self.name = name
       self.daemon = daemon
     
-    def ensure_valid_stream( self, ytdlp_pid = None ):
+    def ensure_valid_stream( self, pid = None ):
         # recorder.py exits as soon as yt-dlp cannot resolve the room, so one
         # still running after the launch poll is fetching its segments.
-        if not ytdlp_pid and self.stream:
-            ytdlp_pid = self.stream.pid
-        return bool( ytdlp_pid and process_active(ytdlp_pid) )
+        if not pid and self.stream:
+            pid = self.stream.pid
+        return bool( pid and process_active(pid) )
  
     def start(self):
         def stream_thread():
@@ -48,7 +48,7 @@ class Streamer:
                     launched_at = time.time()
                     self.stream = subprocess.Popen( process_args, 0, stdout=capture_log, stderr=capture_log, start_new_session=True )
             except OSError:
-                self.daemon.logger.exception("Failed to launch yt-dlp for {}".format(self.name))
+                self.daemon.logger.exception("Failed to launch recorder for {}".format(self.name))
                 return
             proc = self.stream
 
@@ -63,7 +63,7 @@ class Streamer:
                     time.sleep(1)
                 if self.stream and proc.poll() is None:
                     # self.daemon.logger.info("Stream for {} appears to be healthy - validating.".format(self.name))
-                    if self.ensure_valid_stream( ytdlp_pid = proc.pid ):
+                    if self.ensure_valid_stream( pid = proc.pid ):
                         self.daemon.logger.info("Started to record {}.".format(self.name))
                         self.daemon.record_launch()
                         self.finalize_prior_parts( launched_at )
@@ -100,8 +100,8 @@ class Streamer:
         def adopted_thread():
             self.stream = AdoptedProcess( pid )
             try:
-                self.daemon.logger.info("Adopted existing yt-dlp (PID {}) for {}.".format(pid, self.name))
-                if self.ensure_valid_stream( ytdlp_pid=pid ):
+                self.daemon.logger.info("Adopted existing recorder (PID {}) for {}.".format(pid, self.name))
+                if self.ensure_valid_stream( pid=pid ):
                     self.started = True
                     self.daemon.logger.info("Adopted stream for {} validated.".format(self.name))
                     self.wait_with_watchdog( self.stream )
@@ -141,7 +141,7 @@ class Streamer:
                         if stale_since is None:
                             stale_since = time.time()
                         elif time.time() - stale_since >= stale_timeout:
-                            self.daemon.logger.info("Stale output for {} (no writes in {}s), killing yt-dlp.".format(self.name, int(time.time() - stale_since)))
+                            self.daemon.logger.info("Stale output for {} (no writes in {}s), stopping the recorder.".format(self.name, int(time.time() - stale_since)))
                             proc.send_signal(signal.SIGINT)
                             try:
                                 proc.wait( timeout=10 )

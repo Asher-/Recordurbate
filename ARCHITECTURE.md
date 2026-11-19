@@ -329,32 +329,40 @@ Chaturbate serves LL-HLS with video and audio as separate fMP4 playlists of
 1.6s segments and a window of about 8s. The recorder:
 
 1. Runs `<youtube-dl_cmd> --config-location <youtube-dl_config>
-   --dump-single-json <url>`. yt-dlp's stderr goes to the capture log; a
-   non-zero exit (offline, private, …) ends the recorder with status 1.
+   --dump-single-json <url>` with a 60s timeout and passes yt-dlp's stderr on
+   to the capture log. Any failure of this first lookup (offline, private,
+   network error, unreadable output) ends the recorder with status 1.
 2. Takes the title and one playlist URL per entry of `requested_formats`, and
    opens `videos/<name>/<title>.ts` for appending.
-3. Every 1s, loads each playlist, fetches its `EXT-X-MAP` init segment when the
-   URI path changes, and then fetches every full `EXTINF` segment it has not
-   yet written, in media-sequence order. `EXT-X-PART` parts are ignored.
+3. Every 1s, loads each playlist and its `EXT-X-MAP` init segment, then
+   fetches every full `EXTINF` segment it has not yet written, in
+   media-sequence order. `EXT-X-PART` parts are ignored.
 4. Feeds each track to the `Muxer`: a local
    `ffmpeg -f mov -i pipe:<fd> … -map <i> -c copy -f mpegts pipe:1`, whose
    stdout is appended to the `.ts`. Each input has its own queue and writer
    thread, so a fetch never waits on ffmpeg.
 
-| Event                                      | Response                                                  |
-| :----------------------------------------- | :-------------------------------------------------------- |
-| Segment fetch fails 3 times (3s/5s timeouts) | Log the segment as failed and continue with the next one |
-| Segments left the playlist before fetching | Log the lost range and continue                           |
-| Not every playlist loaded for 15s          | Re-resolve through yt-dlp; exit if the room is unavailable |
-| Init segment bytes change                  | Restart the muxer, appending to the same file             |
-| ffmpeg exits                               | Restart the muxer, appending to the same file             |
-| Media sequence restarts                    | Resume from the playlist's first segment                  |
-| No new segment for 120s                    | Exit                                                      |
-| `EXT-X-ENDLIST`                            | Exit                                                      |
-| SIGINT / SIGTERM                           | Close the muxer (ffmpeg flushes) and exit                 |
+| Event                                                 | Response                                                           |
+| :---------------------------------------------------- | :----------------------------------------------------------------- |
+| Segment fetch fails 3 times (3s/5s timeouts), or once with HTTP 403/404/410 | Log the segment as failed and continue with the next one |
+| Segments left the playlist before fetching            | Log the lost range and continue                                    |
+| Not every playlist loaded for 15s                     | Re-resolve through yt-dlp (at most once per 15s)                   |
+| Re-resolution: yt-dlp names a room state              | Exit                                                               |
+| Re-resolution: any other yt-dlp failure               | Log it and keep recording                                          |
+| Re-resolution: a different number of tracks          | Restart the muxer with the new tracks, appending to the same file  |
+| Init segment bytes differ from the last ones fetched  | Restart the muxer, appending to the same file                      |
+| ffmpeg exits                                          | Restart the muxer, appending to the same file                      |
+| Media sequence restarts                               | Resume from the playlist's first segment                           |
+| No new segment for 120s                               | Exit                                                               |
+| `EXT-X-ENDLIST`                                       | Exit                                                               |
+| SIGINT / SIGTERM                                      | Stop between fetch attempts, close the muxer and exit              |
 
-On exit an empty output file is deleted. MPEG-TS plays while it is written
-and tolerates gaps and muxer restarts in the middle of the file.
+SIGINT and SIGTERM are checked before every playlist, init and segment fetch
+attempt and every 0.5s of a yt-dlp lookup. Closing the muxer gives ffmpeg 3s
+to drain its inputs and 3s to exit before it is killed.
+
+On exit an empty output file is deleted. ffprobe reads the `.ts` while it is
+being written, and the file tolerates gaps and muxer restarts.
 
 ---
 
@@ -845,7 +853,7 @@ yt-dlp occasionally deadlocks on internal Python threading locks (observed via
 yt-dlp now only resolves a room, so a deadlock can only stall that lookup.
 `recorder.py` runs it with a 60s timeout: at the first launch a stalled
 lookup makes the recorder exit, and during a recording it counts as a failed
-re-resolution, which ends the recorder.
+re-resolution, which keeps the recording open and is retried 15s later.
 
 ### Session Isolation and ps Visibility
 

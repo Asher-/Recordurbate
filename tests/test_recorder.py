@@ -201,8 +201,12 @@ class FakeHls:
 
     FIRST = 100
 
-    def __init__( self, failing = () ):
+    def __init__( self, failing = (), outage = None, hang = False ):
+        # outage=(start, end) answers 503 to everything in that window of
+        # seconds; hang=True never answers a media segment.
         self.failing = set( failing )
+        self.outage = outage
+        self.hang = hang
         self.started = time.time()
         fake = self
         class Handler( http.server.BaseHTTPRequestHandler ):
@@ -219,6 +223,14 @@ class FakeHls:
 
     def handle( self, request ):
         letter, name = request.path.split("?")[0].strip("/").split("/")
+        elapsed = time.time() - self.started
+        if self.outage and self.outage[0] <= elapsed < self.outage[1]:
+            request.send_response( 503 )
+            request.end_headers()
+            return
+        if self.hang and name.startswith("seg_"):
+            time.sleep( 30 )
+            return
         init, fragments = self.track( letter )
         if name == "playlist.m3u8":
             available = min( len(fragments), int(time.time() - self.started) + 1 )
@@ -281,7 +293,7 @@ class RecorderRunTest( unittest.TestCase ):
         self.assertGreater( duration, 4 )
 
     def test_offline_room_exits_with_ytdlp_error( self ):
-        result = self.run_recorder( { "FAKE_YTDLP_OFFLINE": "1" } )
+        result = self.run_recorder( { "FAKE_YTDLP_MODE": "offline" } )
         self.assertEqual( result.returncode, 1 )
         self.assertIn( "ERROR: [Chaturbate] room: Room is currently offline", result.stdout )
         self.assertFalse( os.path.exists(os.path.join(self.cwd, "videos")) )
@@ -302,6 +314,75 @@ class RecorderRunTest( unittest.TestCase ):
         codecs, container, duration = probe( path )
         self.assertEqual( codecs, [ "aac", "h264" ] )
         self.assertEqual( subprocess.run(["pgrep", "-P", str(proc.pid)], stdout=subprocess.PIPE).stdout, b"" )
+
+    def test_outage_with_failed_reresolution_keeps_one_recording( self ):
+        # Playlists answer 503 from 2s to 19s, so re-resolution runs and its
+        # yt-dlp lookup fails with a network error; the recorder must keep
+        # going and finish the stream in the same file.
+        hls = FakeHls( outage=(2, 19) )
+        try:
+            result = self.run_recorder( { "FAKE_HLS_BASE": hls.base, "FAKE_YTDLP_MODE": "fail-after-first",
+                                          "FAKE_YTDLP_COUNTER": os.path.join(self.cwd, "calls") }, timeout=60 )
+        finally:
+            hls.close()
+        self.assertEqual( result.returncode, 0, result.stdout )
+        self.assertIn( "Re-resolution failed", result.stdout )
+        self.assertIn( "Stream ended", result.stdout )
+        self.assertEqual( os.listdir(os.path.join(self.cwd, "videos", "room")), [ "room 2026-01-01 00_00.ts" ] )
+
+    def test_sigint_during_stalled_fetch_exits_within_15s( self ):
+        hls = FakeHls( hang=True )
+        try:
+            proc = subprocess.Popen( [ sys.executable, os.path.join(ROOT, "recorder.py"), "https://chaturbate.com/room/" ],
+                                     cwd=self.cwd, env=dict(os.environ, FAKE_HLS_BASE=hls.base),
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True )
+            time.sleep( 4 )
+            sent = time.time()
+            proc.send_signal( 2 )
+            out, _ = proc.communicate( timeout=30 )
+            elapsed = time.time() - sent
+        finally:
+            hls.close()
+        self.assertLess( elapsed, 15, out )
+        self.assertIn( "Stopped recording room", out )
+
+class ExtractTest( unittest.TestCase ):
+    # recorder.extract against fake_ytdlp.py in each of its modes.
+
+    CONFIG = { "youtube-dl_cmd": "{} {}".format(sys.executable, os.path.join(ROOT, "tests", "fake_ytdlp.py")),
+               "youtube-dl_config": "unused" }
+
+    def extract( self, mode, stop = None ):
+        with mock.patch.dict( os.environ, { "FAKE_YTDLP_MODE": mode, "FAKE_HLS_BASE": "http://h" } ), \
+             mock.patch.object( recorder.sys, "stderr", new_callable=lambda: open(os.devnull, "w") ):
+            return recorder.extract( "https://chaturbate.com/room/", self.CONFIG, stop or threading.Event() )
+
+    def test_ok( self ):
+        status, (title, urls, headers) = self.extract( "ok" )
+        self.assertEqual( status, "ok" )
+        self.assertEqual( title, "room 2026-01-01 00_00" )
+        self.assertEqual( urls, [ "http://h/v/playlist.m3u8", "http://h/a/playlist.m3u8" ] )
+        self.assertEqual( headers, { "User-Agent": "recordurbate-test" } )
+
+    def test_room_state_is_unavailable( self ):
+        self.assertEqual( self.extract("offline"), ("unavailable", "ERROR: [Chaturbate] room: Room is currently offline") )
+
+    def test_network_error_is_an_error( self ):
+        status, reason = self.extract( "neterror" )
+        self.assertEqual( status, "error" )
+        self.assertIn( "Network is unreachable", reason )
+
+    def test_unreadable_output_is_an_error( self ):
+        status, reason = self.extract( "garbage" )
+        self.assertEqual( status, "error" )
+        self.assertIn( "unreadable yt-dlp output", reason )
+
+    def test_stop_interrupts_a_hanging_lookup( self ):
+        stop = threading.Event()
+        threading.Timer( 1, stop.set ).start()
+        started = time.time()
+        self.assertEqual( self.extract("hang", stop), ("error", "yt-dlp lookup interrupted") )
+        self.assertLess( time.time() - started, 5 )
 
 if __name__ == "__main__":
     unittest.main()

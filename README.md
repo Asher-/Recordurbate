@@ -61,8 +61,8 @@ source venv/bin/activate
 pip install yt-dlp psutil requests
 ```
 
-Streams are saved to `videos/<streamer_name>/<title>.ts`. MPEG-TS plays while
-it is still being written (VLC, mpv, IINA).
+Streams are saved to `videos/<streamer_name>/<title>.ts`, MPEG-TS that can be
+opened while it is still being written.
 
 ## Running Recordurbate
 

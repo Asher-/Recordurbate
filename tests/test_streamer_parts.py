@@ -267,7 +267,7 @@ def test_start_does_not_finalize_when_launch_fails(start_harness, monkeypatch):
 
     assert start_harness["validated"] == 0
     assert start_harness["finalize"] == []
-    assert any("Failed to launch yt-dlp for alice" in m for m in daemon.logger.messages)
+    assert any("Failed to launch recorder for alice" in m for m in daemon.logger.messages)
 
 
 def test_start_logs_and_stops_when_validation_raises(start_harness, monkeypatch):
@@ -382,12 +382,18 @@ def test_stop_during_launch_reports_nothing(start_harness, monkeypatch):
 
 
 def test_real_process_output_is_read_back_from_the_capture_log(workdir):
+    # The real recorder.py runs the fake yt-dlp, whose stderr must reach the
+    # capture log through the recorder.
     error = "ERROR: [Chaturbate] alice: Unable to download webpage: curl: (6) Could not resolve host"
     (workdir / "configs").mkdir()
     (workdir / "configs/capture-alice.log").write_text("ERROR: [Chaturbate] alice: Room is currently offline\n")
     script = workdir / "yt-dlp"
     script.write_text("#!/bin/sh\necho '{}' >&2\nexit 1\n".format(error))
     script.chmod(0o755)
+    (workdir / "configs/config.json").write_text(
+        '{{"youtube-dl_cmd": "{}", "youtube-dl_config": "configs/youtube-dl.config"}}'.format(script))
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    (workdir / "recorder.py").symlink_to(os.path.join(root, "recorder.py"))
     daemon = make_daemon(**{"youtube-dl_cmd": str(script), "process_poll_wait_time": 5})
 
     run_start(Streamer(daemon, "alice"))
