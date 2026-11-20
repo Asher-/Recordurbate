@@ -308,6 +308,31 @@ class RecorderRunTest( unittest.TestCase ):
         self.assertIn( "ERROR: [Chaturbate] room: Room is currently offline", result.stdout )
         self.assertFalse( os.path.exists(os.path.join(self.cwd, "videos")) )
 
+    def test_recording_leaves_the_cookies_export_untouched( self ):
+        # recorder.py run as the daemon runs it, with the user's export in its
+        # working directory: yt-dlp rewrites the copy it is handed on exit, and
+        # the export itself is never written.
+        export = os.path.join( self.cwd, recorder.COOKIES_FILE )
+        contents = "# Netscape HTTP Cookie File\n.chaturbate.com\tTRUE\t/\tTRUE\t0\tsessionid\tfrom-browser\n"
+        with open( export, "w" ) as f:
+            f.write( contents )
+        log = os.path.join( self.cwd, "cookies-log" )
+        hls = FakeHls()
+        try:
+            result = self.run_recorder( { "FAKE_HLS_BASE": hls.base, "FAKE_YTDLP_COOKIES_LOG": log } )
+        finally:
+            hls.close()
+        self.assertEqual( result.returncode, 0, result.stdout )
+        self.assertIn( "Stream ended", result.stdout )
+        with open( log ) as f:
+            path, received = f.read().split( "\n", 1 )
+        self.assertNotEqual( path, "" )
+        self.assertNotEqual( os.path.realpath(path), os.path.realpath(export) )
+        self.assertEqual( received, contents )
+        self.assertFalse( os.path.exists(path) )
+        with open( export ) as f:
+            self.assertEqual( f.read(), contents )
+
     def test_sigint_stops_and_keeps_recording( self ):
         hls = FakeHls()
         try:
