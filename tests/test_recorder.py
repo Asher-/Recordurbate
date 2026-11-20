@@ -1,6 +1,7 @@
 import http.server
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -8,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 from unittest import mock
 
 import requests
@@ -15,6 +17,7 @@ import requests
 ROOT = os.path.dirname( os.path.dirname( os.path.abspath(__file__) ) )
 sys.path.insert( 0, ROOT )
 import recorder
+import streamer as recorder_streamer
 
 def split_boxes( data ):
     boxes = []
@@ -198,15 +201,38 @@ class FakeHls:
     # Serves a live LL-HLS room from the fixtures: one segment per track
     # becomes available each second, the playlist window holds three, and
     # ENDLIST follows the last. Segments in `failing` answer 500.
+    #
+    # It also stands in for the site: POST /get_edge_hls_url_ajax/ answers
+    # according to `api` and GET /master.m3u8 lists two video variants, the
+    # higher-bandwidth one being v/playlist.m3u8, whose audio group's default
+    # rendition is a/playlist.m3u8. `api` is one of ok, offline, private,
+    # unknown (a room_status with no message), neterror (503), garbage (not
+    # JSON), hang (never answers), or fail-after-first (ok once, then 503).
+    # While `api_gate` is cleared, room API requests wait for it to be set.
+    # `api_requests` records each API request's room_slug and Cookie header.
 
     FIRST = 100
+    MASTER = "\n".join( [
+        "#EXTM3U",
+        "#EXT-X-VERSION:6",
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aac",NAME="other",DEFAULT=NO,URI="x/playlist.m3u8"',
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aac",NAME="main",DEFAULT=YES,URI="a/playlist.m3u8"',
+        '#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=9000000,BANDWIDTH=896000,RESOLUTION=640x360,AUDIO="aac"',
+        "lo/playlist.m3u8",
+        '#EXT-X-STREAM-INF:BANDWIDTH=5128000,RESOLUTION=1920x1080,AUDIO="aac"',
+        "v/playlist.m3u8",
+        "" ] )
 
-    def __init__( self, failing = (), outage = None, hang = False ):
+    def __init__( self, failing = (), outage = None, hang = False, api = "ok" ):
         # outage=(start, end) answers 503 to everything in that window of
         # seconds; hang=True never answers a media segment.
         self.failing = set( failing )
         self.outage = outage
         self.hang = hang
+        self.api = api
+        self.api_gate = threading.Event()
+        self.api_gate.set()
+        self.api_requests = []
         self.started = time.time()
         # set once two media segments of each track have been served: the
         # recorder fetches a track in order, so its first has reached the muxer
@@ -219,6 +245,8 @@ class FakeHls:
                 pass
             def do_GET( self ):
                 fake.handle( self )
+            def do_POST( self ):
+                fake.handle_api( self )
         self.server = http.server.ThreadingHTTPServer( ("127.0.0.1", 0), Handler )
         self.base = "http://127.0.0.1:{}".format( self.server.server_address[1] )
         threading.Thread( target=self.server.serve_forever, daemon=True ).start()
@@ -226,13 +254,47 @@ class FakeHls:
     def track( self, letter ):
         return Fixtures.video if letter == "v" else Fixtures.audio
 
+    def respond( self, request, status, body = b"", content_type = None ):
+        request.send_response( status )
+        if content_type:
+            request.send_header( "Content-Type", content_type )
+        request.send_header( "Content-Length", str(len(body)) )
+        request.end_headers()
+        request.wfile.write( body )
+
+    def handle_api( self, request ):
+        length = int( request.headers.get("Content-Length") or 0 )
+        form = urllib.parse.parse_qs( request.rfile.read( length ).decode() )
+        self.api_requests.append( ( form.get("room_slug", [""])[0], request.headers.get("Cookie") ) )
+        self.api_gate.wait()
+        mode = self.api
+        if mode == "fail-after-first":
+            mode = "ok" if len( self.api_requests ) == 1 else "neterror"
+        if mode == "hang":
+            time.sleep( 30 )
+            return
+        if mode == "neterror":
+            self.respond( request, 503 )
+            return
+        if mode == "garbage":
+            self.respond( request, 200, b"not json", "text/html" )
+            return
+        status = { "ok": "public", "offline": "offline", "private": "private", "unknown": "unknown" }[ mode ]
+        info = { "success": True, "url": self.base + "/master.m3u8?token=t" if mode == "ok" else "",
+                 "room_status": status }
+        self.respond( request, 200, json.dumps( info ).encode(), "application/json" )
+
     def handle( self, request ):
-        letter, name = request.path.split("?")[0].strip("/").split("/")
+        path = request.path.split("?")[0]
         elapsed = time.time() - self.started
         if self.outage and self.outage[0] <= elapsed < self.outage[1]:
             request.send_response( 503 )
             request.end_headers()
             return
+        if path == "/master.m3u8":
+            self.respond( request, 200, self.MASTER.encode() )
+            return
+        letter, name = path.strip("/").split("/")
         if self.hang and name.startswith("seg_"):
             time.sleep( 30 )
             return
@@ -266,111 +328,122 @@ class FakeHls:
                 if len( self.served_counts ) == 2 and min( self.served_counts.values() ) >= 2:
                     self.served.set()
 
+    def room_url( self ):
+        return self.base + "/room/"
+
     def close( self ):
+        self.api_gate.set()
         self.server.shutdown()
 
+TITLE = re.compile( r"room \d{4}-\d\d-\d\d \d\d_\d\d\.ts" )
+
 class RecorderRunTest( unittest.TestCase ):
-    # Runs recorder.py as the daemon does, against FakeHls and fake_ytdlp.py.
+    # Runs recorder.py as the daemon does, against FakeHls as both the site's
+    # room API and the CDN.
 
     def setUp( self ):
         self.cwd = tempfile.mkdtemp()
         os.makedirs( os.path.join(self.cwd, "configs") )
-        with open( os.path.join(self.cwd, "configs", "config.json"), "w" ) as f:
-            json.dump( { "youtube-dl_cmd": "{} {}".format(sys.executable, os.path.join(ROOT, "tests", "fake_ytdlp.py")),
-                         "youtube-dl_config": "configs/unused.config" }, f )
 
     def tearDown( self ):
         shutil.rmtree( self.cwd )
 
-    def run_recorder( self, env, timeout = 40 ):
-        return subprocess.run( [ sys.executable, os.path.join(ROOT, "recorder.py"), "https://chaturbate.com/room/" ],
-                               cwd=self.cwd, env=dict(os.environ, **env), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    def run_recorder( self, hls, timeout = 40 ):
+        return subprocess.run( [ sys.executable, os.path.join(ROOT, "recorder.py"), hls.room_url() ],
+                               cwd=self.cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                timeout=timeout, text=True )
+
+    def recording( self ):
+        # the one file recorded for the room, named "room <date> <time>.ts"
+        names = os.listdir( os.path.join(self.cwd, "videos", "room") )
+        self.assertEqual( len(names), 1, names )
+        self.assertRegex( names[0], TITLE )
+        return os.path.join( self.cwd, "videos", "room", names[0] )
 
     def test_records_both_tracks_across_a_failed_segment( self ):
         hls = FakeHls( failing=[ ("v", 102) ] )
         try:
-            result = self.run_recorder( { "FAKE_HLS_BASE": hls.base } )
+            result = self.run_recorder( hls )
         finally:
             hls.close()
         self.assertEqual( result.returncode, 0, result.stdout )
         self.assertIn( "Track 0 segment 102 failed: HTTP 500", result.stdout )
         self.assertIn( "Stream ended", result.stdout )
-        path = os.path.join( self.cwd, "videos", "room", "room 2026-01-01 00_00.ts" )
-        codecs, container, duration = probe( path )
+        codecs, container, duration = probe( self.recording() )
         self.assertEqual( codecs, [ "aac", "h264" ] )
         self.assertEqual( container, "mpegts" )
         self.assertGreater( duration, 4 )
 
-    def test_offline_room_exits_with_ytdlp_error( self ):
-        result = self.run_recorder( { "FAKE_YTDLP_MODE": "offline" } )
+    def test_offline_room_exits_with_its_room_state( self ):
+        hls = FakeHls( api="offline" )
+        try:
+            result = self.run_recorder( hls )
+        finally:
+            hls.close()
         self.assertEqual( result.returncode, 1 )
         self.assertIn( "ERROR: [Chaturbate] room: Room is currently offline", result.stdout )
         self.assertFalse( os.path.exists(os.path.join(self.cwd, "videos")) )
 
-    def test_recording_leaves_the_cookies_export_untouched( self ):
+    def test_recording_sends_the_cookies_export_and_leaves_it_untouched( self ):
         # recorder.py run as the daemon runs it, with the user's export in its
-        # working directory: yt-dlp rewrites the copy it is handed on exit, and
-        # the export itself is never written.
+        # working directory: the room API receives its cookies, including one
+        # marked #HttpOnly_, and the export is never written.
         export = os.path.join( self.cwd, recorder.COOKIES_FILE )
-        contents = "# Netscape HTTP Cookie File\n.chaturbate.com\tTRUE\t/\tTRUE\t0\tsessionid\tfrom-browser\n"
+        contents = ( "# Netscape HTTP Cookie File\n"
+                     "#HttpOnly_127.0.0.1\tFALSE\t/\tFALSE\t0\tsessionid\tfrom-browser\n"
+                     "127.0.0.1\tFALSE\t/\tFALSE\t0\tcsrftoken\tcsrf\n" )
         with open( export, "w" ) as f:
             f.write( contents )
-        log = os.path.join( self.cwd, "cookies-log" )
+        before = os.stat( export ).st_mtime_ns
         hls = FakeHls()
         try:
-            result = self.run_recorder( { "FAKE_HLS_BASE": hls.base, "FAKE_YTDLP_COOKIES_LOG": log } )
+            result = self.run_recorder( hls )
         finally:
             hls.close()
         self.assertEqual( result.returncode, 0, result.stdout )
         self.assertIn( "Stream ended", result.stdout )
-        with open( log ) as f:
-            path, received = f.read().split( "\n", 1 )
-        self.assertNotEqual( path, "" )
-        self.assertNotEqual( os.path.realpath(path), os.path.realpath(export) )
-        self.assertEqual( received, contents )
-        self.assertFalse( os.path.exists(path) )
+        room, cookie = hls.api_requests[0]
+        self.assertEqual( room, "room" )
+        self.assertEqual( sorted( cookie.split("; ") ), [ "csrftoken=csrf", "sessionid=from-browser" ] )
         with open( export ) as f:
             self.assertEqual( f.read(), contents )
+        self.assertEqual( os.stat( export ).st_mtime_ns, before )
 
     def test_sigint_stops_and_keeps_recording( self ):
         hls = FakeHls()
         try:
-            proc = subprocess.Popen( [ sys.executable, os.path.join(ROOT, "recorder.py"), "https://chaturbate.com/room/" ],
-                                     cwd=self.cwd, env=dict(os.environ, FAKE_HLS_BASE=hls.base),
-                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True )
+            proc = subprocess.Popen( [ sys.executable, os.path.join(ROOT, "recorder.py"), hls.room_url() ],
+                                     cwd=self.cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True )
             self.assertTrue( hls.served.wait( 15 ) )
             proc.send_signal( 2 )
             out, _ = proc.communicate( timeout=15 )
         finally:
             hls.close()
         self.assertIn( "Stopped recording room", out )
-        path = os.path.join( self.cwd, "videos", "room", "room 2026-01-01 00_00.ts" )
-        codecs, container, duration = probe( path )
+        codecs, container, duration = probe( self.recording() )
         self.assertEqual( codecs, [ "aac", "h264" ] )
         self.assertEqual( subprocess.run(["pgrep", "-P", str(proc.pid)], stdout=subprocess.PIPE).stdout, b"" )
 
     def test_outage_with_failed_reresolution_keeps_one_recording( self ):
         # Playlists answer 503 from 2s to 19s, so re-resolution runs and its
-        # yt-dlp lookup fails with a network error; the recorder must keep
-        # going and finish the stream in the same file.
-        hls = FakeHls( outage=(2, 19) )
+        # room API request fails; the recorder must keep going and finish the
+        # stream in the same file.
+        hls = FakeHls( outage=(2, 19), api="fail-after-first" )
         try:
-            result = self.run_recorder( { "FAKE_HLS_BASE": hls.base, "FAKE_YTDLP_MODE": "fail-after-first",
-                                          "FAKE_YTDLP_COUNTER": os.path.join(self.cwd, "calls") }, timeout=60 )
+            result = self.run_recorder( hls, timeout=60 )
         finally:
             hls.close()
         self.assertEqual( result.returncode, 0, result.stdout )
         self.assertIn( "Re-resolution failed", result.stdout )
         self.assertIn( "Stream ended", result.stdout )
-        self.assertEqual( os.listdir(os.path.join(self.cwd, "videos", "room")), [ "room 2026-01-01 00_00.ts" ] )
+        self.recording()
 
     def test_sigint_during_stalled_fetch_exits_within_15s( self ):
         hls = FakeHls( hang=True )
         ready_fd, write_fd = os.pipe()
         try:
-            proc = subprocess.Popen( [ sys.executable, os.path.join(ROOT, "recorder.py"), "https://chaturbate.com/room/", str(write_fd) ],
-                                     cwd=self.cwd, env=dict(os.environ, FAKE_HLS_BASE=hls.base), pass_fds=(write_fd,),
+            proc = subprocess.Popen( [ sys.executable, os.path.join(ROOT, "recorder.py"), hls.room_url(), str(write_fd) ],
+                                     cwd=self.cwd, pass_fds=(write_fd,),
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True )
             os.close( write_fd )
             # the room has resolved and the recorder is fetching from the hung server
@@ -385,128 +458,138 @@ class RecorderRunTest( unittest.TestCase ):
         self.assertLess( elapsed, 15, out )
         self.assertIn( "Stopped recording room", out )
 
+    def test_sigint_during_a_hung_lookup_exits_within_15s( self ):
+        hls = FakeHls( api="hang" )
+        try:
+            proc = subprocess.Popen( [ sys.executable, os.path.join(ROOT, "recorder.py"), hls.room_url() ],
+                                     cwd=self.cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True )
+            deadline = time.time() + 15
+            while not hls.api_requests and time.time() < deadline:
+                time.sleep( 0.05 )
+            self.assertTrue( hls.api_requests )
+            sent = time.time()
+            proc.send_signal( 2 )
+            out, _ = proc.communicate( timeout=30 )
+            elapsed = time.time() - sent
+        finally:
+            hls.close()
+        self.assertLess( elapsed, 15, out )
+        self.assertIn( "Cannot record room: lookup interrupted", out )
+
 class ExtractTest( unittest.TestCase ):
-    # recorder.extract against fake_ytdlp.py in each of its modes.
-
-    CONFIG = { "youtube-dl_cmd": "{} {}".format(sys.executable, os.path.join(ROOT, "tests", "fake_ytdlp.py")),
-               "youtube-dl_config": "unused" }
-
-    def extract( self, mode, stop = None ):
-        with mock.patch.dict( os.environ, { "FAKE_YTDLP_MODE": mode, "FAKE_HLS_BASE": "http://h" } ), \
-             mock.patch.object( recorder.sys, "stderr", new_callable=lambda: open(os.devnull, "w") ):
-            return recorder.extract( "https://chaturbate.com/room/", self.CONFIG, stop or recorder.Stop() )
-
-    def test_ok( self ):
-        status, (title, urls, headers) = self.extract( "ok" )
-        self.assertEqual( status, "ok" )
-        self.assertEqual( title, "room 2026-01-01 00_00" )
-        self.assertEqual( urls, [ "http://h/v/playlist.m3u8", "http://h/a/playlist.m3u8" ] )
-        self.assertEqual( headers, { "User-Agent": "recordurbate-test" } )
-
-    def test_room_state_is_unavailable( self ):
-        self.assertEqual( self.extract("offline"), ("unavailable", "ERROR: [Chaturbate] room: Room is currently offline") )
-
-    def test_network_error_is_an_error( self ):
-        status, reason = self.extract( "neterror" )
-        self.assertEqual( status, "error" )
-        self.assertIn( "Network is unreachable", reason )
-
-    def test_unreadable_output_is_an_error( self ):
-        status, reason = self.extract( "garbage" )
-        self.assertEqual( status, "error" )
-        self.assertIn( "unreadable yt-dlp output", reason )
-
-    def test_stop_interrupts_a_hanging_lookup( self ):
-        # stop is set as the lookup starts waiting, so it provably lands
-        # inside the wait; the lookup itself would hang until killed.
-        stop = recorder.Stop()
-        real_communicate = subprocess.Popen.communicate
-        def stop_then_communicate( proc, *args, **kwargs ):
-            stop.set()
-            return real_communicate( proc, *args, **kwargs )
-        with mock.patch.object( recorder.subprocess.Popen, "communicate", stop_then_communicate ):
-            self.assertEqual( self.extract("hang", stop), ("error", "yt-dlp lookup interrupted") )
-
-    def test_stop_set_before_the_lookup_starts_kills_it( self ):
-        stop = recorder.Stop()
-        stop.set()
-        self.assertEqual( self.extract("hang", stop), ("error", "yt-dlp lookup interrupted") )
-
-class ExtractCookiesTest( unittest.TestCase ):
-    # yt-dlp rewrites its --cookies file on exit, as fake_ytdlp.py does;
-    # extract must hand it a private copy so the user's export is never written.
-
-    EXPORT = "# Netscape HTTP Cookie File\n.chaturbate.com\tTRUE\t/\tTRUE\t0\tsessionid\tfrom-browser\n"
+    # recorder.extract against FakeHls's room API in each of its modes.
 
     def setUp( self ):
-        self.dir = tempfile.mkdtemp()
-        self.addCleanup( shutil.rmtree, self.dir )
-        self.export = os.path.join( self.dir, "chaturbate.com_cookies.txt" )
-        self.log = os.path.join( self.dir, "cookies-log" )
-        self.copies = []
+        self.cwd = tempfile.mkdtemp()
+        self.addCleanup( shutil.rmtree, self.cwd )
+        self.export = os.path.join( self.cwd, "chaturbate.com_cookies.txt" )
 
-    def extract( self, mode, stop = None, timeout = recorder.EXTRACT_TIMEOUT ):
-        real_mkstemp = tempfile.mkstemp
-        def recording_mkstemp( *args, **kwargs ):
-            fd, path = real_mkstemp( *args, **kwargs )
-            self.copies.append( path )
-            return fd, path
+    def extract( self, hls, stop = None ):
         with mock.patch.object( recorder, "COOKIES_FILE", self.export ), \
-             mock.patch.object( recorder, "EXTRACT_TIMEOUT", timeout ), \
-             mock.patch.object( recorder.tempfile, "mkstemp", recording_mkstemp ), \
-             mock.patch.dict( os.environ, { "FAKE_YTDLP_COOKIES_LOG": self.log } ):
-            return ExtractTest.extract( self, mode, stop )
+             mock.patch.object( recorder.sys, "stderr", new_callable=lambda: open(os.devnull, "w") ):
+            return recorder.extract( hls.room_url(), stop or recorder.Stop() )
 
-    def write_export( self ):
-        with open( self.export, "w" ) as f:
-            f.write( self.EXPORT )
+    def extract_mode( self, mode ):
+        hls = FakeHls( api=mode )
+        self.addCleanup( hls.close )
+        return self.extract( hls )
 
-    def received( self ):
-        with open( self.log ) as f:
-            path, contents = f.read().split( "\n", 1 )
-        return path, contents
-
-    def assert_export_untouched_and_copy_removed( self ):
-        with open( self.export ) as f:
-            self.assertEqual( f.read(), self.EXPORT )
-        self.assertEqual( len(self.copies), 1 )
-        self.assertFalse( os.path.exists(self.copies[0]) )
-
-    CONFIG = ExtractTest.CONFIG
-
-    def test_yt_dlp_gets_a_copy_of_the_export( self ):
-        self.write_export()
-        status, _ = self.extract( "ok" )
+    def test_ok_picks_the_highest_variant_and_its_default_audio( self ):
+        hls = FakeHls()
+        self.addCleanup( hls.close )
+        status, (title, urls, headers) = self.extract( hls )
         self.assertEqual( status, "ok" )
-        path, contents = self.received()
-        self.assertEqual( path, self.copies[0] )
-        self.assertNotEqual( os.path.realpath(path), os.path.realpath(self.export) )
-        self.assertEqual( contents, self.EXPORT )
-        self.assert_export_untouched_and_copy_removed()
+        self.assertRegex( title + ".ts", TITLE )
+        self.assertEqual( urls, [ hls.base + "/v/playlist.m3u8", hls.base + "/a/playlist.m3u8" ] )
+        self.assertEqual( headers, { "User-Agent": recorder.USER_AGENT, "Referer": hls.base + "/room/" } )
+        self.assertEqual( hls.api_requests, [ ("room", None) ] )
 
-    def test_failed_lookup_leaves_the_export_untouched( self ):
-        self.write_export()
-        self.assertEqual( self.extract("offline")[0], "unavailable" )
-        self.assert_export_untouched_and_copy_removed()
+    def test_room_states_are_unavailable( self ):
+        self.assertEqual( self.extract_mode("offline"), ("unavailable", "ERROR: [Chaturbate] room: Room is currently offline") )
+        self.assertEqual( self.extract_mode("private"), ("unavailable", "ERROR: [Chaturbate] room: Room is currently in a private show") )
 
-    def test_timed_out_lookup_removes_the_copy( self ):
-        self.write_export()
-        self.assertEqual( self.extract("hang", timeout=1), ("error", "yt-dlp took over 1s") )
-        self.assert_export_untouched_and_copy_removed()
+    def test_room_state_messages_are_the_ones_streamer_reads( self ):
+        self.assertEqual( set( recorder.ROOM_STATUS_MESSAGES.values() ), set( recorder_streamer.ROOM_STATES ) )
 
-    def test_stopped_lookup_removes_the_copy( self ):
-        self.write_export()
+    def test_unknown_room_status_is_an_error( self ):
+        self.assertEqual( self.extract_mode("unknown"),
+                          ("error", 'ERROR: [Chaturbate] room: room API gave no stream for room status "unknown"') )
+
+    def test_network_error_is_an_error( self ):
+        status, reason = self.extract_mode( "neterror" )
+        self.assertEqual( status, "error" )
+        self.assertTrue( reason.startswith("ERROR: [Chaturbate] room: room API request failed: 503"), reason )
+
+    def test_unreadable_response_is_an_error( self ):
+        self.assertEqual( self.extract_mode("garbage"), ("error", "ERROR: [Chaturbate] room: unreadable room API response") )
+
+    def test_error_line_reaches_stderr( self ):
+        hls = FakeHls( api="offline" )
+        self.addCleanup( hls.close )
+        with mock.patch.object( recorder.sys, "stderr", new_callable=lambda: __import__("io").StringIO() ) as err:
+            recorder.extract( hls.room_url(), recorder.Stop() )
+        self.assertEqual( err.getvalue(), "ERROR: [Chaturbate] room: Room is currently offline\n" )
+
+    def test_stop_interrupts_a_hanging_lookup_within_1s( self ):
+        hls = FakeHls( api="hang" )
+        self.addCleanup( hls.close )
+        stop = recorder.Stop()
+        set_at = []
+        def stop_once_requested():
+            while not hls.api_requests:
+                time.sleep( 0.01 )
+            set_at.append( time.time() )
+            stop.set()
+        threading.Thread( target=stop_once_requested, daemon=True ).start()
+        self.assertEqual( self.extract(hls, stop), ("error", "lookup interrupted") )
+        self.assertLess( time.time() - set_at[0], 1 )
+
+    def test_stop_set_before_the_lookup_returns_at_once( self ):
+        hls = FakeHls( api="hang" )
+        self.addCleanup( hls.close )
         stop = recorder.Stop()
         stop.set()
-        self.assertEqual( self.extract("hang", stop), ("error", "yt-dlp lookup interrupted") )
-        self.assert_export_untouched_and_copy_removed()
+        started = time.time()
+        self.assertEqual( self.extract(hls, stop), ("error", "lookup interrupted") )
+        self.assertLess( time.time() - started, 1 )
 
-    def test_no_export_passes_no_cookies( self ):
-        status, _ = self.extract( "ok" )
-        self.assertEqual( status, "ok" )
-        self.assertEqual( self.received(), ("", "") )
-        self.assertEqual( self.copies, [] )
+    def test_cookies_come_from_the_export_which_is_left_untouched( self ):
+        contents = ( "# Netscape HTTP Cookie File\n"
+                     "#HttpOnly_127.0.0.1\tFALSE\t/\tFALSE\t0\tsessionid\tfrom-browser\n"
+                     "# a comment\n"
+                     "127.0.0.1\tFALSE\t/\tFALSE\t0\tcsrftoken\tcsrf\n"
+                     "malformed line\n" )
+        with open( self.export, "w" ) as f:
+            f.write( contents )
+        hls = FakeHls()
+        self.addCleanup( hls.close )
+        self.assertEqual( self.extract(hls)[0], "ok" )
+        self.assertEqual( sorted( hls.api_requests[0][1].split("; ") ), [ "csrftoken=csrf", "sessionid=from-browser" ] )
+        with open( self.export ) as f:
+            self.assertEqual( f.read(), contents )
+
+    def test_no_export_sends_no_cookies( self ):
+        hls = FakeHls()
+        self.addCleanup( hls.close )
+        self.assertEqual( self.extract(hls)[0], "ok" )
+        self.assertEqual( hls.api_requests, [ ("room", None) ] )
         self.assertFalse( os.path.exists(self.export) )
+
+class ParseMasterTest( unittest.TestCase ):
+
+    def test_variant_without_audio_group_gives_one_url( self ):
+        text = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nlo.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=2\nhi.m3u8\n"
+        self.assertEqual( recorder.parse_master(text, "http://h/s/master.m3u8?t=1"), [ "http://h/s/hi.m3u8" ] )
+
+    def test_group_without_default_uses_its_first_rendition( self ):
+        text = ( '#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="g",DEFAULT=NO,URI="a1.m3u8"\n'
+                 '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="g",DEFAULT=NO,URI="a2.m3u8"\n'
+                 '#EXT-X-STREAM-INF:BANDWIDTH=5,AUDIO="g"\n/abs/v.m3u8\n' )
+        self.assertEqual( recorder.parse_master(text, "http://h/s/master.m3u8"), [ "http://h/abs/v.m3u8", "http://h/s/a1.m3u8" ] )
+
+    def test_missing_audio_group_or_variant_is_none( self ):
+        self.assertIsNone( recorder.parse_master('#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=5,AUDIO="g"\nv.m3u8\n', "http://h/") )
+        self.assertIsNone( recorder.parse_master("#EXTM3U\n", "http://h/") )
 
 class RunTest( unittest.TestCase ):
     # recorder.run in-process with main replaced, so only run's own routes run.
@@ -515,7 +598,6 @@ class RunTest( unittest.TestCase ):
         previous = os.getcwd()
         with tempfile.TemporaryDirectory() as cwd, \
              mock.patch.object( sys, "argv", [ "recorder.py", "https://chaturbate.com/alice/" ] ), \
-             mock.patch.object( recorder.Config, "load_config", lambda: {} ), \
              mock.patch.object( recorder, "main", main ), \
              mock.patch.object( recorder.signal, "signal" ):
             os.chdir( cwd )
@@ -528,7 +610,7 @@ class RunTest( unittest.TestCase ):
 
     def test_exits_with_the_recordings_code_and_removes_its_record( self ):
         seen = {}
-        def main( url, config, ready_fd, stop, outcome ):
+        def main( url, ready_fd, stop, outcome ):
             with open( "configs/pid-alice" ) as f:
                 seen["record"] = f.read()
             seen["stop"] = stop
@@ -540,7 +622,7 @@ class RunTest( unittest.TestCase ):
         self.assertFalse( record_left )
 
     def test_failed_recording_exits_1_and_removes_its_record( self ):
-        def main( url, config, ready_fd, stop, outcome ):
+        def main( url, ready_fd, stop, outcome ):
             raise RuntimeError( "boom" )
         with mock.patch.object( recorder.threading, "excepthook", lambda args: None ):
             code, record_left = self.run_with( main )

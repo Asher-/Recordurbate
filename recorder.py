@@ -9,36 +9,42 @@ itself, with short timeouts and quick retries, and feeds them to a local
 ffmpeg that only muxes them into MPEG-TS. ffmpeg never touches the network,
 so a dropped connection costs the segments it covered and nothing more: the
 recording carries on in the same file across gaps, reconnects and fresh
-stream URLs. It exits when yt-dlp reports the room unavailable, when no
+stream URLs. It exits when the site reports the room unavailable, when no
 segment arrives for GIVE_UP_AFTER seconds, or on SIGINT/SIGTERM.
 """
-import json
 import os
 import queue
 import re
-import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import requests
 
-import config as Config
-from streamer import ROOM_STATES
 from pid import record_recorder, forget_recorder
 
 POLL_INTERVAL = 1.0      # seconds between playlist reloads
 HTTP_TIMEOUT = (3, 5)    # connect, read
 SEGMENT_TRIES = 3
-REEXTRACT_AFTER = 15     # seconds without every playlist loading before asking yt-dlp for fresh URLs
+REEXTRACT_AFTER = 15     # seconds without every playlist loading before asking the site for fresh URLs
 GIVE_UP_AFTER = 120      # seconds without a new segment before exiting
-EXTRACT_TIMEOUT = 60     # seconds a yt-dlp lookup may take
+LOOKUP_TIMEOUT = (3, 5)  # connect, read, for each request of a room lookup
+LOOKUP_POLL = 0.1        # seconds between checks of stop while a lookup runs
 CLOSE_TIMEOUT = 3        # seconds each muxer shutdown phase may take
 COOKIES_FILE = "chaturbate.com_cookies.txt"  # the user's browser export; read, never written
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+# The edge API's room_status values for a room that is up with no public
+# stream, in yt-dlp's wording, which streamer.ROOM_STATES matches.
+ROOM_STATUS_MESSAGES = {
+    "offline": "Room is currently offline",
+    "private": "Room is currently in a private show",
+    "away": "Performer is currently away",
+    "password protected": "Room is password protected",
+    "hidden": "Hidden session in progress",
+}
 
 def log( message ):
     print( "[recorder {}] {}".format( time.strftime("%Y-%m-%d %H:%M:%S"), message ), flush=True )
@@ -53,73 +59,127 @@ def signal_ready( fd ):
     os.close( fd )
 
 class Stop( threading.Event ):
-    # Set on SIGINT or SIGTERM. Setting it also kills the yt-dlp lookup in
-    # progress, so extract waits on that process alone.
-    lookup = None
+    # Set on SIGINT or SIGTERM.
+    pass
 
-    def set( self ):
-        super().set()
-        lookup = self.lookup
-        if lookup is not None and lookup.poll() is None:
-            lookup.kill()
+def load_cookies():
+    # The user's browser export, read and never written. Lines marked
+    # #HttpOnly_ are cookies too; other # lines are comments.
+    jar = requests.cookies.RequestsCookieJar()
+    try:
+        export = open( COOKIES_FILE, encoding="utf-8", errors="replace" )
+    except FileNotFoundError:
+        return jar
+    with export:
+        for line in export:
+            if line.startswith( "#HttpOnly_" ):
+                line = line[ len("#HttpOnly_"): ]
+            elif line.startswith( "#" ):
+                continue
+            fields = line.rstrip( "\r\n" ).split( "\t" )
+            if len( fields ) == 7:
+                domain, _, path, _, _, name, value = fields
+                jar.set( name, value, domain=domain, path=path )
+    return jar
 
-def extract( url, config, stop ):
-    # Resolves the room through yt-dlp. Returns ("ok", (title, urls, headers)),
-    # ("unavailable", reason) when yt-dlp names a room state, or
-    # ("error", reason) for anything else. yt-dlp's stderr is passed on to
-    # ours, which the daemon appends to the capture log.
-    # yt-dlp rewrites its --cookies file whenever it exits, so it is handed a
-    # private copy of COOKIES_FILE and the user's export is never written.
-    cmd = config["youtube-dl_cmd"].split(" ") + [ "--config-location", config["youtube-dl_config"], "--dump-single-json", url ]
-    cookies = None
-    try:
-        if os.path.exists( COOKIES_FILE ):
-            fd, cookies = tempfile.mkstemp( prefix="cookies-", suffix=".txt" )
-            try:
-                with os.fdopen( fd, "wb" ) as copy, open( COOKIES_FILE, "rb" ) as export:
-                    shutil.copyfileobj( export, copy )
-            except OSError as e:
-                return "error", "could not copy {}: {}".format( COOKIES_FILE, e )
-            cmd += [ "--cookies", cookies ]
+def parse_master( text, base ):
+    # The highest-BANDWIDTH variant's playlist URL and, when the variant names
+    # an audio group, that group's DEFAULT=YES rendition (else its first).
+    # None when the playlist has no usable variant.
+    lines = text.splitlines()
+    audio = {}
+    best = None
+    for i, line in enumerate( lines ):
+        if line.startswith( "#EXT-X-MEDIA:" ) and "TYPE=AUDIO" in line:
+            group = re.search( r'GROUP-ID="([^"]+)"', line )
+            uri = re.search( r'URI="([^"]+)"', line )
+            if group and uri:
+                audio.setdefault( group.group(1), [] ).append( ("DEFAULT=YES" in line, uri.group(1)) )
+        elif line.startswith( "#EXT-X-STREAM-INF:" ):
+            bandwidth = re.search( r'[:,]BANDWIDTH=(\d+)', line )
+            group = re.search( r'AUDIO="([^"]+)"', line )
+            uri = lines[i + 1].strip() if i + 1 < len( lines ) else ""
+            if bandwidth and uri and not uri.startswith( "#" ) and ( best is None or int(bandwidth.group(1)) > best[0] ):
+                best = ( int(bandwidth.group(1)), uri, group.group(1) if group else None )
+    if best is None:
+        return None
+    urls = [ urljoin(base, best[1]) ]
+    if best[2] is not None:
+        renditions = audio.get( best[2] )
+        if not renditions:
+            return None
+        defaults = [ uri for default, uri in renditions if default ]
+        urls.append( urljoin(base, defaults[0] if defaults else renditions[0][1]) )
+    return urls
+
+def lookup( url ):
+    # One edge-API request for the room and, when it is live, one request for
+    # its master playlist. Returns ("ok", (title, urls, headers)),
+    # ("unavailable", line) when the site names a room state, or
+    # ("error", line); each line is an "ERROR: [Chaturbate] <room>: ..." line.
+    parts = urlsplit( url )
+    room = parts.path.strip( "/" ).split( "/" )[0]
+    site = "{}://{}".format( parts.scheme, parts.netloc )
+    headers = { "User-Agent": USER_AGENT, "Referer": "{}/{}/".format(site, room) }
+    def line( message ):
+        return "ERROR: [Chaturbate] {}: {}".format( room, message )
+    with requests.Session() as session:
         try:
-            proc = subprocess.Popen( cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE )
-        except OSError as e:
-            return "error", "could not run yt-dlp: {}".format( e )
-        stop.lookup = proc
+            response = session.post( site + "/get_edge_hls_url_ajax/", data={ "room_slug": room },
+                                     headers=dict( headers, **{ "X-Requested-With": "XMLHttpRequest", "Accept": "application/json" } ),
+                                     cookies=load_cookies(), timeout=LOOKUP_TIMEOUT )
+            response.raise_for_status()
+            info = response.json()
+        except ValueError:
+            return "error", line( "unreadable room API response" )
+        except requests.RequestException as e:
+            return "error", line( "room API request failed: {}".format(e) )
+        if not isinstance( info, dict ):
+            return "error", line( "unreadable room API response" )
+        stream = info.get( "url" )
+        if not stream:
+            status = info.get( "room_status" )
+            if status in ROOM_STATUS_MESSAGES:
+                return "unavailable", line( ROOM_STATUS_MESSAGES[status] )
+            return "error", line( 'room API gave no stream for room status "{}"'.format(status) )
         try:
-            # a stop set before the lookup was registered did not reach it
-            if stop.is_set():
-                proc.kill()
-            try:
-                out, err = proc.communicate( timeout=EXTRACT_TIMEOUT )
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.communicate()
-                return "error", "yt-dlp took over {}s".format( EXTRACT_TIMEOUT )
-        finally:
-            stop.lookup = None
-    finally:
-        if cookies is not None:
-            os.unlink( cookies )
-    if stop.is_set():
-        return "error", "yt-dlp lookup interrupted"
-    text = err.decode( "utf-8", "replace" )
-    sys.stderr.write( text )
-    sys.stderr.flush()
-    if proc.returncode != 0:
-        errors = [ line.strip() for line in text.splitlines() if line.startswith("ERROR:") ]
-        if errors and errors[-1].endswith( ROOM_STATES ):
-            return "unavailable", errors[-1]
-        return "error", errors[-1] if errors else "yt-dlp exited with {}".format( proc.returncode )
-    try:
-        info = json.loads( out )
-        formats = info.get("requested_formats") or [ info ]
-        urls = [ f["url"] for f in formats ]
-        title = info["title"]
-    except (ValueError, KeyError, TypeError, AttributeError) as e:
-        return "error", "unreadable yt-dlp output: {!r}".format( e )
-    headers = info.get("http_headers") or formats[0].get("http_headers") or {}
+            master = session.get( stream, headers=headers, timeout=LOOKUP_TIMEOUT )
+            master.raise_for_status()
+        except requests.RequestException as e:
+            return "error", line( "master playlist request failed: {}".format(e) )
+        urls = parse_master( master.text, master.url )
+        if urls is None:
+            return "error", line( "master playlist has no usable variant" )
+    title = "{} {}".format( room, time.strftime("%Y-%m-%d %H_%M") )
     return "ok", (title, urls, headers)
+
+def extract( url, stop ):
+    # Resolves the room through the site's edge API in a worker thread, so a
+    # set stop returns ("error", "lookup interrupted") within LOOKUP_POLL
+    # seconds. Returns lookup's result otherwise, writing its ERROR: line to
+    # stderr, which the daemon appends to the capture log for
+    # Streamer.launch_error.
+    results = queue.Queue()
+    def work():
+        try:
+            results.put( lookup(url) )
+        except Exception as e:
+            results.put( ("error", "ERROR: [Chaturbate] lookup failed: {!r}".format(e)) )
+    threading.Thread( target=work, daemon=True ).start()
+    while True:
+        if stop.is_set():
+            return "error", "lookup interrupted"
+        try:
+            status, result = results.get( timeout=LOOKUP_POLL )
+            break
+        except queue.Empty:
+            pass
+    if stop.is_set():
+        return "error", "lookup interrupted"
+    if status != "ok":
+        sys.stderr.write( result + "\n" )
+        sys.stderr.flush()
+    return status, result
 
 def parse_playlist( text ):
     sequence = 0
@@ -271,15 +331,15 @@ def recording( url, ready_fd, stop, outcome ):
     name = url.rstrip("/").rsplit("/", 1)[-1]
     record_recorder( name, os.getpid() )
     try:
-        main( url, Config.load_config(), ready_fd, stop, outcome )
+        main( url, ready_fd, stop, outcome )
     finally:
         forget_recorder( name, os.getpid() )
 
-def main( url, config, ready_fd, stop, outcome ):
+def main( url, ready_fd, stop, outcome ):
     # Records the room until it ends or stop is set. outcome["exit_code"]
     # becomes 0 once a recording has run to its end.
     name = url.rstrip("/").rsplit("/", 1)[-1]
-    status, result = extract( url, config, stop )
+    status, result = extract( url, stop )
     if status != "ok":
         log( "Cannot record {}: {}".format(name, result) )
         return
@@ -370,9 +430,9 @@ def main( url, config, ready_fd, stop, outcome ):
                 log( "No new segment in {}s; giving up".format(GIVE_UP_AFTER) )
                 break
             if time.time() - last_full_load > REEXTRACT_AFTER and time.time() - last_extract > REEXTRACT_AFTER:
-                log( "Playlists unreachable for {}s; asking yt-dlp for fresh URLs".format(REEXTRACT_AFTER) )
+                log( "Playlists unreachable for {}s; asking the site for fresh URLs".format(REEXTRACT_AFTER) )
                 last_extract = time.time()
-                status, result = extract( url, config, stop )
+                status, result = extract( url, stop )
                 if status == "unavailable":
                     log( "Room unavailable: {}".format(result) )
                     break

@@ -13,7 +13,7 @@ The daemon runs in the background (via UNIX double-fork) and loops every 60
 seconds over a list of streamers. For each streamer that isn't already being
 recorded, it launches `recorder.py` for their Chaturbate page.
 
-The recorder asks yt-dlp for the room's video and audio playlists, downloads
+The recorder asks the site's room API for the video and audio playlists, downloads
 every segment itself with short timeouts, and has a local ffmpeg mux them into
 an MPEG-TS file. A segment that cannot be fetched becomes a gap in the same
 file rather than ending the recording; unreachable playlists are re-resolved
@@ -35,7 +35,6 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical breakdown
 
 - **macOS** or **Linux**
 - **Python 3.10+**
-- **yt-dlp**
 - **ffmpeg**
 - **Python packages**: `psutil`
 
@@ -58,7 +57,7 @@ git clone https://github.com/oliverjrose99/Recordurbate.git
 cd Recordurbate
 python3 -m venv venv
 source venv/bin/activate
-pip install yt-dlp psutil requests
+pip install psutil requests
 ```
 
 Streams are saved to `videos/<streamer_name>/<title>.ts`, MPEG-TS that can be
@@ -138,39 +137,23 @@ and exits. Active recordings continue uninterrupted across the restart.
 
 ## Configuration
 
-Two config files in the `configs/` directory:
+One config file in the `configs/` directory, and an optional cookies export:
 
 ### config.json
 
 | Key                       | Type     | Default                       | Description                                                                |
 | :------------------------ | :------- | :---------------------------- | :------------------------------------------------------------------------- |
-| `youtube-dl_cmd`          | `string` | `"yt-dlp"`                    | Command `recorder.py` runs to resolve a room. Can be an absolute path.         |
-| `youtube-dl_config`       | `string` | `"configs/youtube-dl.config"` | Path to yt-dlp config, passed via `--config-location`.                         |
 | `auto_reload_config`      | `bool`   | `true`                        | Reload config every loop iteration (60s). Allows live streamer list edits.     |
 | `rate_limit`              | `bool`   | `true`                        | Whether to rate-limit between launching streamers.                             |
 | `rate_limit_time`         | `number` | `0`                           | Seconds to sleep between streamer launches. `0` = no delay.                    |
 | `default_export_location` | `string` | `"./list.txt"`                | Default file path for the `export` command.                                |
 | `streamers`               | `array`  | `[]`                          | Chaturbate usernames to record.                                            |
 
-### youtube-dl.config
+### chaturbate.com_cookies.txt
 
-Passed to yt-dlp via `--config-location` when `recorder.py` resolves a room.
-yt-dlp only resolves the stream; `recorder.py` downloads it and writes
-`videos/<streamer_name>/<title>.ts`, so output and downloader options have no
-effect. The options that matter:
-
-```
---cookies ./chaturbate.com_cookies.txt
-```
-
-Quality can be limited to reduce file size and bandwidth:
-
-```
--f 'bv*[height<1080]+ba'
-```
-
-See the [yt-dlp documentation](https://github.com/yt-dlp/yt-dlp#usage-and-options)
-for format selection.
+A Netscape-format cookies export from your browser, in the project directory.
+`recorder.py` sends its cookies (including `#HttpOnly_` lines) with each room
+lookup and never writes the file. Without it, lookups run without cookies.
 
 ## Monitoring
 
@@ -215,9 +198,8 @@ The generated plist is installed to
 
 ### Large files and bandwidth
 
-Streams are captured at the source quality (up to 4K/60fps). This produces
-large files and heavy bandwidth usage. Use a `-f` format filter in
-`configs/youtube-dl.config` to limit quality if needed.
+Streams are captured at the highest-bandwidth variant the room offers. This
+produces large files and heavy bandwidth usage.
 
 ### Gaps in a recording
 
@@ -228,18 +210,19 @@ segment.
 
 ### Rooms no longer resolve
 
-yt-dlp resolves each room's playlists. If launches fail with extractor errors,
-update it:
-
-```bash
-pip3 install -U yt-dlp
-```
+`recorder.py` resolves each room with one POST to
+`https://chaturbate.com/get_edge_hls_url_ajax/`. If every launch fails with
+`room API request failed` or `room API gave no stream`, the site's API has
+changed or is refusing the request; the line in `configs/capture-<name>.log`
+says which. A fresh cookies export can help when the site starts refusing
+requests.
 
 ### No files appearing
 
-Check that yt-dlp, ffmpeg, and cookies are configured correctly. Check
-`configs/rb.log` for errors. Ensure the `videos/` directory is writable.
+Check that ffmpeg is installed and `chaturbate.com_cookies.txt` is a current
+export. Check `configs/rb.log` for errors. Ensure the `videos/` directory is
+writable.
 
 If launches stop reaching the site, `configs/rb.log` logs `No launch has reached
-chaturbate.com` with yt-dlp's error. Each streamer's own output is in
+chaturbate.com` with the lookup's error. Each streamer's own output is in
 `configs/capture-<name>.log`.

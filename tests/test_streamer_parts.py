@@ -1,4 +1,7 @@
+import http.server
+import json
 import os
+import threading
 import types
 
 import pytest
@@ -19,10 +22,7 @@ class FakeLogger:
 
 
 def make_daemon(**overrides):
-    config = {
-        "youtube-dl_cmd": "yt-dlp",
-        "youtube-dl_config": "youtube-dl.config",
-    }
+    config = {}
     config.update(overrides)
     launches = []
     return types.SimpleNamespace(
@@ -277,22 +277,37 @@ def test_stop_during_launch_reports_nothing(start_harness, monkeypatch):
     assert daemon.launches == []
 
 
-def test_real_process_output_is_read_back_from_the_capture_log(workdir):
-    # The real recorder.py runs the fake yt-dlp, whose stderr must reach the
-    # capture log through the recorder.
-    error = "ERROR: [Chaturbate] alice: Unable to download webpage: curl: (6) Could not resolve host"
+def test_real_process_output_is_read_back_from_the_capture_log(workdir, monkeypatch):
+    # The real recorder.py looks the room up on a stand-in site, and the
+    # ERROR: line it writes must reach the capture log through the recorder.
+    error = 'ERROR: [Chaturbate] alice: room API gave no stream for room status "unknown"'
+
+    class Site(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            body = json.dumps({"url": "", "room_status": "unknown"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    site = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Site)
+    threading.Thread(target=site.serve_forever, daemon=True).start()
+    monkeypatch.setenv("RECORDURBATE_SITE", "http://127.0.0.1:{}".format(site.server_address[1]))
     (workdir / "configs").mkdir()
     (workdir / "configs/capture-alice.log").write_text("ERROR: [Chaturbate] alice: Room is currently offline\n")
-    script = workdir / "yt-dlp"
-    script.write_text("#!/bin/sh\necho '{}' >&2\nexit 1\n".format(error))
-    script.chmod(0o755)
-    (workdir / "configs/config.json").write_text(
-        '{{"youtube-dl_cmd": "{}", "youtube-dl_config": "configs/youtube-dl.config"}}'.format(script))
+    (workdir / "configs/config.json").write_text("{}")
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     (workdir / "recorder.py").symlink_to(os.path.join(root, "recorder.py"))
-    daemon = make_daemon(**{"youtube-dl_cmd": str(script)})
+    daemon = make_daemon()
 
-    run_start(Streamer(daemon, "alice"))
+    try:
+        run_start(Streamer(daemon, "alice"))
+    finally:
+        site.shutdown()
 
     assert daemon.launches == [error]
 

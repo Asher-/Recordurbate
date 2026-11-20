@@ -160,7 +160,7 @@ class Daemon:
         self.logger.info("Adopted {} existing streams.".format(adopted))
 
     def record_launch( self, error = None ):
-        # error is what yt-dlp printed for a launch that did not reach the site.
+        # error is what the lookup printed for a launch that did not reach the site.
         # Single misses are routine, so rb.log hears once, after as many in a row
         # as there are streamers, and once more when a launch gets through.
         with self.launches_lock:

@@ -2,7 +2,7 @@
 
 Streamer.start launches the real recorder.py through a real Popen, and a
 running recorder is found through its PID record and adopted by Streamer.adopt.
-FakeHls (the CDN) and fake_ytdlp.py (yt-dlp) are the only stand-ins.
+FakeHls (the site's room API and the CDN) is the only stand-in.
 """
 import json
 import logging
@@ -23,7 +23,6 @@ sys.path.insert( 0, ROOT )
 sys.path.insert( 0, TESTS )
 import test_recorder
 from test_recorder import FakeHls, probe
-from fifo_wait import open_fifo
 import streamer as streamer_module
 from streamer import Streamer
 from pid import recorded_recorder
@@ -46,22 +45,21 @@ class FakeDaemon:
         self.launches.append( error )
 
 class RoomDir( unittest.TestCase ):
-    # A daemon working directory: configs/config.json naming fake_ytdlp.py,
-    # and recorder.py where Streamer launches it from.
+    # A daemon working directory with recorder.py where Streamer launches it
+    # from; RECORDURBATE_SITE points the recorder's room lookup at FakeHls.
 
     def setUp( self ):
         self.previous = os.getcwd()
         self.cwd = tempfile.mkdtemp()
         os.makedirs( os.path.join(self.cwd, "configs") )
-        self.config = { "youtube-dl_cmd": "{} {}".format(sys.executable, os.path.join(TESTS, "fake_ytdlp.py")),
-                        "youtube-dl_config": "configs/unused.config" }
+        self.config = {}
         with open( os.path.join(self.cwd, "configs", "config.json"), "w" ) as f:
             json.dump( self.config, f )
         os.symlink( os.path.join(ROOT, "recorder.py"), os.path.join(self.cwd, "recorder.py") )
         os.chdir( self.cwd )
         self.hls = FakeHls()
         self.env = dict( os.environ )
-        os.environ[ "FAKE_HLS_BASE" ] = self.hls.base
+        os.environ[ "RECORDURBATE_SITE" ] = self.hls.base
 
     def tearDown( self ):
         self.hls.close()
@@ -71,7 +69,12 @@ class RoomDir( unittest.TestCase ):
         shutil.rmtree( self.cwd )
 
     def recording( self ):
-        return os.path.join( self.cwd, "videos", "room", "room 2026-01-01 00_00.ts" )
+        # the file recorded for the room, "room <date> <time>.ts", or a path
+        # that does not exist when nothing was recorded
+        folder = os.path.join( self.cwd, "videos", "room" )
+        names = os.listdir( folder ) if os.path.isdir( folder ) else []
+        self.assertLessEqual( len(names), 1, names )
+        return os.path.join( folder, names[0] ) if names else os.path.join( folder, "nothing.ts" )
 
 class StreamerLaunchesRecorderTest( RoomDir ):
 
@@ -90,22 +93,18 @@ class StreamerLaunchesRecorderTest( RoomDir ):
             self.assertIn( "Stream ended", f.read() )
 
     def gate_lookup_on_readiness_wait( self ):
-        # yt-dlp answers only once Streamer is inside its readiness wait:
-        # fake_ytdlp.py blocks reading this FIFO until the wait opens and
-        # closes its write end.
-        gate = os.path.join( self.cwd, "gate" )
-        os.mkfifo( gate )
-        os.environ[ "FAKE_YTDLP_GATE" ] = gate
+        # the room API answers only once Streamer is inside its readiness wait
+        self.hls.api_gate.clear()
         real_select = streamer_module.select.select
         def open_gate_then_select( *args ):
-            open_fifo( gate, "w", 30 ).close()
+            self.hls.api_gate.set()
             return real_select( *args )
         patcher = mock.patch.object( streamer_module.select, "select", open_gate_then_select )
         patcher.start()
         self.addCleanup( patcher.stop )
 
     def test_offline_room_reported_during_the_readiness_wait_is_not_started( self ):
-        os.environ[ "FAKE_YTDLP_MODE" ] = "offline"
+        self.hls.api = "offline"
         self.gate_lookup_on_readiness_wait()
         daemon = FakeDaemon( self.config )
         streamer = Streamer( daemon, "room" )
@@ -132,13 +131,9 @@ class StreamerLaunchesRecorderTest( RoomDir ):
         self.assertEqual( codecs, [ "aac", "h264" ] )
 
     def hold_lookup( self ):
-        # fake_ytdlp.py blocks opening this FIFO, so the recorder's lookup
-        # never answers; cleanup opens it so the held lookup can finish.
-        gate = os.path.join( self.cwd, "gate" )
-        os.mkfifo( gate )
-        os.environ[ "FAKE_YTDLP_GATE" ] = gate
-        held = os.open( gate, os.O_RDWR )
-        self.addCleanup( os.close, held )
+        # the room API never answers the recorder's lookup; tearDown sets the
+        # gate so the held request can finish.
+        self.hls.api_gate.clear()
 
     def test_recorder_that_never_signals_ready_is_not_started( self ):
         self.hold_lookup()
@@ -243,25 +238,25 @@ class AdoptRecordedRecorderTest( RoomDir ):
 class RecorderStopTest( RoomDir ):
 
     def test_sigterm_during_the_lookup_ends_the_recorder_and_its_record( self ):
-        # fake_ytdlp.py blocks on this FIFO; opening its write end returns
-        # once the lookup is waiting on it, and it is never answered.
-        gate = os.path.join( self.cwd, "gate" )
-        os.mkfifo( gate )
-        os.environ[ "FAKE_YTDLP_GATE" ] = gate
+        # the room API holds the lookup until cleanup sets the gate; the
+        # recorder is signalled once its request has arrived.
+        self.hls.api_gate.clear()
         recorder = subprocess.Popen( [ sys.executable, "recorder.py", "https://chaturbate.com/room/" ],
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True )
-        writer = open_fifo( gate, "w", 30 )
         try:
+            deadline = time.time() + 30
+            while not self.hls.api_requests and time.time() < deadline:
+                time.sleep( 0.05 )
+            self.assertTrue( self.hls.api_requests )
             self.assertEqual( recorded_recorder("room"), recorder.pid )
             recorder.send_signal( signal.SIGTERM )
             out, _ = recorder.communicate( timeout=15 )
         finally:
-            writer.close()
             if recorder.poll() is None:
                 recorder.kill()
                 recorder.wait()
         self.assertEqual( recorder.returncode, 1 )
-        self.assertIn( b"Cannot record room: yt-dlp lookup interrupted", out )
+        self.assertIn( b"Cannot record room: lookup interrupted", out )
         self.assertFalse( os.path.exists( "configs/pid-room" ) )
 
 if __name__ == "__main__":

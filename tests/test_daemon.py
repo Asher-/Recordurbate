@@ -1,3 +1,4 @@
+import http.server
 import json
 import logging
 import os
@@ -278,20 +279,39 @@ def test_shutdown_stops_streamers_together(monkeypatch):
 
 @pytest.mark.parametrize("method", ["stop", "handoff"])
 def test_run_with_a_real_recorder_ends_on_stop_and_handoff(monkeypatch, tmp_path, method):
-    # Daemon.run launches recorder.py through Streamer. fake_ytdlp.py resolves
-    # the room to a server that accepts connections and never answers, so the
-    # recorder runs until the daemon ends it.
+    # Daemon.run launches recorder.py through Streamer. A stand-in site
+    # resolves the room to playlists on a server that accepts connections and
+    # never answers, so the recorder runs until the daemon ends it.
     unanswering = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     unanswering.bind(("127.0.0.1", 0))
     unanswering.listen(16)
+    cdn = "http://127.0.0.1:{}".format(unanswering.getsockname()[1])
+
+    class Site(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def answer(self, body):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self.answer(json.dumps({"url": site_base + "/master.m3u8", "room_status": "public"}).encode())
+
+        def do_GET(self):
+            self.answer('#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n{}/v.m3u8\n'.format(cdn).encode())
+
+    site = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Site)
+    site_base = "http://127.0.0.1:{}".format(site.server_address[1])
+    threading.Thread(target=site.serve_forever, daemon=True).start()
     (tmp_path / "configs").mkdir()
-    (tmp_path / "configs" / "config.json").write_text(json.dumps({
-        "youtube-dl_cmd": "{} {}".format(sys.executable, os.path.join(REPO, "tests", "fake_ytdlp.py")),
-        "youtube-dl_config": "configs/unused.config",
-    }))
+    (tmp_path / "configs" / "config.json").write_text(json.dumps({}))
     (tmp_path / "recorder.py").symlink_to(os.path.join(REPO, "recorder.py"))
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("FAKE_HLS_BASE", "http://127.0.0.1:{}".format(unanswering.getsockname()[1]))
+    monkeypatch.setenv("RECORDURBATE_SITE", site_base)
     # adopt_existing runs for real: configs/ holds no record, so nothing is adopted
     instance = counting_daemon()
     instance.pid = os.getpid()
@@ -328,6 +348,7 @@ def test_run_with_a_real_recorder_ends_on_stop_and_handoff(monkeypatch, tmp_path
             os.killpg(recorder.pid, signal.SIGKILL)
             recorder.wait()
         unanswering.close()
+        site.shutdown()
 
 
 class AdoptingStreamer:

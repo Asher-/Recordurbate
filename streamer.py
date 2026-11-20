@@ -8,7 +8,7 @@ import signal
 
 from pid import process_active, AdoptedProcess, forget_recorder
 
-# yt-dlp's Chaturbate extractor raises these for a room that is up but has no public stream
+# The room states recorder.py reports for a room that is up but has no public stream
 ROOM_STATES = (
     "Room is currently offline",
     "Room is currently in a private show",
@@ -16,8 +16,8 @@ ROOM_STATES = (
     "Room is password protected",
     "Hidden session in progress",
 )
-NO_ERROR = "yt-dlp printed no error"
-READY_TIMEOUT = 90  # seconds a launch may take to log "Recording"; recorder.py's own lookup gives up after 60
+NO_ERROR = "the lookup printed no error"
+READY_TIMEOUT = 90  # seconds a launch may take to log "Recording"; each request of recorder.py's lookup times out after 3s to connect and 5s to read
 
 class Streamer:
   
@@ -86,7 +86,7 @@ class Streamer:
         return thread
 
     def launch_error( self, capture_path, offset ):
-        # The last error yt-dlp printed for this launch, or None when it named a
+        # The last error the lookup printed for this launch, or None when it named a
         # room state, which it can only have heard from the site.
         with open( capture_path, "r", errors="replace" ) as capture_log:
             capture_log.seek( offset )
@@ -98,7 +98,7 @@ class Streamer:
         return errors[-1]
 
     def recorder_ready( self, ready_fd ):
-        # recorder.py writes to ready_fd once yt-dlp has resolved the room, then
+        # recorder.py writes to ready_fd once its lookup has resolved the room, then
         # closes it. The pipe reaches end of file without a write when the
         # recorder exits first, including when stop() terminates it.
         readable, _, _ = select.select( [ready_fd], [], [], READY_TIMEOUT )
