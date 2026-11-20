@@ -13,6 +13,7 @@ import daemon
 from daemon import Daemon
 from ipc.ipc_config import IpcConfig
 from streamer import Streamer
+from fifo_wait import read_fifo
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -170,10 +171,7 @@ def test_stop_ends_the_run_loops_wait_at_once(monkeypatch):
 
 
 @pytest.mark.parametrize("method", ["stop", "handoff"])
-def test_stop_and_handoff_clear_pid_and_set_wake(monkeypatch, method):
-    def no_sleep(seconds):
-        raise AssertionError("{} slept {}s".format(method, seconds))
-    monkeypatch.setattr(daemon.time, "sleep", no_sleep)
+def test_stop_and_handoff_clear_pid_and_set_wake(method):
     instance = bare_daemon()
     instance.pid = os.getpid()
     instance.wake = threading.Event()
@@ -186,35 +184,106 @@ def test_stop_and_handoff_clear_pid_and_set_wake(monkeypatch, method):
     assert instance._handoff == (method == "handoff")
 
 
+def run_with_recorded_waits(instance, streamer):
+    # Runs the loop with one streamer and records each timeout the loop waits
+    # on wake for. streamer.start is called once the recording is in place.
+    instance.pid = os.getpid()
+    instance.streamers_lock = threading.Lock()
+    instance.streamers = {"room": streamer}
+    waits = []
+    waiting = threading.Event()
+    thread = instance.run()
+    real_wait = instance.wake.wait
+
+    def record_wait(timeout):
+        waits.append(timeout)
+        waiting.set()
+        return real_wait(timeout)
+
+    instance.wake.wait = record_wait
+    streamer.go.set()
+    assert waiting.wait(timeout=5)
+    instance.stop()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    return waits
+
+
+class GatedStreamer:
+    stream = None
+
+    def __init__(self, fail):
+        self.fail = fail
+        self.go = threading.Event()
+        self.starts = 0
+
+    def start(self):
+        assert self.go.wait(timeout=5)
+        self.starts += 1
+        if self.fail:
+            raise RuntimeError("launch failed")
+
+    def stop(self):
+        pass
+
+
 def test_run_loop_waits_for_wake_after_an_error(monkeypatch):
     monkeypatch.setattr(daemon, "recorded_recorder", lambda name: None)
-    slept = []
-    monkeypatch.setattr(daemon.time, "sleep", slept.append)
+    instance = bare_daemon()
+    instance.config = {"auto_reload_config": False, "rate_limit_time": 0}
+    streamer = GatedStreamer(fail=True)
+
+    waits = run_with_recorded_waits(instance, streamer)
+
+    # the failed pass waits out the minute on wake; stop ends that wait
+    assert waits == [60]
+    assert streamer.starts == 1
+
+
+def test_stop_ends_the_rate_limit_pause(monkeypatch):
+    monkeypatch.setattr(daemon, "recorded_recorder", lambda name: None)
+    instance = bare_daemon()
+    instance.config = {"auto_reload_config": False, "rate_limit_time": 45}
+    streamer = GatedStreamer(fail=False)
+
+    waits = run_with_recorded_waits(instance, streamer)
+
+    # the pause after a launch is a wait on wake, so stop ends it at once
+    assert waits == [45]
+    assert streamer.starts == 1
+
+
+def test_shutdown_stops_streamers_together(monkeypatch):
+    monkeypatch.setattr(daemon, "recorded_recorder", lambda name: None)
     instance = bare_daemon()
     instance.pid = os.getpid()
     instance.config = {"auto_reload_config": False, "rate_limit_time": 0}
     instance.streamers_lock = threading.Lock()
-    failed = threading.Event()
+    # each stop returns only once both are stopping at the same time
+    both_stopping = threading.Barrier(2, timeout=5)
+    stopped = []
 
-    class FailingStreamer:
-        stream = None
+    class BarrierStreamer:
+        stream = object()  # recording, so the loop launches nothing
+
+        def __init__(self, name):
+            self.name = name
 
         def start(self):
-            failed.set()
-            raise RuntimeError("launch failed")
+            raise AssertionError("a recording streamer is not started")
 
         def stop(self):
-            pass
+            both_stopping.wait()
+            stopped.append(self.name)
 
-    instance.streamers = {"room": FailingStreamer()}
+    instance.streamers = {name: BarrierStreamer(name) for name in ["first", "second"]}
 
     thread = instance.run()
-    assert failed.wait(timeout=5)
     instance.stop()
-    thread.join(timeout=5)
+    thread.join(timeout=10)
 
     assert not thread.is_alive()
-    assert slept == []
+    assert sorted(stopped) == ["first", "second"]
 
 
 @pytest.mark.parametrize("method", ["stop", "handoff"])
@@ -233,7 +302,7 @@ def test_run_with_a_real_recorder_ends_on_stop_and_handoff(monkeypatch, tmp_path
     (tmp_path / "recorder.py").symlink_to(os.path.join(REPO, "recorder.py"))
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("FAKE_HLS_BASE", "http://127.0.0.1:{}".format(unanswering.getsockname()[1]))
-    monkeypatch.setattr(daemon, "recorded_recorder", lambda name: None)
+    # adopt_existing runs for real: configs/ holds no record, so nothing is adopted
     instance = counting_daemon()
     instance.pid = os.getpid()
     instance.config = {"auto_reload_config": False, "rate_limit_time": 0}
@@ -332,7 +401,7 @@ def test_daemonize_releases_the_callers_stdio(tmp_path):
         # Returns only once every process holding the caller's pipes has let go
         caller.communicate(timeout=DAEMON_REPORT_DEADLINE_SECONDS)
         # Blocks until the daemon opens the FIFO, writes its report and closes it
-        report = json.loads(report_path.read_text())
+        report = json.loads(read_fifo(report_path, DAEMON_REPORT_DEADLINE_SECONDS))
 
         os.kill(report["pid"], 0)  # the daemon is still running
         assert report["devnull"] == [True, True, True]

@@ -2,7 +2,6 @@ import sys
 import os
 import logging
 import signal
-import time
 import threading
 from ipc.server import SocketServer
 from ipc.ipc_config import IpcConfig
@@ -315,8 +314,9 @@ class Daemon:
                             break
                         if not streamer.stream:
                             streamer.start()
+                        # the configured pause between launches; stop and handoff end it
                         if self.config["rate_limit_time"]:
-                            time.sleep(self.config["rate_limit_time"])
+                            self.wake.wait(self.config["rate_limit_time"])
 
                     # wait a minute; stop and handoff clear pid and set wake
                     if self.pid:
@@ -332,11 +332,18 @@ class Daemon:
             if not self._handoff:
                 with self.streamers_lock:
                     streamer_snapshot = dict(self.streamers)
-                for name, streamer in streamer_snapshot.items():
+                # stop every recorder at once, so shutdown waits for the
+                # slowest one rather than for each in turn
+                def stop_streamer(name, streamer):
                     try:
                         streamer.stop()
                     except Exception:
                         self.logger.exception("Error stopping {} during shutdown".format(name))
+                stoppers = [threading.Thread(target=stop_streamer, args=item) for item in streamer_snapshot.items()]
+                for stopper in stoppers:
+                    stopper.start()
+                for stopper in stoppers:
+                    stopper.join()
             else:
                 self.logger.info("Handoff mode: leaving child processes running.")
             

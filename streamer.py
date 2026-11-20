@@ -25,6 +25,7 @@ class Streamer:
     daemon = None
     stream = None
     started = False
+    stopping = False  # set by stop(); a launch it ends is not a failed launch
 
     def __init__( self, daemon, name ):
       self.name = name
@@ -39,6 +40,7 @@ class Streamer:
         return bool( pid and process_active(pid) )
  
     def start(self):
+        self.stopping = False
         def stream_thread():
 
             ready_fd = None
@@ -69,8 +71,8 @@ class Streamer:
                     self.started = True
                     proc.wait()
                     return
-                # stop clears stream, and a stopped launch says nothing about the site
-                if self.stream:
+                # a stopped launch says nothing about the site
+                if self.stream and not self.stopping:
                     self.daemon.record_launch( self.launch_error( capture_path, capture_offset ) )
             except Exception:
                 self.daemon.logger.exception("stream_thread error for {}".format(self.name))
@@ -126,6 +128,9 @@ class Streamer:
     def stop( self, signal_child = True ):
         stream = self.stream
         if stream:
+            # set before the recorder is ended, so a launch still waiting
+            # for readiness sees it was stopped, not that it failed
+            self.stopping = True
             if self.started:
                 self.started = False
                 if signal_child:

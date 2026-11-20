@@ -24,6 +24,7 @@ if os.path.exists(os.path.join(VENV, "bin", "python")) and os.path.realpath(sys.
 import cli
 from ipc.ipc_config import IpcConfig
 from ipc.server import SocketServer
+from fifo_wait import read_fifo
 
 
 # service
@@ -104,8 +105,7 @@ def test_enable_logs_outside_project_and_status_reports_last_exit(tmp_path, pyth
 
 def job_pid(script):
     # Blocks until launchd has started the job and it has written its PID
-    with open(script.parent / "started") as started:
-        return int(started.read())
+    return int(read_fifo(script.parent / "started", LAUNCHD_DEADLINE_SECONDS))
 
 
 def status_after_exit(script, env):

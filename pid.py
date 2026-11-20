@@ -60,6 +60,29 @@ def recorded_recorder( name ):
     forget_recorder( name, pid )
     return None
 
+def wait_for_exit( pid, timeout ):
+    # Whether pid exited within timeout seconds (None waits without bound):
+    # kqueue's NOTE_EXIT on macOS and BSD, a pidfd on Linux.
+    if hasattr( select, "kqueue" ):
+        queue = select.kqueue()
+        try:
+            exit_event = select.kevent( pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT, fflags=select.KQ_NOTE_EXIT )
+            try:
+                return bool( queue.control( [exit_event], 1, timeout ) )
+            except ProcessLookupError:
+                return True  # already gone
+        finally:
+            queue.close()
+    try:
+        pidfd = os.pidfd_open( pid )
+    except ProcessLookupError:
+        return True  # already gone
+    try:
+        readable, _, _ = select.select( [pidfd], [], [], timeout )
+        return bool( readable )
+    finally:
+        os.close( pidfd )
+
 class AdoptedProcess:
 
     def __init__( self, pid ):
@@ -82,19 +105,10 @@ class AdoptedProcess:
 
     def wait( self, timeout=None ):
         # An adopted recorder is not our child, so waitpid cannot reach it;
-        # kqueue reports its exit as an event.
+        # the kernel reports its exit as an event instead.
         if self._returncode is not None:
             return self._returncode
-        queue = select.kqueue()
-        try:
-            exit_event = select.kevent( self.pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT, fflags=select.KQ_NOTE_EXIT )
-            try:
-                events = queue.control( [exit_event], 1, timeout )
-            except ProcessLookupError:
-                events = [ exit_event ]  # already gone
-        finally:
-            queue.close()
-        if not events:
+        if not wait_for_exit( self.pid, timeout ):
             raise subprocess.TimeoutExpired( cmd="adopted_process", timeout=timeout )
         self._returncode = -1
         return self._returncode

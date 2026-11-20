@@ -436,6 +436,7 @@ def test_valid_adopted_recorder_is_waited_on(adopt_harness, monkeypatch):
     assert daemon.launches == []
     assert s.stream is None
     assert not s.started
+    assert not adopt_harness.exists()  # Streamer forgets the ended recorder's record
 
 
 def test_adopted_recorder_that_fails_validation_is_terminated(adopt_harness, monkeypatch):
@@ -449,6 +450,7 @@ def test_adopted_recorder_that_fails_validation_is_terminated(adopt_harness, mon
     assert any("failed validation, will restart" in m for m in daemon.logger.messages)
     assert not any("validated." in m for m in daemon.logger.messages)
     assert s.stream is None
+    assert not adopt_harness.exists()  # Streamer forgets the ended recorder's record
 
 
 def test_adopt_error_is_logged_and_streamer_cleared(adopt_harness, monkeypatch):
@@ -463,3 +465,4 @@ def test_adopt_error_is_logged_and_streamer_cleared(adopt_harness, monkeypatch):
 
     assert any("adopted_thread error for alice" in m for m in daemon.logger.messages)
     assert s.stream is None
+    assert not adopt_harness.exists()  # Streamer forgets the ended recorder's record

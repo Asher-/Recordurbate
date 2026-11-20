@@ -23,6 +23,7 @@ sys.path.insert( 0, ROOT )
 sys.path.insert( 0, TESTS )
 import test_recorder
 from test_recorder import FakeHls, probe
+from fifo_wait import open_fifo
 import streamer as streamer_module
 from streamer import Streamer
 from pid import recorded_recorder
@@ -97,8 +98,7 @@ class StreamerLaunchesRecorderTest( RoomDir ):
         os.environ[ "FAKE_YTDLP_GATE" ] = gate
         real_select = streamer_module.select.select
         def open_gate_then_select( *args ):
-            with open( gate, "w" ):
-                pass
+            open_fifo( gate, "w", 30 ).close()
             return real_select( *args )
         patcher = mock.patch.object( streamer_module.select, "select", open_gate_then_select )
         patcher.start()
@@ -130,6 +130,57 @@ class StreamerLaunchesRecorderTest( RoomDir ):
         self.assertTrue( any( "Started to record room." in line for line in logs.output ) )
         codecs, container, duration = probe( self.recording() )
         self.assertEqual( codecs, [ "aac", "h264" ] )
+
+    def hold_lookup( self ):
+        # fake_ytdlp.py blocks opening this FIFO, so the recorder's lookup
+        # never answers; cleanup opens it so the held lookup can finish.
+        gate = os.path.join( self.cwd, "gate" )
+        os.mkfifo( gate )
+        os.environ[ "FAKE_YTDLP_GATE" ] = gate
+        held = os.open( gate, os.O_RDWR )
+        self.addCleanup( os.close, held )
+
+    def test_recorder_that_never_signals_ready_is_not_started( self ):
+        self.hold_lookup()
+        patcher = mock.patch.object( streamer_module, "READY_TIMEOUT", 1 )
+        patcher.start()
+        self.addCleanup( patcher.stop )
+        daemon = FakeDaemon( self.config )
+        streamer = Streamer( daemon, "room" )
+        with self.assertLogs( "test-integration", level="INFO" ) as logs:
+            daemon.logger.info( "launching room" )
+            thread = streamer.start()
+            thread.join( 60 )
+        self.assertFalse( thread.is_alive() )
+        # the deadline passed, so the launch counts against the site and the
+        # recorder is ended
+        self.assertEqual( len( daemon.launches ), 1 )
+        self.assertFalse( any( "Started to record" in line for line in logs.output ) )
+        self.assertIsNone( streamer.stream )
+        self.assertFalse( os.path.exists( "configs/pid-room" ) )
+
+    def test_stop_during_the_readiness_wait_reports_nothing( self ):
+        self.hold_lookup()
+        waiting = threading.Event()
+        real_select = streamer_module.select.select
+        def report_wait( *args ):
+            waiting.set()
+            return real_select( *args )
+        patcher = mock.patch.object( streamer_module.select, "select", report_wait )
+        patcher.start()
+        self.addCleanup( patcher.stop )
+        daemon = FakeDaemon( self.config )
+        streamer = Streamer( daemon, "room" )
+        thread = streamer.start()
+        self.assertTrue( waiting.wait( 30 ) )
+        recorder = streamer.stream
+        streamer.stop()
+        thread.join( 60 )
+        self.assertFalse( thread.is_alive() )
+        self.assertIsNotNone( recorder.poll() )
+        # a stopped launch says nothing about the site
+        self.assertEqual( daemon.launches, [] )
+        self.assertIsNone( streamer.stream )
 
 class AdoptRecordedRecorderTest( RoomDir ):
     # A recorder launched as Streamer.start launches it, by a daemon that has
@@ -199,7 +250,7 @@ class RecorderStopTest( RoomDir ):
         os.environ[ "FAKE_YTDLP_GATE" ] = gate
         recorder = subprocess.Popen( [ sys.executable, "recorder.py", "https://chaturbate.com/room/" ],
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True )
-        writer = open( gate, "w" )
+        writer = open_fifo( gate, "w", 30 )
         try:
             self.assertEqual( recorded_recorder("room"), recorder.pid )
             recorder.send_signal( signal.SIGTERM )

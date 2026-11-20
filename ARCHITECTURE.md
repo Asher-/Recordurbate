@@ -244,13 +244,14 @@ while self.pid:
     for each streamer:
         if not self.pid: break         # stop/handoff ends the pass
         if not streaming: start()      # launch recorder.py
-        rate_limit_sleep()
-    sleep 60s (in 1s intervals, checking self.pid)
+        self.wake.wait(rate_limit_time)
+    self.wake.wait(60)                 # an error in the pass also waits here
 ```
 
-**`stop()`**: Sets `self.pid = None`, which causes the run loop to exit. The
-run loop's cleanup phase calls `streamer.stop()` on all streamers. Then
-`sys.exit(0)`.
+**`stop()`**: Sets `self.pid = None` and sets the `wake` event, so the run
+loop leaves any wait at once and exits. The run loop's cleanup phase calls
+`streamer.stop()` on every streamer at the same time and waits for all of
+them. The process exits when `start()`'s join of the run-loop thread returns.
 
 **`reload_config()`**: Reloads `config.json` every loop iteration (when
 `auto_reload_config` is true). Preserves existing `Streamer` objects for names
@@ -1127,7 +1128,9 @@ continue uninterrupted through the new daemon.
 
 - `_handoff` flag — when `True`, the run loop cleanup phase skips
   `streamer.stop()`, leaving children running.
-- `handoff()` — sets `_handoff = True`, stops the run loop, exits.
+- `handoff()` — sets `_handoff = True`, clears `self.pid` and sets the `wake`
+  event so the run loop ends; the process exits when `start()`'s join of the
+  run-loop thread returns.
 - `adopt_existing()` — called at the start of `run()`. Calls
   `streamer.adopt(pid)` for each configured streamer whose
   `configs/pid-<name>` names a live recorder.
