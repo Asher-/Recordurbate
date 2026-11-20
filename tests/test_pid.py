@@ -1,8 +1,11 @@
 import os
+import select
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname( os.path.dirname( os.path.abspath(__file__) ) )
 sys.path.insert( 0, ROOT )
@@ -103,6 +106,65 @@ class AdoptedProcessWaitTest( unittest.TestCase ):
         release( proc )
         self.assertEqual( adopted.wait(), -1 )
         self.assertEqual( adopted.wait(), -1 )
+
+class WaitForExitRoutesTest( unittest.TestCase ):
+    # wait_for_exit's routes one at a time. The kernel calls are replaced
+    # where the host lacks them (pidfd off Linux) or cannot be made to fail
+    # on demand (a PID vanishing between the check and the kqueue
+    # registration); the real calls run in AdoptedProcessWaitTest and in
+    # test_pidfd_* where os.pidfd_open exists.
+
+    def without_kqueue( self, pidfd_open ):
+        # the Linux route: a select module with no kqueue, and pidfd_open
+        return mock.patch.multiple( pid, select=types.SimpleNamespace( select=select.select ) ), \
+               mock.patch.object( pid.os, "pidfd_open", pidfd_open, create=True )
+
+    def test_kqueue_registration_on_a_vanished_pid_counts_as_exited( self ):
+        class VanishedQueue:
+            def control( self, changes, max_events, timeout ):
+                raise ProcessLookupError()
+            def close( self ):
+                pass
+        if not hasattr( select, "kqueue" ):
+            self.skipTest( "no kqueue on this host" )
+        with mock.patch.object( pid.select, "kqueue", VanishedQueue ):
+            self.assertTrue( pid.wait_for_exit( 1, 0 ) )
+
+    def test_pidfd_of_an_exited_process_is_readable( self ):
+        read_fd, write_fd = os.pipe()
+        os.close( write_fd )  # readable at once, as a pidfd is once its process exits
+        no_kqueue, pidfd = self.without_kqueue( lambda p: read_fd )
+        with no_kqueue, pidfd:
+            self.assertTrue( pid.wait_for_exit( 1, 5 ) )
+        with self.assertRaises( OSError ):
+            os.fstat( read_fd )  # wait_for_exit closed it
+
+    def test_pidfd_of_a_running_process_times_out( self ):
+        read_fd, write_fd = os.pipe()  # never readable while write_fd is open
+        no_kqueue, pidfd = self.without_kqueue( lambda p: read_fd )
+        try:
+            with no_kqueue, pidfd:
+                self.assertFalse( pid.wait_for_exit( 1, 0 ) )
+        finally:
+            os.close( write_fd )
+        with self.assertRaises( OSError ):
+            os.fstat( read_fd )
+
+    def test_pidfd_of_a_vanished_pid_counts_as_exited( self ):
+        def vanished( p ):
+            raise ProcessLookupError()
+        no_kqueue, pidfd = self.without_kqueue( vanished )
+        with no_kqueue, pidfd:
+            self.assertTrue( pid.wait_for_exit( 1, 0 ) )
+
+    @unittest.skipUnless( hasattr( os, "pidfd_open" ), "pidfd is Linux-only" )
+    def test_pidfd_waits_for_a_real_process( self ):
+        proc = held()
+        with mock.patch.multiple( pid, select=types.SimpleNamespace( select=select.select ) ):
+            self.assertFalse( pid.wait_for_exit( proc.pid, 0 ) )
+            proc.stdin.close()
+            self.assertTrue( pid.wait_for_exit( proc.pid, 30 ) )
+        proc.wait()
 
 if __name__ == "__main__":
     unittest.main()

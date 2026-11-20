@@ -466,3 +466,48 @@ def test_adopt_error_is_logged_and_streamer_cleared(adopt_harness, monkeypatch):
     assert any("adopted_thread error for alice" in m for m in daemon.logger.messages)
     assert s.stream is None
     assert not adopt_harness.exists()  # Streamer forgets the ended recorder's record
+
+
+class SlowToStopRecorder:
+    # A started recorder that ignores SIGINT: its wait for the SIGINT times out
+    def __init__(self):
+        self.pid = 4242
+        self.signals = []
+        self.terminated = False
+
+    def send_signal(self, sig):
+        self.signals.append(sig)
+
+    def wait(self, timeout=None):
+        if timeout is not None and not self.terminated:
+            raise streamer.subprocess.TimeoutExpired(cmd="recorder", timeout=timeout)
+        return -15
+
+    def poll(self):
+        return -15 if self.terminated else None
+
+    def terminate(self):
+        self.terminated = True
+
+
+def test_recorder_that_ignores_sigint_is_terminated(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "configs/pid-alice").write_text("4242\n")
+    daemon = make_daemon()
+    s = Streamer(daemon, "alice")
+    recorder = SlowToStopRecorder()
+    s.stream = recorder
+    s.started = True
+
+    s.stop()
+
+    assert recorder.signals == [streamer.signal.SIGINT]
+    assert any("SIGINT timeout for alice, escalating to SIGTERM." in m for m in daemon.logger.messages)
+    assert recorder.terminated
+    assert s.stream is None
+    assert not (tmp_path / "configs/pid-alice").exists()
+
+    # a second stop finds no stream and does nothing
+    s.stop()
+    assert recorder.signals == [streamer.signal.SIGINT]
