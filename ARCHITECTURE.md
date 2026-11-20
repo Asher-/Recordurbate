@@ -379,8 +379,9 @@ names `pid`. `recorder.py` calls it as it exits.
 is alive and its command line holds `recorder.py` and
 `chaturbate.com/<name>/`; otherwise forgets the record and returns `None`.
 
-**`AdoptedProcess.wait(timeout)`**: Registers a kqueue `NOTE_EXIT` event for a
-PID that is not a child and blocks once until it fires.
+**`AdoptedProcess.wait(timeout)`**: Waits for a PID that is not a child through
+`pid.wait_for_exit`: a kqueue `NOTE_EXIT` event on macOS and BSD, a pidfd on
+Linux. It blocks once until the process exits.
 
 ---
 
@@ -1080,12 +1081,14 @@ CLI: python cli.py upgrade
 | Method           | Popen                       | AdoptedProcess                    |
 | :--------------- | :-------------------------- | :-------------------------------- |
 | `poll()`         | Checks child exit status    | `psutil.Process.status()`         |
-| `wait(timeout)`  | `os.waitpid()` (child only) | kqueue `NOTE_EXIT` (any PID)      |
+| `wait(timeout)`  | `os.waitpid()` (child only) | kqueue `NOTE_EXIT` / Linux pidfd (any PID) |
 | `send_signal(s)` | `os.kill(self.pid, s)`      | `os.kill(self.pid, s)`            |
 | `terminate()`    | Sends SIGTERM               | Sends SIGTERM                     |
 
-`wait(timeout)` registers a kqueue `EVFILT_PROC`/`NOTE_EXIT` event for the PID
-and blocks once until the process exits; a timeout raises
+`wait(timeout)` calls `pid.wait_for_exit`, which registers a kqueue
+`EVFILT_PROC`/`NOTE_EXIT` event for the PID on macOS and BSD, or selects on a
+pidfd from `os.pidfd_open` on Linux, and blocks once until the process exits;
+a timeout raises
 `subprocess.TimeoutExpired` so `Streamer.stop()` exception handling works
 unchanged.
 
