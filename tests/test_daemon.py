@@ -462,3 +462,43 @@ def test_restart_of_a_stopped_daemon_does_nothing():
 
     assert not instance._restart
     assert not instance.wake.is_set()
+
+
+START_SCRIPT = """
+import json, logging, os, socket, sys, threading
+from ipc.ipc_config import IpcConfig
+from daemon import Daemon
+probe = socket.socket()
+probe.bind((IpcConfig.host, 0))
+IpcConfig.port = probe.getsockname()[1]
+probe.close()
+instance = Daemon.__new__(Daemon)
+instance.logger = logging.getLogger("start")
+instance.config = {"auto_reload_config": False, "rate_limit_time": 0}
+instance.streamers_lock = threading.Lock()
+instance.streamers = {}
+real_run = Daemon.run
+def run_then_stop(self):
+    thread = real_run(self)  # the real loop, already running
+    listening = socket.create_connection((IpcConfig.host, IpcConfig.port), timeout=5)
+    listening.close()
+    self.stop()
+    return thread
+Daemon.run = run_then_stop
+sys.argv[0] = "/project/cli.py"
+instance.start(foreground=True)
+print(json.dumps({"restart_argv": instance.restart_argv, "pid": instance.pid}))
+"""
+
+
+def test_start_in_the_foreground_serves_ipc_runs_the_loop_and_returns_after_stop():
+    # The real Daemon.start -> start_foreground: binds the IPC socket, starts
+    # its listener, runs the loop and joins it; stop ends the loop and start
+    # returns on the main thread.
+    process = subprocess.run(
+        [sys.executable, "-c", START_SCRIPT],
+        cwd=REPO, capture_output=True, text=True, timeout=30,
+    )
+    assert process.returncode == 0, process.stderr
+    report = json.loads(process.stdout.strip().splitlines()[-1])
+    assert report == {"restart_argv": [sys.executable, "/project/cli.py", "start", "--foreground"], "pid": None}
