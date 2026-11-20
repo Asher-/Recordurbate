@@ -119,7 +119,8 @@ def lookup( url ):
     # ("error", line); each line is an "ERROR: [Chaturbate] <room>: ..." line.
     parts = urlsplit( url )
     room = parts.path.strip( "/" ).split( "/" )[0]
-    site = "{}://{}".format( parts.scheme, parts.netloc )
+    # RECORDURBATE_SITE stands in for the room URL's site in tests
+    site = os.environ.get( "RECORDURBATE_SITE" ) or "{}://{}".format( parts.scheme, parts.netloc )
     headers = { "User-Agent": USER_AGENT, "Referer": "{}/{}/".format(site, room) }
     def line( message ):
         return "ERROR: [Chaturbate] {}: {}".format( room, message )

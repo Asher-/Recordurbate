@@ -575,6 +575,17 @@ class ExtractTest( unittest.TestCase ):
         self.assertEqual( hls.api_requests, [ ("room", None) ] )
         self.assertFalse( os.path.exists(self.export) )
 
+    def test_recordurbate_site_replaces_the_room_urls_site( self ):
+        hls = FakeHls()
+        self.addCleanup( hls.close )
+        with mock.patch.dict( os.environ, { "RECORDURBATE_SITE": hls.base } ), \
+             mock.patch.object( recorder, "COOKIES_FILE", self.export ), \
+             mock.patch.object( recorder.sys, "stderr", new_callable=lambda: open(os.devnull, "w") ):
+            status, (_, urls, headers) = recorder.extract( "https://chaturbate.com/room/", recorder.Stop() )
+        self.assertEqual( status, "ok" )
+        self.assertEqual( hls.api_requests, [ ("room", None) ] )
+        self.assertEqual( headers["Referer"], hls.base + "/room/" )
+
 class ParseMasterTest( unittest.TestCase ):
 
     def test_variant_without_audio_group_gives_one_url( self ):
