@@ -148,26 +148,12 @@ def test_logs_recovery_once_and_warns_again_on_the_next_outage(caplog):
 def test_stop_ends_the_run_loops_wait_at_once(monkeypatch):
     monkeypatch.setattr(daemon, "recorded_recorder", lambda name: None)
     instance = bare_daemon()
-    instance.pid = os.getpid()
     instance.config = {"auto_reload_config": False, "rate_limit_time": 0}
-    instance.streamers_lock = threading.Lock()
-    instance.streamers = {}
-    waiting = threading.Event()
+    # the streamer holds the pass until the wait is being recorded, so the
+    # loop reaches its minute wait only through the recorded wait
+    waits = run_with_recorded_waits(instance, GatedStreamer(fail=False))
 
-    thread = instance.run()
-    real_wait = instance.wake.wait
-    # the loop is inside its minute wait once this wrapper runs
-    def wait_and_report(timeout):
-        waiting.set()
-        return real_wait(timeout)
-    instance.wake.wait = wait_and_report
-    instance.wake.set()  # ends a wait that began before the wrapper
-    instance.wake.clear()
-    assert waiting.wait(timeout=65)
-    instance.stop()
-    thread.join(timeout=5)
-
-    assert not thread.is_alive()
+    assert waits == [60]
 
 
 @pytest.mark.parametrize("method", ["stop", "handoff"])
@@ -418,48 +404,51 @@ def test_daemonize_releases_the_callers_stdio(tmp_path):
                 pass
 
 
-def test_restart_stops_then_reexecutes_once_the_run_loop_ends(monkeypatch):
+RESTART_SCRIPT = """
+import logging, os, sys, threading
+from daemon import Daemon
+instance = Daemon.__new__(Daemon)
+instance.logger = logging.getLogger("restart")
+instance.pid = os.getpid()
+instance.config = {"auto_reload_config": False, "rate_limit_time": 0}
+instance.streamers_lock = threading.Lock()
+instance.streamers = {}
+# the command restart runs: a program that reports the PID it runs as
+instance.restart_argv = [sys.executable, "-c",
+    "import os, sys; open(sys.argv[1], 'w').write(str(os.getpid()))", sys.argv[1]]
+thread = instance.run()
+getattr(instance, sys.argv[2])(client_response=None)
+thread.join()
+"""
+
+
+@pytest.mark.parametrize("method", ["restart", "stop"])
+def test_restart_reexecutes_in_the_same_process_and_stop_does_not(tmp_path, method):
+    marker = tmp_path / "executed"
+    process = subprocess.Popen(
+        [sys.executable, "-c", RESTART_SCRIPT, str(marker), method],
+        cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    _, stderr = process.communicate(timeout=30)
+    assert process.returncode == 0, stderr
+    if method == "restart":
+        # the run loop replaced the daemon's own process with restart_argv
+        assert marker.read_text() == str(process.pid)
+    else:
+        assert not marker.exists()
+
+
+def test_start_restarts_with_cli_start_whatever_started_it(monkeypatch):
     instance = bare_daemon()
-    instance.pid = os.getpid()
-    instance.wake = threading.Event()
-    loop_ended = threading.Event()
-    executed = []
-
-    def fake_run():
-        # a run loop that ends once stop has been requested
-        def loop():
-            instance.wake.wait(timeout=5)
-            loop_ended.set()
-        thread = threading.Thread(target=loop)
-        thread.start()
-        return thread
-
-    def fake_execv(path, argv):
-        assert loop_ended.is_set()  # never while the old loop still runs
-        executed.append((path, argv))
-
+    monkeypatch.setattr(daemon.sys, "argv", ["/project/cli.py", "upgrade"])
     monkeypatch.setattr(instance, "daemonize", lambda: None)
-    monkeypatch.setattr(instance, "run", fake_run)
-    monkeypatch.setattr(daemon.os, "execv", fake_execv)
-    monkeypatch.setattr(daemon.logging, "shutdown", lambda: None)
-
-    instance.restart(client_response=None)
-    assert instance.pid is None
-    assert instance.wake.is_set()
-    instance.start()
-
-    assert executed == [(sys.executable, [sys.executable] + sys.argv)]
-
-
-def test_stop_does_not_reexecute(monkeypatch):
-    instance = bare_daemon()
-    instance.pid = os.getpid()
-    instance.wake = threading.Event()
     ended = threading.Thread(target=lambda: None)
     ended.start()
-    monkeypatch.setattr(instance, "daemonize", lambda: None)
     monkeypatch.setattr(instance, "run", lambda: ended)
-    monkeypatch.setattr(daemon.os, "execv", lambda path, argv: pytest.fail("stop re-executed"))
 
-    instance.stop()
-    instance.start()  # returns once the loop has ended, without re-executing
+    instance.start()
+    assert instance.restart_argv == [sys.executable, "/project/cli.py", "start"]
+
+    monkeypatch.setattr(instance, "start_foreground", lambda: None)
+    instance.start(foreground=True)
+    assert instance.restart_argv == [sys.executable, "/project/cli.py", "start", "--foreground"]

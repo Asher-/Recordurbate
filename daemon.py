@@ -19,7 +19,8 @@ class Daemon:
     ipc_client = None
     streamers = {}
     _handoff = False
-    _restart = False  # set by restart; start re-executes once the run loop ends
+    _restart = False  # set by restart; the run loop re-executes restart_argv as it ends
+    restart_argv = None  # set by start: this interpreter running "cli.py start"
     wake = None  # set by stop and handoff to end the run loop's wait at once
     failed_launches = 0
     site_unreachable = False
@@ -124,6 +125,8 @@ class Daemon:
             streamer.stop()
 
     def start(self, foreground=False):
+        # restart re-executes this command, whatever command started the daemon
+        self.restart_argv = [ sys.executable, os.path.abspath(sys.argv[0]), "start" ] + ( ["--foreground"] if foreground else [] )
         if foreground:
             self.start_foreground()
         else:
@@ -132,12 +135,6 @@ class Daemon:
             # Block main thread on the run loop so Python finalization
             # doesn't deadlock the GIL while the loop thread is still working.
             thread.join()
-        if self._restart:
-            # the run loop has ended and stopped every recorder; run the same
-            # command again in this process (the IPC socket closes on exec)
-            self.logger.info("Restarting")
-            logging.shutdown()
-            os.execv( sys.executable, [sys.executable] + sys.argv )
 
     def start_foreground(self):
         """Run without daemonizing — for use under launchd or other supervisors."""
@@ -203,8 +200,8 @@ class Daemon:
                 self.wake.set()
 
     def restart(self, client_response):
-        # stops like stop; start re-executes the daemon once the run loop
-        # has ended, on the main thread
+        # stops like stop; the run-loop thread re-executes restart_argv once
+        # it has stopped every recorder
         if self.pid:
             self._restart = True
         self.stop( client_response=client_response )
@@ -360,6 +357,12 @@ class Daemon:
                 self.logger.info("Handoff mode: leaving child processes running.")
             
             self.logger.info("Successfully stopped.")
+            if self._restart:
+                # every recorder has stopped; replace this process with a
+                # fresh start (the IPC socket is non-inheritable and closes)
+                self.logger.info("Restarting")
+                logging.shutdown()
+                os.execv( self.restart_argv[0], self.restart_argv )
         thread = threading.Thread(target=daemon_run_loop, args=())
         thread.start()
         return thread        
