@@ -19,6 +19,7 @@ class Daemon:
     ipc_client = None
     streamers = {}
     _handoff = False
+    _restart = False  # set by restart; start re-executes once the run loop ends
     wake = None  # set by stop and handoff to end the run loop's wait at once
     failed_launches = 0
     site_unreachable = False
@@ -131,6 +132,12 @@ class Daemon:
             # Block main thread on the run loop so Python finalization
             # doesn't deadlock the GIL while the loop thread is still working.
             thread.join()
+        if self._restart:
+            # the run loop has ended and stopped every recorder; run the same
+            # command again in this process (the IPC socket closes on exec)
+            self.logger.info("Restarting")
+            logging.shutdown()
+            os.execv( sys.executable, [sys.executable] + sys.argv )
 
     def start_foreground(self):
         """Run without daemonizing — for use under launchd or other supervisors."""
@@ -196,8 +203,11 @@ class Daemon:
                 self.wake.set()
 
     def restart(self, client_response):
-        self.stop()
-        self.start()
+        # stops like stop; start re-executes the daemon once the run loop
+        # has ended, on the main thread
+        if self.pid:
+            self._restart = True
+        self.stop( client_response=client_response )
 
     def add_streamer( self, name, save_config = True, client_response = None ):
         with self.streamers_lock:

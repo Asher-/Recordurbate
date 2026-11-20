@@ -416,3 +416,50 @@ def test_daemonize_releases_the_callers_stdio(tmp_path):
                 os.kill(report["pid"], signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+def test_restart_stops_then_reexecutes_once_the_run_loop_ends(monkeypatch):
+    instance = bare_daemon()
+    instance.pid = os.getpid()
+    instance.wake = threading.Event()
+    loop_ended = threading.Event()
+    executed = []
+
+    def fake_run():
+        # a run loop that ends once stop has been requested
+        def loop():
+            instance.wake.wait(timeout=5)
+            loop_ended.set()
+        thread = threading.Thread(target=loop)
+        thread.start()
+        return thread
+
+    def fake_execv(path, argv):
+        assert loop_ended.is_set()  # never while the old loop still runs
+        executed.append((path, argv))
+
+    monkeypatch.setattr(instance, "daemonize", lambda: None)
+    monkeypatch.setattr(instance, "run", fake_run)
+    monkeypatch.setattr(daemon.os, "execv", fake_execv)
+    monkeypatch.setattr(daemon.logging, "shutdown", lambda: None)
+
+    instance.restart(client_response=None)
+    assert instance.pid is None
+    assert instance.wake.is_set()
+    instance.start()
+
+    assert executed == [(sys.executable, [sys.executable] + sys.argv)]
+
+
+def test_stop_does_not_reexecute(monkeypatch):
+    instance = bare_daemon()
+    instance.pid = os.getpid()
+    instance.wake = threading.Event()
+    ended = threading.Thread(target=lambda: None)
+    ended.start()
+    monkeypatch.setattr(instance, "daemonize", lambda: None)
+    monkeypatch.setattr(instance, "run", lambda: ended)
+    monkeypatch.setattr(daemon.os, "execv", lambda path, argv: pytest.fail("stop re-executed"))
+
+    instance.stop()
+    instance.start()  # returns once the loop has ended, without re-executing
