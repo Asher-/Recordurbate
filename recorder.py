@@ -16,9 +16,11 @@ import json
 import os
 import queue
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from urllib.parse import urljoin
@@ -36,6 +38,7 @@ REEXTRACT_AFTER = 15     # seconds without every playlist loading before asking 
 GIVE_UP_AFTER = 120      # seconds without a new segment before exiting
 EXTRACT_TIMEOUT = 60     # seconds a yt-dlp lookup may take
 CLOSE_TIMEOUT = 3        # seconds each muxer shutdown phase may take
+COOKIES_FILE = "chaturbate.com_cookies.txt"  # the user's browser export; read, never written
 
 def log( message ):
     print( "[recorder {}] {}".format( time.strftime("%Y-%m-%d %H:%M:%S"), message ), flush=True )
@@ -65,24 +68,39 @@ def extract( url, config, stop ):
     # ("unavailable", reason) when yt-dlp names a room state, or
     # ("error", reason) for anything else. yt-dlp's stderr is passed on to
     # ours, which the daemon appends to the capture log.
+    # yt-dlp rewrites its --cookies file whenever it exits, so it is handed a
+    # private copy of COOKIES_FILE and the user's export is never written.
     cmd = config["youtube-dl_cmd"].split(" ") + [ "--config-location", config["youtube-dl_config"], "--dump-single-json", url ]
+    cookies = None
     try:
-        proc = subprocess.Popen( cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE )
-    except OSError as e:
-        return "error", "could not run yt-dlp: {}".format( e )
-    stop.lookup = proc
-    try:
-        # a stop set before the lookup was registered did not reach it
-        if stop.is_set():
-            proc.kill()
+        if os.path.exists( COOKIES_FILE ):
+            fd, cookies = tempfile.mkstemp( prefix="cookies-", suffix=".txt" )
+            try:
+                with os.fdopen( fd, "wb" ) as copy, open( COOKIES_FILE, "rb" ) as export:
+                    shutil.copyfileobj( export, copy )
+            except OSError as e:
+                return "error", "could not copy {}: {}".format( COOKIES_FILE, e )
+            cmd += [ "--cookies", cookies ]
         try:
-            out, err = proc.communicate( timeout=EXTRACT_TIMEOUT )
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()
-            return "error", "yt-dlp took over {}s".format( EXTRACT_TIMEOUT )
+            proc = subprocess.Popen( cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE )
+        except OSError as e:
+            return "error", "could not run yt-dlp: {}".format( e )
+        stop.lookup = proc
+        try:
+            # a stop set before the lookup was registered did not reach it
+            if stop.is_set():
+                proc.kill()
+            try:
+                out, err = proc.communicate( timeout=EXTRACT_TIMEOUT )
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+                return "error", "yt-dlp took over {}s".format( EXTRACT_TIMEOUT )
+        finally:
+            stop.lookup = None
     finally:
-        stop.lookup = None
+        if cookies is not None:
+            os.unlink( cookies )
     if stop.is_set():
         return "error", "yt-dlp lookup interrupted"
     text = err.decode( "utf-8", "replace" )

@@ -407,6 +407,82 @@ class ExtractTest( unittest.TestCase ):
         stop.set()
         self.assertEqual( self.extract("hang", stop), ("error", "yt-dlp lookup interrupted") )
 
+class ExtractCookiesTest( unittest.TestCase ):
+    # yt-dlp rewrites its --cookies file on exit, as fake_ytdlp.py does;
+    # extract must hand it a private copy so the user's export is never written.
+
+    EXPORT = "# Netscape HTTP Cookie File\n.chaturbate.com\tTRUE\t/\tTRUE\t0\tsessionid\tfrom-browser\n"
+
+    def setUp( self ):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup( shutil.rmtree, self.dir )
+        self.export = os.path.join( self.dir, "chaturbate.com_cookies.txt" )
+        self.log = os.path.join( self.dir, "cookies-log" )
+        self.copies = []
+
+    def extract( self, mode, stop = None, timeout = recorder.EXTRACT_TIMEOUT ):
+        real_mkstemp = tempfile.mkstemp
+        def recording_mkstemp( *args, **kwargs ):
+            fd, path = real_mkstemp( *args, **kwargs )
+            self.copies.append( path )
+            return fd, path
+        with mock.patch.object( recorder, "COOKIES_FILE", self.export ), \
+             mock.patch.object( recorder, "EXTRACT_TIMEOUT", timeout ), \
+             mock.patch.object( recorder.tempfile, "mkstemp", recording_mkstemp ), \
+             mock.patch.dict( os.environ, { "FAKE_YTDLP_COOKIES_LOG": self.log } ):
+            return ExtractTest.extract( self, mode, stop )
+
+    def write_export( self ):
+        with open( self.export, "w" ) as f:
+            f.write( self.EXPORT )
+
+    def received( self ):
+        with open( self.log ) as f:
+            path, contents = f.read().split( "\n", 1 )
+        return path, contents
+
+    def assert_export_untouched_and_copy_removed( self ):
+        with open( self.export ) as f:
+            self.assertEqual( f.read(), self.EXPORT )
+        self.assertEqual( len(self.copies), 1 )
+        self.assertFalse( os.path.exists(self.copies[0]) )
+
+    CONFIG = ExtractTest.CONFIG
+
+    def test_yt_dlp_gets_a_copy_of_the_export( self ):
+        self.write_export()
+        status, _ = self.extract( "ok" )
+        self.assertEqual( status, "ok" )
+        path, contents = self.received()
+        self.assertEqual( path, self.copies[0] )
+        self.assertNotEqual( os.path.realpath(path), os.path.realpath(self.export) )
+        self.assertEqual( contents, self.EXPORT )
+        self.assert_export_untouched_and_copy_removed()
+
+    def test_failed_lookup_leaves_the_export_untouched( self ):
+        self.write_export()
+        self.assertEqual( self.extract("offline")[0], "unavailable" )
+        self.assert_export_untouched_and_copy_removed()
+
+    def test_timed_out_lookup_removes_the_copy( self ):
+        self.write_export()
+        self.assertEqual( self.extract("hang", timeout=1), ("error", "yt-dlp took over 1s") )
+        self.assert_export_untouched_and_copy_removed()
+
+    def test_stopped_lookup_removes_the_copy( self ):
+        self.write_export()
+        stop = recorder.Stop()
+        stop.set()
+        self.assertEqual( self.extract("hang", stop), ("error", "yt-dlp lookup interrupted") )
+        self.assert_export_untouched_and_copy_removed()
+
+    def test_no_export_passes_no_cookies( self ):
+        status, _ = self.extract( "ok" )
+        self.assertEqual( status, "ok" )
+        self.assertEqual( self.received(), ("", "") )
+        self.assertEqual( self.copies, [] )
+        self.assertFalse( os.path.exists(self.export) )
+
 class RunTest( unittest.TestCase ):
     # recorder.run in-process with main replaced, so only run's own routes run.
 
