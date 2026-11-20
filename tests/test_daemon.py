@@ -452,3 +452,13 @@ def test_start_restarts_with_cli_start_whatever_started_it(monkeypatch):
     monkeypatch.setattr(instance, "start_foreground", lambda: None)
     instance.start(foreground=True)
     assert instance.restart_argv == [sys.executable, "/project/cli.py", "start", "--foreground"]
+
+
+def test_restart_of_a_stopped_daemon_does_nothing():
+    instance = bare_daemon()  # pid None: already stopping
+    instance.wake = threading.Event()
+
+    instance.restart(client_response=None)
+
+    assert not instance._restart
+    assert not instance.wake.is_set()
