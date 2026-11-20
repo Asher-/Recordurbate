@@ -174,9 +174,10 @@ class Daemon:
     # stop and handoff end the run loop; the process exits when start's join
     # of the run-loop thread returns. Each answers its client first, since
     # the process may exit before the IPC handler's own close runs.
+    # stop runs in the signal handler, so it only flags the run loop, which
+    # logs the stop on its own thread
     def stop(self, client_response = None):
         if self.pid:
-            self.logger.info("Caught stop signal, stopping")
             if client_response:
                 client_response.close()
             self.pid = None
@@ -330,6 +331,7 @@ class Daemon:
 
             # loop ended
             if not self._handoff:
+                self.logger.info("Stop requested, stopping")
                 with self.streamers_lock:
                     streamer_snapshot = dict(self.streamers)
                 # stop every recorder at once, so shutdown waits for the

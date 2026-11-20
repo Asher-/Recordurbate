@@ -171,17 +171,21 @@ def test_stop_ends_the_run_loops_wait_at_once(monkeypatch):
 
 
 @pytest.mark.parametrize("method", ["stop", "handoff"])
-def test_stop_and_handoff_clear_pid_and_set_wake(method):
+def test_stop_and_handoff_clear_pid_and_set_wake(caplog, method):
     instance = bare_daemon()
     instance.pid = os.getpid()
     instance.wake = threading.Event()
 
     # Returns rather than exiting; the process ends when start's join returns
-    assert getattr(instance, method)() is None
+    with caplog.at_level(logging.DEBUG):
+        assert getattr(instance, method)() is None
 
     assert instance.pid is None
     assert instance.wake.is_set()
     assert instance._handoff == (method == "handoff")
+    if method == "stop":
+        # stop runs in the signal handler, which writes no log
+        assert caplog.records == []
 
 
 def run_with_recorded_waits(instance, streamer):
