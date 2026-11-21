@@ -1,6 +1,8 @@
 import http.server
+import io
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -197,41 +199,44 @@ class MuxerTest( unittest.TestCase ):
         self.assertEqual( codecs, [ "aac", "h264" ] )
         subprocess.run( [ "ffmpeg", "-v", "error", "-i", path, "-f", "null", "-" ], check=True )
 
+EDGE_API = os.path.join( ROOT, "tests", "fixtures", "edge_api" )
+CAPTURED_HOST = "https://edge27-atl.live.mmcdn.com"
+
+def captured( name ):
+    # A response captured from the site; see tests/fixtures/edge_api/README.md
+    with open( os.path.join(EDGE_API, name), encoding="utf-8" ) as f:
+        return f.read()
+
 class FakeHls:
     # Serves a live LL-HLS room from the fixtures: one segment per track
     # becomes available each second, the playlist window holds three, and
     # ENDLIST follows the last. Segments in `failing` answer 500.
     #
-    # It also stands in for the site: POST /get_edge_hls_url_ajax/ answers
-    # according to `api` and GET /master.m3u8 lists two video variants, the
-    # higher-bandwidth one being v/playlist.m3u8, whose audio group's default
-    # rendition is a/playlist.m3u8. `api` is one of ok, offline, private,
-    # unknown (a room_status with no message), neterror (503), garbage (not
-    # JSON), hang (never answers), or fail-after-first (ok once, then 503).
-    # While `api_gate` is cleared, room API requests wait for it to be set.
-    # `api_requests` records each API request's room_slug and Cookie header.
+    # It also stands in for the site with responses captured from it: POST
+    # /get_edge_hls_url_ajax/ answers according to `api`, and the master
+    # playlist the public answer names is the captured one, whose video and
+    # audio chunklists FakeHls serves as the fixture's two tracks. `api` is
+    # one of ok, offline, hidden (captured answers), unknown (the offline
+    # answer with room_status "unknown"), list (a JSON array), neterror (503),
+    # garbage (not JSON), hang (never answers), or fail-after-first (ok once,
+    # then 503). `master` is ok, neterror (503) or empty (the captured master
+    # cut before its first variant). While `api_gate` is cleared, room API
+    # requests wait for it. `api_requests` records each request's room_slug
+    # and Cookie header, and `api_arrived` is set once one has arrived.
 
     FIRST = 100
-    MASTER = "\n".join( [
-        "#EXTM3U",
-        "#EXT-X-VERSION:6",
-        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aac",NAME="other",DEFAULT=NO,URI="x/playlist.m3u8"',
-        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aac",NAME="main",DEFAULT=YES,URI="a/playlist.m3u8"',
-        '#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=9000000,BANDWIDTH=896000,RESOLUTION=640x360,AUDIO="aac"',
-        "lo/playlist.m3u8",
-        '#EXT-X-STREAM-INF:BANDWIDTH=5128000,RESOLUTION=1920x1080,AUDIO="aac"',
-        "v/playlist.m3u8",
-        "" ] )
 
-    def __init__( self, failing = (), outage = None, hang = False, api = "ok" ):
+    def __init__( self, failing = (), outage = None, hang = False, api = "ok", master = "ok" ):
         # outage=(start, end) answers 503 to everything in that window of
         # seconds; hang=True never answers a media segment.
         self.failing = set( failing )
         self.outage = outage
         self.hang = hang
         self.api = api
+        self.master = master
         self.api_gate = threading.Event()
         self.api_gate.set()
+        self.api_arrived = threading.Event()
         self.api_requests = []
         self.started = time.time()
         # set once two media segments of each track have been served: the
@@ -251,6 +256,12 @@ class FakeHls:
         self.base = "http://127.0.0.1:{}".format( self.server.server_address[1] )
         threading.Thread( target=self.server.serve_forever, daemon=True ).start()
 
+    def stream_url( self, kind ):
+        # the captured master playlist's chunklist for kind "video" or "audio"
+        number = 3 if kind == "video" else 5
+        return ( self.base + "/v1/edge/streams/origin.room.01ROOMSTREAM00000000000000/"
+                 "chunklist_{}_{}_10000000000000000000_llhls.m3u8?session=00000000-0000-0000-0000-000000000000".format(number, kind) )
+
     def track( self, letter ):
         return Fixtures.video if letter == "v" else Fixtures.audio
 
@@ -266,6 +277,7 @@ class FakeHls:
         length = int( request.headers.get("Content-Length") or 0 )
         form = urllib.parse.parse_qs( request.rfile.read( length ).decode() )
         self.api_requests.append( ( form.get("room_slug", [""])[0], request.headers.get("Cookie") ) )
+        self.api_arrived.set()
         self.api_gate.wait()
         mode = self.api
         if mode == "fail-after-first":
@@ -277,24 +289,41 @@ class FakeHls:
             self.respond( request, 503 )
             return
         if mode == "garbage":
-            self.respond( request, 200, b"not json", "text/html" )
+            self.respond( request, 200, b"<html>not json</html>", "text/html" )
             return
-        status = { "ok": "public", "offline": "offline", "private": "private", "unknown": "unknown" }[ mode ]
-        info = { "success": True, "url": self.base + "/master.m3u8?token=t" if mode == "ok" else "",
-                 "room_status": status }
-        self.respond( request, 200, json.dumps( info ).encode(), "application/json" )
+        if mode == "list":
+            self.respond( request, 200, b"[]", "application/json" )
+            return
+        if mode == "ok":
+            body = captured( "public.json" ).replace( CAPTURED_HOST, self.base )
+        elif mode == "unknown":
+            info = json.loads( captured("offline.json") )
+            info["room_status"] = "unknown"
+            body = json.dumps( info )
+        else:
+            body = captured( mode + ".json" )
+        self.respond( request, 200, body.encode(), "application/json" )
 
     def handle( self, request ):
-        path = request.path.split("?")[0]
+        name = request.path.split("?")[0].rsplit("/", 1)[-1]
         elapsed = time.time() - self.started
         if self.outage and self.outage[0] <= elapsed < self.outage[1]:
             request.send_response( 503 )
             request.end_headers()
             return
-        if path == "/master.m3u8":
-            self.respond( request, 200, self.MASTER.encode() )
+        if name == "llhls.m3u8":
+            if self.master == "neterror":
+                self.respond( request, 503 )
+                return
+            text = captured( "master.m3u8" )
+            if self.master == "empty":
+                text = text.split( "#EXT-X-STREAM-INF" )[0]
+            self.respond( request, 200, text.encode() )
             return
-        letter, name = path.strip("/").split("/")
+        if name.startswith( "chunklist_" ):
+            letter, name = ( "v" if "_video_" in name else "a" ), "playlist.m3u8"
+        else:
+            letter, name = name.split( "_", 1 )
         if self.hang and name.startswith("seg_"):
             time.sleep( 30 )
             return
@@ -303,9 +332,9 @@ class FakeHls:
             available = min( len(fragments), int(time.time() - self.started) + 1 )
             first = max( 0, available - 3 )
             lines = [ "#EXTM3U", "#EXT-X-VERSION:6", "#EXT-X-TARGETDURATION:1",
-                      "#EXT-X-MEDIA-SEQUENCE:{}".format(self.FIRST + first), '#EXT-X-MAP:URI="init.mp4"' ]
+                      "#EXT-X-MEDIA-SEQUENCE:{}".format(self.FIRST + first), '#EXT-X-MAP:URI="{}_init.mp4"'.format(letter) ]
             for index in range( first, available ):
-                lines += [ "#EXTINF:1.0,", "seg_{}.m4s".format(self.FIRST + index) ]
+                lines += [ "#EXTINF:1.0,", "{}_seg_{}.m4s".format(letter, self.FIRST + index) ]
             if available == len( fragments ) and time.time() - self.started > len( fragments ) + 1:
                 lines.append( "#EXT-X-ENDLIST" )
             body = ( "\n".join(lines) + "\n" ).encode()
@@ -463,10 +492,7 @@ class RecorderRunTest( unittest.TestCase ):
         try:
             proc = subprocess.Popen( [ sys.executable, os.path.join(ROOT, "recorder.py"), hls.room_url() ],
                                      cwd=self.cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True )
-            deadline = time.time() + 15
-            while not hls.api_requests and time.time() < deadline:
-                time.sleep( 0.05 )
-            self.assertTrue( hls.api_requests )
+            self.assertTrue( hls.api_arrived.wait( 15 ) )
             sent = time.time()
             proc.send_signal( 2 )
             out, _ = proc.communicate( timeout=30 )
@@ -476,117 +502,57 @@ class RecorderRunTest( unittest.TestCase ):
         self.assertLess( elapsed, 15, out )
         self.assertIn( "Cannot record room: lookup interrupted", out )
 
-class ExtractTest( unittest.TestCase ):
-    # recorder.extract against FakeHls's room API in each of its modes.
+class StopTest( unittest.TestCase ):
+
+    def test_set_wakes_a_registered_waiter( self ):
+        stop = recorder.Stop()
+        stop.waiter = queue.Queue()
+        stop.set()
+        self.assertTrue( stop.is_set() )
+        self.assertIsNone( stop.waiter.get_nowait() )
+
+    def test_set_without_a_waiter_only_sets( self ):
+        stop = recorder.Stop()
+        stop.set()
+        self.assertTrue( stop.is_set() )
+
+class LoadCookiesTest( unittest.TestCase ):
 
     def setUp( self ):
         self.cwd = tempfile.mkdtemp()
         self.addCleanup( shutil.rmtree, self.cwd )
         self.export = os.path.join( self.cwd, "chaturbate.com_cookies.txt" )
+        patcher = mock.patch.object( recorder, "COOKIES_FILE", self.export )
+        patcher.start()
+        self.addCleanup( patcher.stop )
 
-    def extract( self, hls, stop = None ):
-        with mock.patch.object( recorder, "COOKIES_FILE", self.export ), \
-             mock.patch.object( recorder.sys, "stderr", new_callable=lambda: open(os.devnull, "w") ):
-            return recorder.extract( hls.room_url(), stop or recorder.Stop() )
-
-    def extract_mode( self, mode ):
-        hls = FakeHls( api=mode )
-        self.addCleanup( hls.close )
-        return self.extract( hls )
-
-    def test_ok_picks_the_highest_variant_and_its_default_audio( self ):
-        hls = FakeHls()
-        self.addCleanup( hls.close )
-        status, (title, urls, headers) = self.extract( hls )
-        self.assertEqual( status, "ok" )
-        self.assertRegex( title + ".ts", TITLE )
-        self.assertEqual( urls, [ hls.base + "/v/playlist.m3u8", hls.base + "/a/playlist.m3u8" ] )
-        self.assertEqual( headers, { "User-Agent": recorder.USER_AGENT, "Referer": hls.base + "/room/" } )
-        self.assertEqual( hls.api_requests, [ ("room", None) ] )
-
-    def test_room_states_are_unavailable( self ):
-        self.assertEqual( self.extract_mode("offline"), ("unavailable", "ERROR: [Chaturbate] room: Room is currently offline") )
-        self.assertEqual( self.extract_mode("private"), ("unavailable", "ERROR: [Chaturbate] room: Room is currently in a private show") )
-
-    def test_room_state_messages_are_the_ones_streamer_reads( self ):
-        self.assertEqual( set( recorder.ROOM_STATUS_MESSAGES.values() ), set( recorder_streamer.ROOM_STATES ) )
-
-    def test_unknown_room_status_is_an_error( self ):
-        self.assertEqual( self.extract_mode("unknown"),
-                          ("error", 'ERROR: [Chaturbate] room: room API gave no stream for room status "unknown"') )
-
-    def test_network_error_is_an_error( self ):
-        status, reason = self.extract_mode( "neterror" )
-        self.assertEqual( status, "error" )
-        self.assertTrue( reason.startswith("ERROR: [Chaturbate] room: room API request failed: 503"), reason )
-
-    def test_unreadable_response_is_an_error( self ):
-        self.assertEqual( self.extract_mode("garbage"), ("error", "ERROR: [Chaturbate] room: unreadable room API response") )
-
-    def test_error_line_reaches_stderr( self ):
-        hls = FakeHls( api="offline" )
-        self.addCleanup( hls.close )
-        with mock.patch.object( recorder.sys, "stderr", new_callable=lambda: __import__("io").StringIO() ) as err:
-            recorder.extract( hls.room_url(), recorder.Stop() )
-        self.assertEqual( err.getvalue(), "ERROR: [Chaturbate] room: Room is currently offline\n" )
-
-    def test_stop_interrupts_a_hanging_lookup_within_1s( self ):
-        hls = FakeHls( api="hang" )
-        self.addCleanup( hls.close )
-        stop = recorder.Stop()
-        set_at = []
-        def stop_once_requested():
-            while not hls.api_requests:
-                time.sleep( 0.01 )
-            set_at.append( time.time() )
-            stop.set()
-        threading.Thread( target=stop_once_requested, daemon=True ).start()
-        self.assertEqual( self.extract(hls, stop), ("error", "lookup interrupted") )
-        self.assertLess( time.time() - set_at[0], 1 )
-
-    def test_stop_set_before_the_lookup_returns_at_once( self ):
-        hls = FakeHls( api="hang" )
-        self.addCleanup( hls.close )
-        stop = recorder.Stop()
-        stop.set()
-        started = time.time()
-        self.assertEqual( self.extract(hls, stop), ("error", "lookup interrupted") )
-        self.assertLess( time.time() - started, 1 )
-
-    def test_cookies_come_from_the_export_which_is_left_untouched( self ):
-        contents = ( "# Netscape HTTP Cookie File\n"
-                     "#HttpOnly_127.0.0.1\tFALSE\t/\tFALSE\t0\tsessionid\tfrom-browser\n"
-                     "# a comment\n"
-                     "127.0.0.1\tFALSE\t/\tFALSE\t0\tcsrftoken\tcsrf\n"
-                     "malformed line\n" )
-        with open( self.export, "w" ) as f:
-            f.write( contents )
-        hls = FakeHls()
-        self.addCleanup( hls.close )
-        self.assertEqual( self.extract(hls)[0], "ok" )
-        self.assertEqual( sorted( hls.api_requests[0][1].split("; ") ), [ "csrftoken=csrf", "sessionid=from-browser" ] )
-        with open( self.export ) as f:
-            self.assertEqual( f.read(), contents )
-
-    def test_no_export_sends_no_cookies( self ):
-        hls = FakeHls()
-        self.addCleanup( hls.close )
-        self.assertEqual( self.extract(hls)[0], "ok" )
-        self.assertEqual( hls.api_requests, [ ("room", None) ] )
+    def test_no_export_gives_an_empty_jar( self ):
+        self.assertEqual( len(recorder.load_cookies()), 0 )
         self.assertFalse( os.path.exists(self.export) )
 
-    def test_recordurbate_site_replaces_the_room_urls_site( self ):
-        hls = FakeHls()
-        self.addCleanup( hls.close )
-        with mock.patch.dict( os.environ, { "RECORDURBATE_SITE": hls.base } ), \
-             mock.patch.object( recorder, "COOKIES_FILE", self.export ), \
-             mock.patch.object( recorder.sys, "stderr", new_callable=lambda: open(os.devnull, "w") ):
-            status, (_, urls, headers) = recorder.extract( "https://chaturbate.com/room/", recorder.Stop() )
-        self.assertEqual( status, "ok" )
-        self.assertEqual( hls.api_requests, [ ("room", None) ] )
-        self.assertEqual( headers["Referer"], hls.base + "/room/" )
+    def test_reads_cookie_and_httponly_lines_and_skips_comments_and_malformed_lines( self ):
+        contents = ( "# Netscape HTTP Cookie File\n"
+                     "#HttpOnly_.chaturbate.com\tTRUE\t/\tTRUE\t0\tsessionid\tfrom-browser\n"
+                     "# a comment\n"
+                     ".chaturbate.com\tTRUE\t/\tFALSE\t1795000000\tcsrftoken\tcsrf\r\n"
+                     "malformed line\n" )
+        with open( self.export, "w", newline="" ) as f:
+            f.write( contents )
+        jar = recorder.load_cookies()
+        self.assertEqual( sorted( (c.domain, c.path, c.name, c.value) for c in jar ),
+                          [ (".chaturbate.com", "/", "csrftoken", "csrf"), (".chaturbate.com", "/", "sessionid", "from-browser") ] )
+        with open( self.export, newline="" ) as f:
+            self.assertEqual( f.read(), contents )
 
 class ParseMasterTest( unittest.TestCase ):
+
+    BASE = "https://edge27-atl.live.mmcdn.com/v1/edge/streams/origin.room.01ROOMSTREAM00000000000000/llhls.m3u8?token=TOKEN"
+
+    def test_captured_master_gives_the_highest_variant_and_its_groups_default_audio( self ):
+        urls = recorder.parse_master( captured("master.m3u8"), self.BASE )
+        self.assertEqual( [ u.split("?")[0].rsplit("/", 1)[1] for u in urls ],
+                          [ "chunklist_3_video_10000000000000000000_llhls.m3u8", "chunklist_5_audio_10000000000000000000_llhls.m3u8" ] )
+        self.assertTrue( urls[0].startswith("https://edge27-atl.live.mmcdn.com/v1/edge/streams/") )
 
     def test_variant_without_audio_group_gives_one_url( self ):
         text = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nlo.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=2\nhi.m3u8\n"
@@ -598,9 +564,161 @@ class ParseMasterTest( unittest.TestCase ):
                  '#EXT-X-STREAM-INF:BANDWIDTH=5,AUDIO="g"\n/abs/v.m3u8\n' )
         self.assertEqual( recorder.parse_master(text, "http://h/s/master.m3u8"), [ "http://h/abs/v.m3u8", "http://h/s/a1.m3u8" ] )
 
-    def test_missing_audio_group_or_variant_is_none( self ):
+    def test_rendition_without_uri_is_carried_in_the_variant( self ):
+        text = ( '#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="g",DEFAULT=YES,NAME="in-band"\n'
+                 '#EXT-X-STREAM-INF:BANDWIDTH=5,AUDIO="g"\nv.m3u8\n' )
+        self.assertEqual( recorder.parse_master(text, "http://h/s/master.m3u8"), [ "http://h/s/v.m3u8" ] )
+
+    def test_undeclared_audio_group_or_no_variant_is_none( self ):
         self.assertIsNone( recorder.parse_master('#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=5,AUDIO="g"\nv.m3u8\n', "http://h/") )
-        self.assertIsNone( recorder.parse_master("#EXTM3U\n", "http://h/") )
+        self.assertIsNone( recorder.parse_master(captured("master.m3u8").split("#EXT-X-STREAM-INF")[0], "http://h/") )
+
+class LookupTest( unittest.TestCase ):
+    # recorder.lookup with a real requests.Session against FakeHls serving the
+    # site's captured answers.
+
+    def setUp( self ):
+        self.cwd = tempfile.mkdtemp()
+        self.addCleanup( shutil.rmtree, self.cwd )
+        patcher = mock.patch.object( recorder, "COOKIES_FILE", os.path.join(self.cwd, "chaturbate.com_cookies.txt") )
+        patcher.start()
+        self.addCleanup( patcher.stop )
+
+    def lookup( self, **modes ):
+        hls = FakeHls( **modes )
+        self.addCleanup( hls.close )
+        with requests.Session() as session:
+            return hls, recorder.lookup( hls.room_url(), session )
+
+    def test_public_room_resolves_to_its_video_and_audio( self ):
+        hls, (status, (title, urls, headers)) = self.lookup()
+        self.assertEqual( status, "ok" )
+        self.assertRegex( title + ".ts", TITLE )
+        self.assertEqual( urls, [ hls.stream_url("video"), hls.stream_url("audio") ] )
+        self.assertEqual( headers, { "User-Agent": recorder.USER_AGENT, "Referer": hls.base + "/room/" } )
+        self.assertEqual( hls.api_requests, [ ("room", None) ] )
+
+    def test_room_states_are_unavailable( self ):
+        self.assertEqual( self.lookup(api="offline")[1], ("unavailable", "ERROR: [Chaturbate] room: Room is currently offline") )
+        self.assertEqual( self.lookup(api="hidden")[1], ("unavailable", "ERROR: [Chaturbate] room: Hidden session in progress") )
+
+    def test_unknown_room_status_is_an_error( self ):
+        self.assertEqual( self.lookup(api="unknown")[1],
+                          ("error", 'ERROR: [Chaturbate] room: room API gave no stream for room status "unknown"') )
+
+    def test_failed_api_request_is_an_error( self ):
+        status, reason = self.lookup( api="neterror" )[1]
+        self.assertEqual( status, "error" )
+        self.assertTrue( reason.startswith("ERROR: [Chaturbate] room: room API request failed: 503"), reason )
+
+    def test_unreadable_or_non_object_answer_is_an_error( self ):
+        self.assertEqual( self.lookup(api="garbage")[1], ("error", "ERROR: [Chaturbate] room: unreadable room API response") )
+        self.assertEqual( self.lookup(api="list")[1], ("error", "ERROR: [Chaturbate] room: unreadable room API response") )
+
+    def test_failed_master_request_is_an_error( self ):
+        status, reason = self.lookup( master="neterror" )[1]
+        self.assertEqual( status, "error" )
+        self.assertTrue( reason.startswith("ERROR: [Chaturbate] room: master playlist request failed: 503"), reason )
+
+    def test_master_without_variant_is_an_error( self ):
+        self.assertEqual( self.lookup(master="empty")[1], ("error", "ERROR: [Chaturbate] room: master playlist has no usable variant") )
+
+    def test_cookies_come_from_the_export_which_is_left_untouched( self ):
+        contents = ( "# Netscape HTTP Cookie File\n"
+                     "#HttpOnly_127.0.0.1\tFALSE\t/\tFALSE\t0\tsessionid\tfrom-browser\n"
+                     "127.0.0.1\tFALSE\t/\tFALSE\t0\tcsrftoken\tcsrf\n" )
+        with open( recorder.COOKIES_FILE, "w" ) as f:
+            f.write( contents )
+        hls, (status, _) = self.lookup()
+        self.assertEqual( status, "ok" )
+        self.assertEqual( sorted( hls.api_requests[0][1].split("; ") ), [ "csrftoken=csrf", "sessionid=from-browser" ] )
+        with open( recorder.COOKIES_FILE ) as f:
+            self.assertEqual( f.read(), contents )
+
+    def test_recordurbate_site_replaces_the_room_urls_site( self ):
+        hls = FakeHls()
+        self.addCleanup( hls.close )
+        with mock.patch.dict( os.environ, { "RECORDURBATE_SITE": hls.base } ), requests.Session() as session:
+            status, (_, _, headers) = recorder.lookup( "https://chaturbate.com/room/", session )
+        self.assertEqual( status, "ok" )
+        self.assertEqual( hls.api_requests, [ ("room", None) ] )
+        self.assertEqual( headers["Referer"], hls.base + "/room/" )
+
+    def test_room_status_messages_are_the_ones_streamer_reads( self ):
+        self.assertEqual( set( recorder.ROOM_STATUS_MESSAGES.values() ), set( recorder_streamer.ROOM_STATES ) )
+
+class ExtractTest( unittest.TestCase ):
+    # recorder.extract: its worker thread, its wait on stop, and its stderr.
+
+    def setUp( self ):
+        self.cwd = tempfile.mkdtemp()
+        self.addCleanup( shutil.rmtree, self.cwd )
+        patcher = mock.patch.object( recorder, "COOKIES_FILE", os.path.join(self.cwd, "chaturbate.com_cookies.txt") )
+        patcher.start()
+        self.addCleanup( patcher.stop )
+        self.stderr = io.StringIO()
+        patcher = mock.patch.object( recorder.sys, "stderr", self.stderr )
+        patcher.start()
+        self.addCleanup( patcher.stop )
+
+    def fake( self, **modes ):
+        hls = FakeHls( **modes )
+        self.addCleanup( hls.close )
+        return hls
+
+    def test_ok_returns_the_lookup_and_writes_nothing( self ):
+        hls = self.fake()
+        status, (_, urls, _) = recorder.extract( hls.room_url(), recorder.Stop() )
+        self.assertEqual( status, "ok" )
+        self.assertEqual( urls, [ hls.stream_url("video"), hls.stream_url("audio") ] )
+        self.assertEqual( self.stderr.getvalue(), "" )
+
+    def test_failure_writes_its_error_line_to_stderr( self ):
+        hls = self.fake( api="offline" )
+        self.assertEqual( recorder.extract( hls.room_url(), recorder.Stop() ),
+                          ("unavailable", "ERROR: [Chaturbate] room: Room is currently offline") )
+        self.assertEqual( self.stderr.getvalue(), "ERROR: [Chaturbate] room: Room is currently offline\n" )
+
+    def test_fail_after_first_answers_then_fails( self ):
+        hls = self.fake( api="fail-after-first" )
+        self.assertEqual( recorder.extract( hls.room_url(), recorder.Stop() )[0], "ok" )
+        status, reason = recorder.extract( hls.room_url(), recorder.Stop() )
+        self.assertEqual( status, "error" )
+        self.assertTrue( reason.startswith("ERROR: [Chaturbate] room: room API request failed: 503"), reason )
+
+    def test_lookup_raising_is_an_error_line( self ):
+        with mock.patch.object( recorder, "lookup", side_effect=RuntimeError("boom") ):
+            self.assertEqual( recorder.extract( "https://chaturbate.com/room/", recorder.Stop() ),
+                              ("error", "ERROR: [Chaturbate] lookup failed: RuntimeError('boom')") )
+        self.assertEqual( self.stderr.getvalue(), "ERROR: [Chaturbate] lookup failed: RuntimeError('boom')\n" )
+
+    def test_stop_during_a_hung_request_returns_within_1s( self ):
+        hls = self.fake( api="hang" )
+        stop = recorder.Stop()
+        set_at = []
+        def stop_once_requested():
+            hls.api_arrived.wait()
+            set_at.append( time.time() )
+            stop.set()
+        threading.Thread( target=stop_once_requested, daemon=True ).start()
+        self.assertEqual( recorder.extract( hls.room_url(), stop ), ("error", "lookup interrupted") )
+        self.assertLess( time.time() - set_at[0], 1 )
+        self.assertIsNone( stop.waiter )
+
+    def test_stop_set_before_the_lookup_returns_at_once( self ):
+        hls = self.fake( api="hang" )
+        stop = recorder.Stop()
+        stop.set()
+        self.assertEqual( recorder.extract( hls.room_url(), stop ), ("error", "lookup interrupted") )
+        self.assertEqual( hls.api_requests, [] )
+
+    def test_stop_set_as_the_answer_arrives_is_interrupted( self ):
+        stop = recorder.Stop()
+        def answer_then_stop( url, session ):
+            stop.set()
+            return ( "ok", ("room 2026-01-01 00_00", [], {}) )
+        with mock.patch.object( recorder, "lookup", answer_then_stop ):
+            self.assertEqual( recorder.extract( "https://chaturbate.com/room/", stop ), ("error", "lookup interrupted") )
 
 class RunTest( unittest.TestCase ):
     # recorder.run in-process with main replaced, so only run's own routes run.

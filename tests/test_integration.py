@@ -244,10 +244,7 @@ class RecorderStopTest( RoomDir ):
         recorder = subprocess.Popen( [ sys.executable, "recorder.py", "https://chaturbate.com/room/" ],
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True )
         try:
-            deadline = time.time() + 30
-            while not self.hls.api_requests and time.time() < deadline:
-                time.sleep( 0.05 )
-            self.assertTrue( self.hls.api_requests )
+            self.assertTrue( self.hls.api_arrived.wait( 30 ) )
             self.assertEqual( recorded_recorder("room"), recorder.pid )
             recorder.send_signal( signal.SIGTERM )
             out, _ = recorder.communicate( timeout=15 )

@@ -1,13 +1,11 @@
-import http.server
-import json
 import os
-import threading
 import types
 
 import pytest
 
 import streamer
 from streamer import Streamer
+from test_recorder import FakeHls
 
 
 class FakeLogger:
@@ -41,7 +39,7 @@ def workdir(tmp_path, monkeypatch):
 
 # wiring into Streamer.start
 
-# What recorder.py logs once yt-dlp has resolved the room.
+# What recorder.py logs once its lookup has resolved the room.
 READY_LINE = "[recorder 2026-10-01 12:00:00] Recording alice to videos/alice/alice 2026-10-01 12_00.ts\n"
 
 class FakeProc:
@@ -155,7 +153,7 @@ def test_start_does_not_validate_when_recorder_exits_before_ready(start_harness,
 
 def test_start_does_not_record_when_launch_fails(start_harness, monkeypatch):
     def failing_popen(*args, **kwargs):
-        raise OSError("no yt-dlp")
+        raise OSError("no recorder.py")
 
     monkeypatch.setattr(streamer.subprocess, "Popen", failing_popen)
     monkeypatch.setattr(Streamer, "ensure_valid_stream", validation_returning(start_harness, True))
@@ -213,8 +211,8 @@ def test_any_other_error_is_reported_as_not_reaching_the_site(start_harness, err
     assert daemon.launches == [error]
 
 
-def test_last_error_decides_when_ytdlp_warned_first(start_harness):
-    # yt-dlp falls back to the webpage when its API call fails
+def test_last_error_decides_when_a_warning_came_first(start_harness):
+    # a recorder that printed a warning before its error
     start_harness["proc_factory"] = ExitedProc
     start_harness["output"] = (
         "WARNING: [Chaturbate] alice: Unable to download JSON metadata: curl: (60)\n"
@@ -278,25 +276,12 @@ def test_stop_during_launch_reports_nothing(start_harness, monkeypatch):
 
 
 def test_real_process_output_is_read_back_from_the_capture_log(workdir, monkeypatch):
-    # The real recorder.py looks the room up on a stand-in site, and the
-    # ERROR: line it writes must reach the capture log through the recorder.
+    # The real recorder.py looks the room up on FakeHls, which answers with an
+    # unknown room status, and the ERROR: line it writes must reach the
+    # capture log through the recorder.
     error = 'ERROR: [Chaturbate] alice: room API gave no stream for room status "unknown"'
-
-    class Site(http.server.BaseHTTPRequestHandler):
-        def log_message(self, *args):
-            pass
-
-        def do_POST(self):
-            self.rfile.read(int(self.headers.get("Content-Length") or 0))
-            body = json.dumps({"url": "", "room_status": "unknown"}).encode()
-            self.send_response(200)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-    site = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Site)
-    threading.Thread(target=site.serve_forever, daemon=True).start()
-    monkeypatch.setenv("RECORDURBATE_SITE", "http://127.0.0.1:{}".format(site.server_address[1]))
+    hls = FakeHls(api="unknown")
+    monkeypatch.setenv("RECORDURBATE_SITE", hls.base)
     (workdir / "configs").mkdir()
     (workdir / "configs/capture-alice.log").write_text("ERROR: [Chaturbate] alice: Room is currently offline\n")
     (workdir / "configs/config.json").write_text("{}")
@@ -307,7 +292,7 @@ def test_real_process_output_is_read_back_from_the_capture_log(workdir, monkeypa
     try:
         run_start(Streamer(daemon, "alice"))
     finally:
-        site.shutdown()
+        hls.close()
 
     assert daemon.launches == [error]
 
@@ -323,7 +308,7 @@ def on_readiness_wait(monkeypatch, action):
 
 
 def slow_lookup(output, exit_code, monkeypatch):
-    # A recorder whose yt-dlp lookup finishes once Streamer is waiting for it,
+    # A recorder whose lookup finishes once Streamer is waiting for it,
     # while Streamer is in its readiness wait: it writes output to the capture log, then
     # signals ready when exit_code is None, or exits with exit_code.
     class SlowLookup(FakeProc):

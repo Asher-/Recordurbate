@@ -32,7 +32,6 @@ SEGMENT_TRIES = 3
 REEXTRACT_AFTER = 15     # seconds without every playlist loading before asking the site for fresh URLs
 GIVE_UP_AFTER = 120      # seconds without a new segment before exiting
 LOOKUP_TIMEOUT = (3, 5)  # connect, read, for each request of a room lookup
-LOOKUP_POLL = 0.1        # seconds between checks of stop while a lookup runs
 CLOSE_TIMEOUT = 3        # seconds each muxer shutdown phase may take
 COOKIES_FILE = "chaturbate.com_cookies.txt"  # the user's browser export; read, never written
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -59,8 +58,15 @@ def signal_ready( fd ):
     os.close( fd )
 
 class Stop( threading.Event ):
-    # Set on SIGINT or SIGTERM.
-    pass
+    # Set on SIGINT or SIGTERM. Setting it also wakes a lookup waiting in
+    # extract, through the queue that lookup registered as waiter.
+    waiter = None
+
+    def set( self ):
+        super().set()
+        waiter = self.waiter
+        if waiter is not None:
+            waiter.put( None )
 
 def load_cookies():
     # The user's browser export, read and never written. Lines marked
@@ -84,8 +90,10 @@ def load_cookies():
 
 def parse_master( text, base ):
     # The highest-BANDWIDTH variant's playlist URL and, when the variant names
-    # an audio group, that group's DEFAULT=YES rendition (else its first).
-    # None when the playlist has no usable variant.
+    # an audio group, that group's DEFAULT=YES rendition (else its first); a
+    # rendition with no URI is carried in the variant itself, so the variant
+    # is the only URL. None when the playlist has no usable variant or names
+    # an audio group it does not declare.
     lines = text.splitlines()
     audio = {}
     best = None
@@ -93,8 +101,8 @@ def parse_master( text, base ):
         if line.startswith( "#EXT-X-MEDIA:" ) and "TYPE=AUDIO" in line:
             group = re.search( r'GROUP-ID="([^"]+)"', line )
             uri = re.search( r'URI="([^"]+)"', line )
-            if group and uri:
-                audio.setdefault( group.group(1), [] ).append( ("DEFAULT=YES" in line, uri.group(1)) )
+            if group:
+                audio.setdefault( group.group(1), [] ).append( ("DEFAULT=YES" in line, uri.group(1) if uri else None) )
         elif line.startswith( "#EXT-X-STREAM-INF:" ):
             bandwidth = re.search( r'[:,]BANDWIDTH=(\d+)', line )
             group = re.search( r'AUDIO="([^"]+)"', line )
@@ -109,13 +117,15 @@ def parse_master( text, base ):
         if not renditions:
             return None
         defaults = [ uri for default, uri in renditions if default ]
-        urls.append( urljoin(base, defaults[0] if defaults else renditions[0][1]) )
+        chosen = defaults[0] if defaults else renditions[0][1]
+        if chosen is not None:
+            urls.append( urljoin(base, chosen) )
     return urls
 
-def lookup( url ):
-    # One edge-API request for the room and, when it is live, one request for
-    # its master playlist. Returns ("ok", (title, urls, headers)),
-    # ("unavailable", line) when the site names a room state, or
+def lookup( url, session ):
+    # One edge-API request for the room through session and, when it is live,
+    # one request for its master playlist. Returns ("ok", (title, urls,
+    # headers)), ("unavailable", line) when the site names a room state, or
     # ("error", line); each line is an "ERROR: [Chaturbate] <room>: ..." line.
     parts = urlsplit( url )
     room = parts.path.strip( "/" ).split( "/" )[0]
@@ -124,59 +134,63 @@ def lookup( url ):
     headers = { "User-Agent": USER_AGENT, "Referer": "{}/{}/".format(site, room) }
     def line( message ):
         return "ERROR: [Chaturbate] {}: {}".format( room, message )
-    with requests.Session() as session:
-        try:
-            response = session.post( site + "/get_edge_hls_url_ajax/", data={ "room_slug": room },
-                                     headers=dict( headers, **{ "X-Requested-With": "XMLHttpRequest", "Accept": "application/json" } ),
-                                     cookies=load_cookies(), timeout=LOOKUP_TIMEOUT )
-            response.raise_for_status()
-            info = response.json()
-        except ValueError:
-            return "error", line( "unreadable room API response" )
-        except requests.RequestException as e:
-            return "error", line( "room API request failed: {}".format(e) )
-        if not isinstance( info, dict ):
-            return "error", line( "unreadable room API response" )
-        stream = info.get( "url" )
-        if not stream:
-            status = info.get( "room_status" )
-            if status in ROOM_STATUS_MESSAGES:
-                return "unavailable", line( ROOM_STATUS_MESSAGES[status] )
-            return "error", line( 'room API gave no stream for room status "{}"'.format(status) )
-        try:
-            master = session.get( stream, headers=headers, timeout=LOOKUP_TIMEOUT )
-            master.raise_for_status()
-        except requests.RequestException as e:
-            return "error", line( "master playlist request failed: {}".format(e) )
-        urls = parse_master( master.text, master.url )
-        if urls is None:
-            return "error", line( "master playlist has no usable variant" )
+    try:
+        response = session.post( site + "/get_edge_hls_url_ajax/", data={ "room_slug": room },
+                                 headers=dict( headers, **{ "X-Requested-With": "XMLHttpRequest", "Accept": "application/json" } ),
+                                 cookies=load_cookies(), timeout=LOOKUP_TIMEOUT )
+        response.raise_for_status()
+    except requests.RequestException as e:
+        return "error", line( "room API request failed: {}".format(e) )
+    try:
+        info = response.json()
+    except ValueError:
+        return "error", line( "unreadable room API response" )
+    if not isinstance( info, dict ):
+        return "error", line( "unreadable room API response" )
+    stream = info.get( "url" )
+    if not stream:
+        status = info.get( "room_status" )
+        if status in ROOM_STATUS_MESSAGES:
+            return "unavailable", line( ROOM_STATUS_MESSAGES[status] )
+        return "error", line( 'room API gave no stream for room status "{}"'.format(status) )
+    try:
+        master = session.get( stream, headers=headers, timeout=LOOKUP_TIMEOUT )
+        master.raise_for_status()
+    except requests.RequestException as e:
+        return "error", line( "master playlist request failed: {}".format(e) )
+    urls = parse_master( master.text, master.url )
+    if urls is None:
+        return "error", line( "master playlist has no usable variant" )
     title = "{} {}".format( room, time.strftime("%Y-%m-%d %H_%M") )
     return "ok", (title, urls, headers)
 
 def extract( url, stop ):
-    # Resolves the room through the site's edge API in a worker thread, so a
-    # set stop returns ("error", "lookup interrupted") within LOOKUP_POLL
-    # seconds. Returns lookup's result otherwise, writing its ERROR: line to
-    # stderr, which the daemon appends to the capture log for
+    # Resolves the room through lookup on a worker thread and blocks until the
+    # lookup answers or stop is set: Stop.set puts None on the queue this call
+    # registers as stop's waiter. A stopped lookup returns ("error",
+    # "lookup interrupted") at once; its worker is a daemon thread that ends
+    # when its request times out (LOOKUP_TIMEOUT), and stop is set only as the
+    # recorder exits. Otherwise returns lookup's result, writing its ERROR:
+    # line to stderr, which the daemon appends to the capture log for
     # Streamer.launch_error.
     results = queue.Queue()
-    def work():
-        try:
-            results.put( lookup(url) )
-        except Exception as e:
-            results.put( ("error", "ERROR: [Chaturbate] lookup failed: {!r}".format(e)) )
-    threading.Thread( target=work, daemon=True ).start()
-    while True:
+    stop.waiter = results
+    try:
         if stop.is_set():
             return "error", "lookup interrupted"
-        try:
-            status, result = results.get( timeout=LOOKUP_POLL )
-            break
-        except queue.Empty:
-            pass
-    if stop.is_set():
+        def work():
+            try:
+                with requests.Session() as session:
+                    results.put( lookup(url, session) )
+            except Exception as e:
+                results.put( ("error", "ERROR: [Chaturbate] lookup failed: {!r}".format(e)) )
+        threading.Thread( target=work, daemon=True ).start()
+        answer = results.get()
+    finally:
+        stop.waiter = None
+    if answer is None or stop.is_set():
         return "error", "lookup interrupted"
+    status, result = answer
     if status != "ok":
         sys.stderr.write( result + "\n" )
         sys.stderr.flush()

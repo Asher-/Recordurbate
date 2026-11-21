@@ -355,8 +355,11 @@ Chaturbate serves LL-HLS with video and audio as separate fMP4 playlists of
 | SIGINT / SIGTERM                                      | Stop between fetch attempts, close the muxer and exit              |
 
 The main thread only takes SIGINT and SIGTERM; the recording runs on a worker
-thread. A signal sets a `Stop` event. A lookup runs its requests on its own
-thread and checks `Stop` every 0.1s, so a set `Stop` ends it at once. The
+thread. A signal sets a `Stop` event. A lookup runs its requests on a daemon
+worker thread and blocks on a queue that it registers on `Stop`; setting
+`Stop` puts a wake-up on that queue, so the lookup returns `lookup interrupted`
+at once. The abandoned worker ends when its request times out, and `Stop` is
+set only as the recorder exits. The recording
 worker checks `Stop` before every playlist, init and segment fetch attempt.
 Closing the muxer gives ffmpeg 3s to drain its inputs and 3s to exit before
 it is killed.
@@ -576,7 +579,7 @@ as an extra argument (`pass_fds`), closing its own copy after `Popen`.
 `recorder.py` writes `ready` to it right after logging `Recording <name> to
 <path>`, then closes it; until then it may still exit reporting a room state.
 `recorder_ready()` waits once in `select()` on the read end for up to
-`READY_TIMEOUT` (90s, above the longest `recorder.py` lookup): data means
+`READY_TIMEOUT` (90s): data means
 ready, and end of file means the recorder exited first, including when
 `stop()` terminated it. After a handoff the write fails with a closed pipe,
 which `recorder.py` ignores.
