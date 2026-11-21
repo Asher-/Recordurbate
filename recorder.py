@@ -20,6 +20,8 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin, urlsplit
 
 import requests
@@ -29,6 +31,7 @@ from pid import record_recorder, forget_recorder
 POLL_INTERVAL = 1.0      # seconds between playlist reloads
 HTTP_TIMEOUT = (3, 5)    # connect, read
 SEGMENT_TRIES = 3
+FETCH_WORKERS = 8        # segment fetches in flight at once, across all tracks
 REEXTRACT_AFTER = 15     # seconds without every playlist loading before asking the site for fresh URLs
 GIVE_UP_AFTER = 120      # seconds without a new segment before exiting
 LOOKUP_TIMEOUT = (3, 5)  # connect, read, for each request of a room lookup
@@ -248,6 +251,24 @@ class Track:
         self.next_sequence = None
         self.init = None
         self.segments = []
+        # (sequence, future of fetch's result) in sequence order, not yet fed
+        self.pending = deque()
+
+def feed_fetched( tracks, muxer, wait = False ):
+    # Feeds each track's fetched segments to muxer in sequence order, stopping
+    # at the first still in flight unless wait is set. Returns whether any
+    # segment was fed.
+    fed = False
+    for index, track in enumerate( tracks ):
+        while track.pending and ( wait or track.pending[0][1].done() ):
+            sequence, future = track.pending.popleft()
+            data, reason = future.result()
+            if data is None:
+                log( "Track {} segment {} failed: {}".format(index, sequence, reason) )
+                continue
+            muxer.feed( index, data )
+            fed = True
+    return fed
 
 class Muxer:
     # A local ffmpeg reading one fMP4 input per track from pipes and writing
@@ -369,6 +390,10 @@ def main( url, ready_fd, stop, outcome ):
     session.headers.update( headers )
     tracks = [ Track(u) for u in urls ]
     muxer = None
+    # Segments are fetched on the pool as soon as a playlist lists them, so a
+    # slow fetch holds up neither the next playlist reload nor the other
+    # track; the window is a few seconds long.
+    pool = ThreadPoolExecutor( FETCH_WORKERS )
     now = time.time()
     last_full_load = now
     last_extract = now
@@ -420,21 +445,16 @@ def main( url, ready_fd, stop, outcome ):
             if muxer:
                 for index, track in enumerate( tracks ):
                     for sequence, uri in track.segments:
-                        if stop.is_set():
-                            break
                         if track.next_sequence is None:
                             track.next_sequence = sequence
                         if sequence < track.next_sequence:
                             continue
                         if sequence > track.next_sequence:
                             log( "Track {} lost segments {}-{}: gone from the playlist before they could be fetched".format(index, track.next_sequence, sequence - 1) )
-                        data, reason = fetch( session, urljoin(track.url, uri), stop=stop )
+                        track.pending.append( ( sequence, pool.submit( fetch, session, urljoin(track.url, uri), stop=stop ) ) )
                         track.next_sequence = sequence + 1
-                        if data is None:
-                            log( "Track {} segment {} failed: {}".format(index, sequence, reason) )
-                            continue
-                        muxer.feed( index, data )
-                        last_segment = time.time()
+                if feed_fetched( tracks, muxer ):
+                    last_segment = time.time()
 
             if stop.is_set():
                 break
@@ -469,6 +489,11 @@ def main( url, ready_fd, stop, outcome ):
 
             stop.wait( max( 0, POLL_INTERVAL - (time.time() - started) ) )
     finally:
+        # A stream that ended or went quiet keeps the segments still in
+        # flight; a stopped recorder does not wait for them.
+        if muxer and not stop.is_set():
+            feed_fetched( tracks, muxer, wait=True )
+        pool.shutdown( wait=False, cancel_futures=True )
         if muxer:
             muxer.close()
         if os.path.exists( path ) and os.path.getsize( path ) == 0:

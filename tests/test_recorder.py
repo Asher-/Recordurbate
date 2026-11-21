@@ -216,12 +216,14 @@ class FakeHls:
 
     FIRST = 100
 
-    def __init__( self, failing = (), outage = None, hang = False ):
+    def __init__( self, failing = (), outage = None, hang = False, slow = 0 ):
         # outage=(start, end) answers 503 to everything in that window of
-        # seconds; hang=True never answers a media segment.
+        # seconds; hang=True never answers a media segment; slow delays each
+        # media segment's answer by that many seconds.
         self.failing = set( failing )
         self.outage = outage
         self.hang = hang
+        self.slow = slow
         self.started = time.time()
         # set once two media segments of each track have been served: the
         # recorder fetches a track in order, so its first has reached the muxer
@@ -251,6 +253,8 @@ class FakeHls:
         if self.hang and name.startswith("seg_"):
             time.sleep( 30 )
             return
+        if self.slow and name.startswith("seg_"):
+            time.sleep( self.slow )
         init, fragments = self.track( letter )
         if name == "playlist.m3u8":
             available = min( len(fragments), int(time.time() - self.started) + 1 )
@@ -440,6 +444,20 @@ class RecorderRunTest( unittest.TestCase ):
         self.assertEqual( codecs, [ "aac", "h264" ] )
         self.assertEqual( container, "mpegts" )
         self.assertGreater( duration, 4 )
+
+    def test_slow_segments_are_all_recorded( self ):
+        # Each media segment takes 0.8s to answer while each track gains one
+        # a second and the window holds three: fetched one after another the
+        # two tracks need 1.6s a second and fall out of the window.
+        hls = fake_site( slow=0.8 )
+        try:
+            result = self.run_recorder( hls, timeout=60 )
+        finally:
+            hls.close()
+        self.assertEqual( result.returncode, 0, result.stdout )
+        self.assertIn( "Stream ended", result.stdout )
+        self.assertNotIn( "lost segments", result.stdout )
+        self.recording()
 
     def test_offline_room_exits_with_its_room_state( self ):
         hls = fake_site( api="offline" )
