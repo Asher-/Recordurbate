@@ -216,14 +216,18 @@ class FakeHls:
 
     FIRST = 100
 
-    def __init__( self, failing = (), outage = None, hang = False, slow = 0 ):
+    def __init__( self, failing = (), outage = None, hang = False, slow = 0, stall = None, repeat = () ):
         # outage=(start, end) answers 503 to everything in that window of
         # seconds; hang=True never answers a media segment; slow delays each
-        # media segment's answer by that many seconds.
+        # media segment's answer by that many seconds; stall=(start, end)
+        # holds every playlist request arriving in that window until its end;
+        # a segment in `repeat` answers with the bytes of the one before it.
         self.failing = set( failing )
         self.outage = outage
         self.hang = hang
         self.slow = slow
+        self.stall = stall
+        self.repeat = set( repeat )
         self.started = time.time()
         # set once two media segments of each track have been served: the
         # recorder fetches a track in order, so its first has reached the muxer
@@ -256,6 +260,8 @@ class FakeHls:
         if self.slow and name.startswith("seg_"):
             time.sleep( self.slow )
         init, fragments = self.track( letter )
+        if name == "playlist.m3u8" and self.stall and self.stall[0] <= elapsed < self.stall[1]:
+            time.sleep( self.stall[1] - elapsed )
         if name == "playlist.m3u8":
             available = min( len(fragments), int(time.time() - self.started) + 1 )
             first = max( 0, available - 3 )
@@ -274,6 +280,8 @@ class FakeHls:
                 request.send_response( 500 )
                 request.end_headers()
                 return
+            if (letter, sequence) in self.repeat:
+                sequence -= 1
             body = fragments[ sequence - self.FIRST ]
         request.send_response( 200 )
         request.send_header( "Content-Length", str(len(body)) )
@@ -459,6 +467,35 @@ class RecorderRunTest( unittest.TestCase ):
         self.assertNotIn( "lost segments", result.stdout )
         self.recording()
 
+    def test_stalled_playlists_lose_no_segment( self ):
+        # Every playlist request from 2s to 6s is held until 6s, longer than
+        # the three-segment window: the segments that left the playlist
+        # meanwhile are fetched directly.
+        hls = fake_site( stall=(2, 6) )
+        try:
+            result = self.run_recorder( hls, timeout=60 )
+        finally:
+            hls.close()
+        self.assertEqual( result.returncode, 0, result.stdout )
+        self.assertIn( "Stream ended", result.stdout )
+        self.assertIn( "fetching them directly", result.stdout )
+        self.assertNotIn( "lost segments", result.stdout )
+        self.assertNotIn( "failed", result.stdout )
+        self.recording()
+
+    def test_a_segment_repeating_the_one_before_is_dropped( self ):
+        hls = fake_site( repeat=[ ("v", 103) ] )
+        try:
+            result = self.run_recorder( hls )
+        finally:
+            hls.close()
+        self.assertEqual( result.returncode, 0, result.stdout )
+        self.assertIn( "Track 0 segment 103 repeats the segment before it; dropped", result.stdout )
+        self.assertNotIn( "Track 1 segment 103 repeats", result.stdout )
+        self.assertIn( "Stream ended", result.stdout )
+        codecs, container, duration = probe( self.recording() )
+        self.assertEqual( codecs, [ "aac", "h264" ] )
+
     def test_offline_room_exits_with_its_room_state( self ):
         hls = fake_site( api="offline" )
         try:
@@ -557,6 +594,22 @@ class RecorderRunTest( unittest.TestCase ):
             hls.close()
         self.assertLess( elapsed, 15, out )
         self.assertIn( "Cannot record room: lookup interrupted", out )
+
+class SiblingUriTest( unittest.TestCase ):
+
+    def test_replaces_the_sequence_in_the_file_name( self ):
+        uri = "/v1/edge/streams/origin.room.01M7X/seg_3_4533_video_8910694399301777647_llhls.m4s?session=62e3"
+        self.assertEqual( recorder.sibling_uri( uri, 4533, 4530 ),
+                          "/v1/edge/streams/origin.room.01M7X/seg_3_4530_video_8910694399301777647_llhls.m4s?session=62e3" )
+
+    def test_absolute_uri_and_plain_name( self ):
+        self.assertEqual( recorder.sibling_uri( "http://127.0.0.1:1/v/seg_105.m4s", 105, 103 ),
+                          "http://127.0.0.1:1/v/seg_103.m4s" )
+
+    def test_sequence_not_held_exactly_once_is_none( self ):
+        self.assertIsNone( recorder.sibling_uri( "/s/seg_7.m4s", 8, 6 ) )
+        self.assertIsNone( recorder.sibling_uri( "/s/seg_7_7.m4s", 7, 6 ) )
+        self.assertIsNone( recorder.sibling_uri( "/s/7/seg.m4s?n=7", 7, 6 ) )
 
 class StopTest( unittest.TestCase ):
 

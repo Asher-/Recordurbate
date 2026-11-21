@@ -12,6 +12,7 @@ recording carries on in the same file across gaps, reconnects and fresh
 stream URLs. It exits when the site reports the room unavailable, when no
 segment arrives for GIVE_UP_AFTER seconds, or on SIGINT/SIGTERM.
 """
+import hashlib
 import os
 import queue
 import re
@@ -32,6 +33,9 @@ POLL_INTERVAL = 1.0      # seconds between playlist reloads
 HTTP_TIMEOUT = (3, 5)    # connect, read
 SEGMENT_TRIES = 3
 FETCH_WORKERS = 8        # segment fetches in flight at once, across all tracks
+PLAYLIST_TIMEOUT = (3, 1.5)  # connect, read: a playlist is a few KB and answers in ~0.05s
+PLAYLIST_TRIES = 3
+BACKFILL_LIMIT = 10      # most segments fetched directly after a gap; the CDN keeps one ~10s past the window
 REEXTRACT_AFTER = 15     # seconds without every playlist loading before asking the site for fresh URLs
 GIVE_UP_AFTER = 120      # seconds without a new segment before exiting
 LOOKUP_TIMEOUT = (3, 5)  # connect, read, for each request of a room lookup
@@ -221,7 +225,19 @@ def parse_playlist( text ):
             after_extinf = False
     return [ (sequence + i, uri) for i, uri in enumerate(uris) ], init_uri, ended
 
-def fetch( session, url, tries = SEGMENT_TRIES, stop = None ):
+def sibling_uri( uri, sequence, wanted ):
+    # The URI of segment `wanted` of the track whose segment `sequence` is at
+    # uri: the one run of digits in uri's file name that is sequence, replaced
+    # by wanted. None when the file name does not hold sequence exactly once.
+    path, mark, query = uri.partition( "?" )
+    head, slash, name = path.rpartition( "/" )
+    runs = [ m for m in re.finditer( r"\d+", name ) if m.group() == str(sequence) ]
+    if len( runs ) != 1:
+        return None
+    run = runs[0]
+    return head + slash + name[:run.start()] + str(wanted) + name[run.end():] + mark + query
+
+def fetch( session, url, tries = SEGMENT_TRIES, stop = None, timeout = HTTP_TIMEOUT ):
     # Returns (bytes, None) or (None, reason). 403, 404 and 410 end the
     # attempts at once; a set stop event ends them before the next attempt.
     reason = None
@@ -229,7 +245,7 @@ def fetch( session, url, tries = SEGMENT_TRIES, stop = None ):
         if stop is not None and stop.is_set():
             return None, reason or "stopped"
         try:
-            response = session.get( url, timeout=HTTP_TIMEOUT )
+            response = session.get( url, timeout=timeout )
             if response.status_code == 200:
                 return response.content, None
             reason = "HTTP {}".format( response.status_code )
@@ -250,7 +266,10 @@ class Track:
         self.url = url
         self.next_sequence = None
         self.init = None
+        self.init_uri = None
         self.segments = []
+        # digest of the last segment fed, to drop one that repeats it
+        self.last_digest = None
         # (sequence, future of fetch's result) in sequence order, not yet fed
         self.pending = deque()
 
@@ -266,6 +285,11 @@ def feed_fetched( tracks, muxer, wait = False ):
             if data is None:
                 log( "Track {} segment {} failed: {}".format(index, sequence, reason) )
                 continue
+            digest = hashlib.sha256( data ).digest()
+            if digest == track.last_digest:
+                log( "Track {} segment {} repeats the segment before it; dropped".format(index, sequence) )
+                continue
+            track.last_digest = digest
             muxer.feed( index, data )
             fed = True
     return fed
@@ -394,6 +418,9 @@ def main( url, ready_fd, stop, outcome ):
     # slow fetch holds up neither the next playlist reload nor the other
     # track; the window is a few seconds long.
     pool = ThreadPoolExecutor( FETCH_WORKERS )
+    # Playlists load on a pool of their own, all tracks at once, so they never
+    # queue behind segment fetches or behind each other.
+    list_pool = ThreadPoolExecutor( 4 )
     now = time.time()
     last_full_load = now
     last_extract = now
@@ -407,20 +434,24 @@ def main( url, ready_fd, stop, outcome ):
             # segment, so the muxer can start with all tracks.
             loaded = 0
             ended = False
-            for track in tracks:
+            lists = [ list_pool.submit( fetch, session, track.url, PLAYLIST_TRIES, stop, PLAYLIST_TIMEOUT ) for track in tracks ]
+            for track, listed in zip( tracks, lists ):
                 if stop.is_set():
                     break
                 track.segments = []
-                data, reason = fetch( session, track.url, tries=1, stop=stop )
+                data, reason = listed.result()
                 if data is None or not data.startswith( b"#EXTM3U" ):
                     continue
                 segments, init_uri, track_ended = parse_playlist( data.decode("utf-8", "replace") )
                 ended = ended or track_ended
-                if init_uri:
-                    init, reason = fetch( session, urljoin(track.url, init_uri), tries=1, stop=stop )
+                # The init segment is fetched again only when its URI changes.
+                if init_uri and ( init_uri != track.init_uri or track.init is None ):
+                    init, reason = fetch( session, urljoin(track.url, init_uri), tries=PLAYLIST_TRIES, stop=stop )
                     if init is None and track.init is None:
                         log( "Init segment failed: {}".format(reason) )
                         continue
+                    if init is not None:
+                        track.init_uri = init_uri
                     if init is not None and init != track.init:
                         if track.init is not None and muxer:
                             log( "Stream parameters changed; restarting muxer" )
@@ -450,7 +481,18 @@ def main( url, ready_fd, stop, outcome ):
                         if sequence < track.next_sequence:
                             continue
                         if sequence > track.next_sequence:
-                            log( "Track {} lost segments {}-{}: gone from the playlist before they could be fetched".format(index, track.next_sequence, sequence - 1) )
+                            # Segments that left the playlist before it was
+                            # read are fetched directly, their URIs built from
+                            # this one's, while the CDN still serves them.
+                            first = max( track.next_sequence, sequence - BACKFILL_LIMIT )
+                            if sibling_uri( uri, sequence, first ) is None:
+                                first = sequence
+                            if first > track.next_sequence:
+                                log( "Track {} lost segments {}-{}: gone from the playlist before they could be fetched".format(index, track.next_sequence, first - 1) )
+                            if first < sequence:
+                                log( "Track {} segments {}-{} left the playlist before it was read; fetching them directly".format(index, first, sequence - 1) )
+                            for missing in range( first, sequence ):
+                                track.pending.append( ( missing, pool.submit( fetch, session, urljoin(track.url, sibling_uri(uri, sequence, missing)), stop=stop ) ) )
                         track.pending.append( ( sequence, pool.submit( fetch, session, urljoin(track.url, uri), stop=stop ) ) )
                         track.next_sequence = sequence + 1
                 if feed_fetched( tracks, muxer ):
@@ -494,6 +536,7 @@ def main( url, ready_fd, stop, outcome ):
         if muxer and not stop.is_set():
             feed_fetched( tracks, muxer, wait=True )
         pool.shutdown( wait=False, cancel_futures=True )
+        list_pool.shutdown( wait=False, cancel_futures=True )
         if muxer:
             muxer.close()
         if os.path.exists( path ) and os.path.getsize( path ) == 0:
