@@ -9,10 +9,13 @@ itself, with short timeouts and quick retries, and feeds them to a local
 ffmpeg that only muxes them into MPEG-TS. ffmpeg never touches the network,
 so a dropped connection costs the segments it covered and nothing more: the
 recording carries on in the same file across gaps, reconnects and fresh
-stream URLs. It exits when the site reports the room unavailable, when no
-segment arrives for GIVE_UP_AFTER seconds, or on SIGINT/SIGTERM.
+stream URLs. When the site reports the room unavailable it waits up to
+room_return_wait_minutes (configs/config.json) for the room to come back and
+records on into the same file; it exits when the room stays away that long,
+when no segment arrives for GIVE_UP_AFTER seconds, or on SIGINT/SIGTERM.
 """
 import hashlib
+import json
 import os
 import queue
 import re
@@ -39,6 +42,9 @@ BACKFILL_LIMIT = 10      # most segments fetched directly after a gap; the CDN k
 SEGMENT_TIMEOUT = (3, 2) # connect, read: seconds without a byte before a segment request is abandoned
 SEGMENT_DEADLINE = 12    # seconds a segment is asked for again after its first request; the CDN keeps one ~11-16s
 SLOW_RELOAD = 3          # seconds a playlist reload may take before its timing is logged
+RETURN_POLL = 3          # seconds between room checks while waiting for a room to come back
+DEFAULT_RETURN_WAIT_MINUTES = 10
+CONFIG_FILE = os.path.join( "configs", "config.json" )
 REEXTRACT_AFTER = 15     # seconds without every playlist loading before asking the site for fresh URLs
 GIVE_UP_AFTER = 120      # seconds without a new segment before exiting
 LOOKUP_TIMEOUT = (3, 5)  # connect, read, for each request of a room lookup
@@ -174,7 +180,35 @@ def lookup( url, session ):
     title = "{} {}".format( room, time.strftime("%Y-%m-%d %H_%M") )
     return "ok", (title, urls, headers)
 
-def extract( url, stop ):
+def return_wait_minutes():
+    # configs/config.json's room_return_wait_minutes: how long a room that
+    # went unavailable mid-recording is waited for. Read when a room goes
+    # away, so an edit reaches running recorders; DEFAULT_RETURN_WAIT_MINUTES
+    # when the file or the value is unreadable or negative.
+    try:
+        with open( CONFIG_FILE ) as f:
+            minutes = float( json.load( f ).get( "room_return_wait_minutes", DEFAULT_RETURN_WAIT_MINUTES ) )
+    except ( OSError, ValueError, TypeError, AttributeError ):
+        return DEFAULT_RETURN_WAIT_MINUTES
+    return minutes if minutes >= 0 else DEFAULT_RETURN_WAIT_MINUTES
+
+def await_return( url, stop, minutes ):
+    # Asks the site for the room every RETURN_POLL seconds until it is public
+    # again, `minutes` have passed, or stop is set. Returns extract's last
+    # result, or ("error", "lookup interrupted") when stopped.
+    deadline = time.time() + minutes * 60
+    while True:
+        stop.wait( RETURN_POLL )
+        if stop.is_set():
+            return "error", "lookup interrupted"
+        status, result = extract( url, stop, report=False )
+        if status == "ok":
+            return status, result
+        if time.time() >= deadline:
+            log( "Room did not come back within {:g} min; last answer: {}".format(minutes, result) )
+            return status, result
+
+def extract( url, stop, report = True ):
     # Resolves the room through lookup on a worker thread and blocks until the
     # lookup answers or stop is set: Stop.set puts None on the queue this call
     # registers as stop's waiter. A stopped lookup returns ("error",
@@ -201,7 +235,7 @@ def extract( url, stop ):
     if answer is None or stop.is_set():
         return "error", "lookup interrupted"
     status, result = answer
-    if status != "ok":
+    if status != "ok" and report:
         sys.stderr.write( result + "\n" )
         sys.stderr.flush()
     return status, result
@@ -541,9 +575,25 @@ def main( url, ready_fd, stop, outcome ):
                 last_extract = time.time()
                 status, result = extract( url, stop )
                 if status == "unavailable":
-                    log( "Room unavailable: {}".format(result) )
-                    break
-                if status == "error":
+                    # A broadcaster who drops and reconnects comes back as a
+                    # new stream: wait for it and record it into this file
+                    # through a new muxer, rather than leave the gap until
+                    # the daemon's next pass relaunches the room.
+                    minutes = return_wait_minutes()
+                    log( "Room unavailable: {}; waiting up to {:g} min for it to come back".format(result, minutes) )
+                    status, result = await_return( url, stop, minutes )
+                    if status != "ok":
+                        break
+                    log( "Room is back; recording on in the same file" )
+                    if muxer:
+                        feed_fetched( tracks, muxer, wait=True )
+                        muxer.close()
+                        muxer = None
+                    _, urls, headers = result
+                    session.headers.update( headers )
+                    tracks = [ Track(u) for u in urls ]
+                    last_full_load = last_segment = time.time()
+                elif status == "error":
                     log( "Re-resolution failed: {}; still recording".format(result) )
                 else:
                     _, urls, headers = result

@@ -336,9 +336,12 @@ class FakeSite:
     # it. `api_requests` records each request's room_slug and Cookie header,
     # and `api_arrived` is set once one has arrived.
 
-    def __init__( self, hls, api = "ok", master = "ok" ):
+    def __init__( self, hls, api = "ok", master = "ok", back = None ):
         self.hls = hls
         self.api = api
+        # api="away": ok once, then offline until `back` seconds into the
+        # stream's clock, then ok
+        self.back = back
         self.master = master
         self.api_gate = threading.Event()
         self.api_gate.set()
@@ -382,6 +385,10 @@ class FakeSite:
         mode = self.api
         if mode == "fail-after-first":
             mode = "ok" if len( self.api_requests ) == 1 else "neterror"
+        if mode == "away":
+            started = self.hls.started
+            back = len( self.api_requests ) == 1 or ( started is not None and time.time() - started >= self.back )
+            mode = "ok" if back else "offline"
         if mode == "hang":
             time.sleep( 30 )
             return
@@ -432,10 +439,10 @@ class FakeSite:
         self.server.shutdown()
         self.hls.close()
 
-def fake_site( api = "ok", master = "ok", **media ):
+def fake_site( api = "ok", master = "ok", back = None, **media ):
     # A FakeSite in front of a new FakeHls built from media; closing the site
     # closes both.
-    return FakeSite( FakeHls(**media), api, master )
+    return FakeSite( FakeHls(**media), api, master, back )
 
 TITLE = re.compile( r"room \d{4}-\d\d-\d\d \d\d_\d\d\.ts" )
 
@@ -533,6 +540,38 @@ class RecorderRunTest( unittest.TestCase ):
         self.assertIn( "Stream ended", result.stdout )
         codecs, container, duration = probe( self.recording() )
         self.assertEqual( codecs, [ "aac", "h264" ] )
+
+    def test_a_room_that_goes_away_and_comes_back_records_on_in_one_file( self ):
+        # Playlists answer 503 from 2s to 19s and the site calls the room
+        # offline until 21s: the recorder waits for it and carries on.
+        hls = fake_site( outage=(2, 19), api="away", back=21 )
+        try:
+            result = self.run_recorder( hls, timeout=60 )
+        finally:
+            hls.close()
+        self.assertEqual( result.returncode, 0, result.stdout )
+        self.assertIn( "Room is currently offline; waiting up to 10 min for it to come back", result.stdout )
+        self.assertIn( "Room is back; recording on in the same file", result.stdout )
+        self.assertIn( "Stream ended", result.stdout )
+        # the first offline answer: its ERROR: line and the line quoting it;
+        # the checks while waiting add none
+        self.assertEqual( result.stdout.count( "ERROR: [Chaturbate]" ), 2, result.stdout )
+        codecs, container, duration = probe( self.recording() )
+        self.assertEqual( codecs, [ "aac", "h264" ] )
+
+    def test_a_room_that_stays_away_past_the_configured_wait_ends_the_recording( self ):
+        with open( os.path.join(self.cwd, "configs", "config.json"), "w" ) as f:
+            json.dump( { "room_return_wait_minutes": 0.1 }, f )
+        hls = fake_site( outage=(2, 60), api="away", back=999 )
+        try:
+            result = self.run_recorder( hls, timeout=60 )
+        finally:
+            hls.close()
+        self.assertEqual( result.returncode, 0, result.stdout )
+        self.assertIn( "waiting up to 0.1 min for it to come back", result.stdout )
+        self.assertIn( "Room did not come back within 0.1 min", result.stdout )
+        self.assertNotIn( "Room is back", result.stdout )
+        self.recording()
 
     def test_offline_room_exits_with_its_room_state( self ):
         hls = fake_site( api="offline" )

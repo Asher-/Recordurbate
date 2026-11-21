@@ -698,6 +698,7 @@ Location: `configs/config.json`
 | `auto_reload_config`      | `bool`   | `true`                        | If true, config is reloaded every loop iteration (60s). Allows live changes.      |
 | `rate_limit`              | `bool`   | `true`                        | Whether to rate-limit API calls (controls if `rate_limit_time` is used).          |
 | `rate_limit_time`         | `number` | `0`                           | Seconds to sleep between launching streamers. `0` means no delay.                 |
+| `room_return_wait_minutes` | `number` | `10`                         | Minutes recorder.py waits for a room that went unavailable mid-recording to come back (checking every 3s), recording on into the same file through a new muxer when it does. Read each time a room goes away, so edits reach running recorders. |
 | `default_export_location` | `string` | `"./list.txt"`                | Default file path for the `export` command.                                  |
 | `streamers`               | `array`  | `[]`                          | Array of Chaturbate usernames to record.                                     |
 
