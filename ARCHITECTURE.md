@@ -855,6 +855,12 @@ supervises the process directly — no double-fork. This means:
   `ThrottleInterval: 30` ensures a 30s delay if the process exits and is
   restarted manually.
 - `RunAtLoad: true` — the daemon starts automatically at login.
+- `ProcessType: Interactive` — the daemon, and every recorder and ffmpeg it
+  starts, which inherit its scheduling, are scheduled as interactive work.
+  Without it launchd schedules the job as background work: a fixed CPU loop
+  took 74.07s under a job with no ProcessType and 1.52s under one with
+  Interactive, and recorders scheduled that way missed the ~6.4s LL-HLS
+  playlist window.
 - Logs go to `~/Library/Logs/Recordurbate/launchd.stdout.log` and
   `~/Library/Logs/Recordurbate/launchd.stderr.log`.
 

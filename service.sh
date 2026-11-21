@@ -73,6 +73,9 @@ generate_plist() {
 
     <key>ThrottleInterval</key>
     <integer>30</integer>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
 </dict>
 </plist>
 PLIST
