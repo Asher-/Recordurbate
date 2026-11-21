@@ -15,7 +15,7 @@ from ipc.ipc_config import IpcConfig
 from streamer import Streamer
 from fifo_wait import read_fifo
 import test_recorder
-from test_recorder import FakeHls
+from test_recorder import fake_site
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -280,7 +280,7 @@ def test_shutdown_stops_streamers_together(monkeypatch):
 
 @pytest.fixture(scope="module")
 def recorder_fixtures():
-    # FakeHls serves media built from these; test_recorder builds them
+    # FakeHls, behind FakeSite, serves media built from these; test_recorder builds them
     test_recorder.setUpModule()
     yield
     test_recorder.tearDownModule()
@@ -288,10 +288,10 @@ def recorder_fixtures():
 
 @pytest.mark.parametrize("method", ["stop", "handoff"])
 def test_run_with_a_real_recorder_ends_on_stop_and_handoff(monkeypatch, tmp_path, recorder_fixtures, method):
-    # Daemon.run launches recorder.py through Streamer. FakeHls resolves the
+    # Daemon.run launches recorder.py through Streamer. FakeSite resolves the
     # room and serves its playlists but never answers a media segment, so the
     # recorder runs until the daemon ends it.
-    hls = FakeHls(hang=True)
+    hls = fake_site(hang=True)
     (tmp_path / "configs").mkdir()
     (tmp_path / "configs" / "config.json").write_text(json.dumps({}))
     (tmp_path / "recorder.py").symlink_to(os.path.join(REPO, "recorder.py"))

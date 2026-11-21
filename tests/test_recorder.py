@@ -11,7 +11,9 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.parse
+import urllib.request
 from unittest import mock
 
 import requests
@@ -211,33 +213,15 @@ class FakeHls:
     # Serves a live LL-HLS room from the fixtures: one segment per track
     # becomes available each second, the playlist window holds three, and
     # ENDLIST follows the last. Segments in `failing` answer 500.
-    #
-    # It also stands in for the site with responses captured from it: POST
-    # /get_edge_hls_url_ajax/ answers according to `api`, and the master
-    # playlist the public answer names is the captured one, whose video and
-    # audio chunklists FakeHls serves as the fixture's two tracks. `api` is
-    # one of ok, offline, hidden (captured answers), unknown (the offline
-    # answer with room_status "unknown"), list (a JSON array), neterror (503),
-    # garbage (not JSON), hang (never answers), or fail-after-first (ok once,
-    # then 503). `master` is ok, neterror (503) or empty (the captured master
-    # cut before its first variant). While `api_gate` is cleared, room API
-    # requests wait for it. `api_requests` records each request's room_slug
-    # and Cookie header, and `api_arrived` is set once one has arrived.
 
     FIRST = 100
 
-    def __init__( self, failing = (), outage = None, hang = False, api = "ok", master = "ok" ):
+    def __init__( self, failing = (), outage = None, hang = False ):
         # outage=(start, end) answers 503 to everything in that window of
         # seconds; hang=True never answers a media segment.
         self.failing = set( failing )
         self.outage = outage
         self.hang = hang
-        self.api = api
-        self.master = master
-        self.api_gate = threading.Event()
-        self.api_gate.set()
-        self.api_arrived = threading.Event()
-        self.api_requests = []
         self.started = time.time()
         # set once two media segments of each track have been served: the
         # recorder fetches a track in order, so its first has reached the muxer
@@ -250,20 +234,101 @@ class FakeHls:
                 pass
             def do_GET( self ):
                 fake.handle( self )
-            def do_POST( self ):
-                fake.handle_api( self )
         self.server = http.server.ThreadingHTTPServer( ("127.0.0.1", 0), Handler )
         self.base = "http://127.0.0.1:{}".format( self.server.server_address[1] )
         threading.Thread( target=self.server.serve_forever, daemon=True ).start()
+
+    def track( self, letter ):
+        return Fixtures.video if letter == "v" else Fixtures.audio
+
+    def handle( self, request ):
+        letter, name = request.path.split("?")[0].strip("/").split("/")
+        elapsed = time.time() - self.started
+        if self.outage and self.outage[0] <= elapsed < self.outage[1]:
+            request.send_response( 503 )
+            request.end_headers()
+            return
+        if self.hang and name.startswith("seg_"):
+            time.sleep( 30 )
+            return
+        init, fragments = self.track( letter )
+        if name == "playlist.m3u8":
+            available = min( len(fragments), int(time.time() - self.started) + 1 )
+            first = max( 0, available - 3 )
+            lines = [ "#EXTM3U", "#EXT-X-VERSION:6", "#EXT-X-TARGETDURATION:1",
+                      "#EXT-X-MEDIA-SEQUENCE:{}".format(self.FIRST + first), '#EXT-X-MAP:URI="init.mp4"' ]
+            for index in range( first, available ):
+                lines += [ "#EXTINF:1.0,", "seg_{}.m4s".format(self.FIRST + index) ]
+            if available == len( fragments ) and time.time() - self.started > len( fragments ) + 1:
+                lines.append( "#EXT-X-ENDLIST" )
+            body = ( "\n".join(lines) + "\n" ).encode()
+        elif name == "init.mp4":
+            body = init
+        else:
+            sequence = int( name[len("seg_"):-len(".m4s")] )
+            if (letter, sequence) in self.failing:
+                request.send_response( 500 )
+                request.end_headers()
+                return
+            body = fragments[ sequence - self.FIRST ]
+        request.send_response( 200 )
+        request.send_header( "Content-Length", str(len(body)) )
+        request.end_headers()
+        request.wfile.write( body )
+        if name.startswith( "seg_" ):
+            with self.served_lock:
+                self.served_counts[ letter ] = self.served_counts.get( letter, 0 ) + 1
+                if len( self.served_counts ) == 2 and min( self.served_counts.values() ) >= 2:
+                    self.served.set()
+
+    def close( self ):
+        self.server.shutdown()
+
+
+class FakeSite:
+    # Stands in for chaturbate.com with responses captured from it, in front
+    # of a FakeHls that serves the media. POST /get_edge_hls_url_ajax/
+    # answers according to `api`; the public answer names the captured master
+    # playlist, served verbatim, and its video and audio chunklists are
+    # FakeHls's /v/ and /a/ playlists with init and segment URIs made
+    # absolute on FakeHls, so FakeHls's failures, outages and hangs reach the
+    # recorder unchanged. `api` is one of ok, offline, hidden (captured
+    # answers), unknown or private (the captured offline answer with that
+    # room_status), list (a JSON array), neterror (503), garbage (not JSON),
+    # hang (never answers), or fail-after-first (ok once, then 503). `master`
+    # is ok, neterror (503) or empty (the captured master cut before its
+    # first variant). While `api_gate` is cleared, room API requests wait for
+    # it. `api_requests` records each request's room_slug and Cookie header,
+    # and `api_arrived` is set once one has arrived.
+
+    def __init__( self, hls, api = "ok", master = "ok" ):
+        self.hls = hls
+        self.api = api
+        self.master = master
+        self.api_gate = threading.Event()
+        self.api_gate.set()
+        self.api_arrived = threading.Event()
+        self.api_requests = []
+        site = self
+        class Handler( http.server.BaseHTTPRequestHandler ):
+            def log_message( self, *args ):
+                pass
+            def do_GET( self ):
+                site.handle( self )
+            def do_POST( self ):
+                site.handle_api( self )
+        self.server = http.server.ThreadingHTTPServer( ("127.0.0.1", 0), Handler )
+        self.base = "http://127.0.0.1:{}".format( self.server.server_address[1] )
+        threading.Thread( target=self.server.serve_forever, daemon=True ).start()
+
+    def room_url( self ):
+        return self.base + "/room/"
 
     def stream_url( self, kind ):
         # the captured master playlist's chunklist for kind "video" or "audio"
         number = 3 if kind == "video" else 5
         return ( self.base + "/v1/edge/streams/origin.room.01ROOMSTREAM00000000000000/"
                  "chunklist_{}_{}_10000000000000000000_llhls.m3u8?session=00000000-0000-0000-0000-000000000000".format(number, kind) )
-
-    def track( self, letter ):
-        return Fixtures.video if letter == "v" else Fixtures.audio
 
     def respond( self, request, status, body = b"", content_type = None ):
         request.send_response( status )
@@ -296,9 +361,9 @@ class FakeHls:
             return
         if mode == "ok":
             body = captured( "public.json" ).replace( CAPTURED_HOST, self.base )
-        elif mode == "unknown":
+        elif mode in ( "unknown", "private" ):
             info = json.loads( captured("offline.json") )
-            info["room_status"] = "unknown"
+            info["room_status"] = mode
             body = json.dumps( info )
         else:
             body = captured( mode + ".json" )
@@ -306,11 +371,6 @@ class FakeHls:
 
     def handle( self, request ):
         name = request.path.split("?")[0].rsplit("/", 1)[-1]
-        elapsed = time.time() - self.started
-        if self.outage and self.outage[0] <= elapsed < self.outage[1]:
-            request.send_response( 503 )
-            request.end_headers()
-            return
         if name == "llhls.m3u8":
             if self.master == "neterror":
                 self.respond( request, 503 )
@@ -320,55 +380,33 @@ class FakeHls:
                 text = text.split( "#EXT-X-STREAM-INF" )[0]
             self.respond( request, 200, text.encode() )
             return
-        if name.startswith( "chunklist_" ):
-            letter, name = ( "v" if "_video_" in name else "a" ), "playlist.m3u8"
-        else:
-            letter, name = name.split( "_", 1 )
-        if self.hang and name.startswith("seg_"):
-            time.sleep( 30 )
+        letter = "v" if "_video_" in name else "a"
+        try:
+            with urllib.request.urlopen( "{}/{}/playlist.m3u8".format(self.hls.base, letter), timeout=5 ) as answer:
+                text = answer.read().decode()
+        except urllib.error.HTTPError as e:
+            self.respond( request, e.code )
             return
-        init, fragments = self.track( letter )
-        if name == "playlist.m3u8":
-            available = min( len(fragments), int(time.time() - self.started) + 1 )
-            first = max( 0, available - 3 )
-            lines = [ "#EXTM3U", "#EXT-X-VERSION:6", "#EXT-X-TARGETDURATION:1",
-                      "#EXT-X-MEDIA-SEQUENCE:{}".format(self.FIRST + first), '#EXT-X-MAP:URI="{}_init.mp4"'.format(letter) ]
-            for index in range( first, available ):
-                lines += [ "#EXTINF:1.0,", "{}_seg_{}.m4s".format(letter, self.FIRST + index) ]
-            if available == len( fragments ) and time.time() - self.started > len( fragments ) + 1:
-                lines.append( "#EXT-X-ENDLIST" )
-            body = ( "\n".join(lines) + "\n" ).encode()
-        elif name == "init.mp4":
-            body = init
-        else:
-            sequence = int( name[len("seg_"):-len(".m4s")] )
-            if (letter, sequence) in self.failing:
-                request.send_response( 500 )
-                request.end_headers()
-                return
-            body = fragments[ sequence - self.FIRST ]
-        request.send_response( 200 )
-        request.send_header( "Content-Length", str(len(body)) )
-        request.end_headers()
-        request.wfile.write( body )
-        if name.startswith( "seg_" ):
-            with self.served_lock:
-                self.served_counts[ letter ] = self.served_counts.get( letter, 0 ) + 1
-                if len( self.served_counts ) == 2 and min( self.served_counts.values() ) >= 2:
-                    self.served.set()
-
-    def room_url( self ):
-        return self.base + "/room/"
+        prefix = "{}/{}/".format( self.hls.base, letter )
+        text = text.replace( 'URI="init.mp4"', 'URI="{}init.mp4"'.format(prefix) )
+        text = "\n".join( prefix + line if line.startswith("seg_") else line for line in text.split("\n") )
+        self.respond( request, 200, text.encode() )
 
     def close( self ):
         self.api_gate.set()
         self.server.shutdown()
+        self.hls.close()
+
+def fake_site( api = "ok", master = "ok", **media ):
+    # A FakeSite in front of a new FakeHls built from media; closing the site
+    # closes both.
+    return FakeSite( FakeHls(**media), api, master )
 
 TITLE = re.compile( r"room \d{4}-\d\d-\d\d \d\d_\d\d\.ts" )
 
 class RecorderRunTest( unittest.TestCase ):
-    # Runs recorder.py as the daemon does, against FakeHls as both the site's
-    # room API and the CDN.
+    # Runs recorder.py as the daemon does, against FakeSite as the site's room API
+    # in front of FakeHls as the CDN.
 
     def setUp( self ):
         self.cwd = tempfile.mkdtemp()
@@ -390,7 +428,7 @@ class RecorderRunTest( unittest.TestCase ):
         return os.path.join( self.cwd, "videos", "room", names[0] )
 
     def test_records_both_tracks_across_a_failed_segment( self ):
-        hls = FakeHls( failing=[ ("v", 102) ] )
+        hls = fake_site( failing=[ ("v", 102) ] )
         try:
             result = self.run_recorder( hls )
         finally:
@@ -404,7 +442,7 @@ class RecorderRunTest( unittest.TestCase ):
         self.assertGreater( duration, 4 )
 
     def test_offline_room_exits_with_its_room_state( self ):
-        hls = FakeHls( api="offline" )
+        hls = fake_site( api="offline" )
         try:
             result = self.run_recorder( hls )
         finally:
@@ -424,7 +462,7 @@ class RecorderRunTest( unittest.TestCase ):
         with open( export, "w" ) as f:
             f.write( contents )
         before = os.stat( export ).st_mtime_ns
-        hls = FakeHls()
+        hls = fake_site()
         try:
             result = self.run_recorder( hls )
         finally:
@@ -439,11 +477,11 @@ class RecorderRunTest( unittest.TestCase ):
         self.assertEqual( os.stat( export ).st_mtime_ns, before )
 
     def test_sigint_stops_and_keeps_recording( self ):
-        hls = FakeHls()
+        hls = fake_site()
         try:
             proc = subprocess.Popen( [ sys.executable, os.path.join(ROOT, "recorder.py"), hls.room_url() ],
                                      cwd=self.cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True )
-            self.assertTrue( hls.served.wait( 15 ) )
+            self.assertTrue( hls.hls.served.wait( 15 ) )
             proc.send_signal( 2 )
             out, _ = proc.communicate( timeout=15 )
         finally:
@@ -457,7 +495,7 @@ class RecorderRunTest( unittest.TestCase ):
         # Playlists answer 503 from 2s to 19s, so re-resolution runs and its
         # room API request fails; the recorder must keep going and finish the
         # stream in the same file.
-        hls = FakeHls( outage=(2, 19), api="fail-after-first" )
+        hls = fake_site( outage=(2, 19), api="fail-after-first" )
         try:
             result = self.run_recorder( hls, timeout=60 )
         finally:
@@ -468,7 +506,7 @@ class RecorderRunTest( unittest.TestCase ):
         self.recording()
 
     def test_sigint_during_stalled_fetch_exits_within_15s( self ):
-        hls = FakeHls( hang=True )
+        hls = fake_site( hang=True )
         ready_fd, write_fd = os.pipe()
         try:
             proc = subprocess.Popen( [ sys.executable, os.path.join(ROOT, "recorder.py"), hls.room_url(), str(write_fd) ],
@@ -488,7 +526,7 @@ class RecorderRunTest( unittest.TestCase ):
         self.assertIn( "Stopped recording room", out )
 
     def test_sigint_during_a_hung_lookup_exits_within_15s( self ):
-        hls = FakeHls( api="hang" )
+        hls = fake_site( api="hang" )
         try:
             proc = subprocess.Popen( [ sys.executable, os.path.join(ROOT, "recorder.py"), hls.room_url() ],
                                      cwd=self.cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True )
@@ -574,7 +612,7 @@ class ParseMasterTest( unittest.TestCase ):
         self.assertIsNone( recorder.parse_master(captured("master.m3u8").split("#EXT-X-STREAM-INF")[0], "http://h/") )
 
 class LookupTest( unittest.TestCase ):
-    # recorder.lookup with a real requests.Session against FakeHls serving the
+    # recorder.lookup with a real requests.Session against FakeSite serving the
     # site's captured answers.
 
     def setUp( self ):
@@ -585,7 +623,7 @@ class LookupTest( unittest.TestCase ):
         self.addCleanup( patcher.stop )
 
     def lookup( self, **modes ):
-        hls = FakeHls( **modes )
+        hls = fake_site( **modes )
         self.addCleanup( hls.close )
         with requests.Session() as session:
             return hls, recorder.lookup( hls.room_url(), session )
@@ -601,6 +639,7 @@ class LookupTest( unittest.TestCase ):
     def test_room_states_are_unavailable( self ):
         self.assertEqual( self.lookup(api="offline")[1], ("unavailable", "ERROR: [Chaturbate] room: Room is currently offline") )
         self.assertEqual( self.lookup(api="hidden")[1], ("unavailable", "ERROR: [Chaturbate] room: Hidden session in progress") )
+        self.assertEqual( self.lookup(api="private")[1], ("unavailable", "ERROR: [Chaturbate] room: Room is currently in a private show") )
 
     def test_unknown_room_status_is_an_error( self ):
         self.assertEqual( self.lookup(api="unknown")[1],
@@ -636,7 +675,7 @@ class LookupTest( unittest.TestCase ):
             self.assertEqual( f.read(), contents )
 
     def test_recordurbate_site_replaces_the_room_urls_site( self ):
-        hls = FakeHls()
+        hls = fake_site()
         self.addCleanup( hls.close )
         with mock.patch.dict( os.environ, { "RECORDURBATE_SITE": hls.base } ), requests.Session() as session:
             status, (_, _, headers) = recorder.lookup( "https://chaturbate.com/room/", session )
@@ -662,7 +701,7 @@ class ExtractTest( unittest.TestCase ):
         self.addCleanup( patcher.stop )
 
     def fake( self, **modes ):
-        hls = FakeHls( **modes )
+        hls = fake_site( **modes )
         self.addCleanup( hls.close )
         return hls
 
@@ -692,16 +731,26 @@ class ExtractTest( unittest.TestCase ):
                               ("error", "ERROR: [Chaturbate] lookup failed: RuntimeError('boom')") )
         self.assertEqual( self.stderr.getvalue(), "ERROR: [Chaturbate] lookup failed: RuntimeError('boom')\n" )
 
-    def test_stop_during_a_hung_request_returns_within_1s( self ):
+    def test_stop_during_a_hung_request_returns_before_the_lookup_and_within_1s( self ):
         hls = self.fake( api="hang" )
         stop = recorder.Stop()
         set_at = []
+        finished = []
+        real_lookup = recorder.lookup
+        def recording_lookup( url, session ):
+            try:
+                return real_lookup( url, session )
+            finally:
+                finished.append( True )
         def stop_once_requested():
             hls.api_arrived.wait()
             set_at.append( time.time() )
             stop.set()
         threading.Thread( target=stop_once_requested, daemon=True ).start()
-        self.assertEqual( recorder.extract( hls.room_url(), stop ), ("error", "lookup interrupted") )
+        with mock.patch.object( recorder, "lookup", recording_lookup ):
+            self.assertEqual( recorder.extract( hls.room_url(), stop ), ("error", "lookup interrupted") )
+            # extract returned while its worker was still inside the hung request
+            self.assertEqual( finished, [] )
         self.assertLess( time.time() - set_at[0], 1 )
         self.assertIsNone( stop.waiter )
 

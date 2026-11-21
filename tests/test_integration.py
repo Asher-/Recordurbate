@@ -2,7 +2,7 @@
 
 Streamer.start launches the real recorder.py through a real Popen, and a
 running recorder is found through its PID record and adopted by Streamer.adopt.
-FakeHls (the site's room API and the CDN) is the only stand-in.
+FakeSite (the site's room API, in front of FakeHls as the CDN) is the only stand-in.
 """
 import json
 import logging
@@ -22,7 +22,7 @@ ROOT = os.path.dirname( TESTS )
 sys.path.insert( 0, ROOT )
 sys.path.insert( 0, TESTS )
 import test_recorder
-from test_recorder import FakeHls, probe
+from test_recorder import fake_site, probe
 import streamer as streamer_module
 from streamer import Streamer
 from pid import recorded_recorder
@@ -46,7 +46,7 @@ class FakeDaemon:
 
 class RoomDir( unittest.TestCase ):
     # A daemon working directory with recorder.py where Streamer launches it
-    # from; RECORDURBATE_SITE points the recorder's room lookup at FakeHls.
+    # from; RECORDURBATE_SITE points the recorder's room lookup at FakeSite.
 
     def setUp( self ):
         self.previous = os.getcwd()
@@ -57,7 +57,7 @@ class RoomDir( unittest.TestCase ):
             json.dump( self.config, f )
         os.symlink( os.path.join(ROOT, "recorder.py"), os.path.join(self.cwd, "recorder.py") )
         os.chdir( self.cwd )
-        self.hls = FakeHls()
+        self.hls = fake_site()
         self.env = dict( os.environ )
         os.environ[ "RECORDURBATE_SITE" ] = self.hls.base
 

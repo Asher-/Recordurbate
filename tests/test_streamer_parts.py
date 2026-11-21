@@ -5,7 +5,7 @@ import pytest
 
 import streamer
 from streamer import Streamer
-from test_recorder import FakeHls
+from test_recorder import fake_site
 
 
 class FakeLogger:
@@ -276,11 +276,11 @@ def test_stop_during_launch_reports_nothing(start_harness, monkeypatch):
 
 
 def test_real_process_output_is_read_back_from_the_capture_log(workdir, monkeypatch):
-    # The real recorder.py looks the room up on FakeHls, which answers with an
+    # The real recorder.py looks the room up on FakeSite, which answers with an
     # unknown room status, and the ERROR: line it writes must reach the
     # capture log through the recorder.
     error = 'ERROR: [Chaturbate] alice: room API gave no stream for room status "unknown"'
-    hls = FakeHls(api="unknown")
+    hls = fake_site(api="unknown")
     monkeypatch.setenv("RECORDURBATE_SITE", hls.base)
     (workdir / "configs").mkdir()
     (workdir / "configs/capture-alice.log").write_text("ERROR: [Chaturbate] alice: Room is currently offline\n")
