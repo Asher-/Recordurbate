@@ -164,6 +164,14 @@ class FetchTest( unittest.TestCase ):
         self.assertEqual( recorder.fetch(session, "u"), (None, "HTTP 404") )
         self.assertEqual( session.calls, 1 )
 
+    def test_failures_collects_each_failed_attempt_even_on_success( self, sleep ):
+        session = FakeSession( [ requests.ConnectTimeout("c"), FakeResponse(503), FakeResponse(200, b"x") ] )
+        failures = []
+        self.assertEqual( recorder.fetch(session, "u", failures=failures), (b"x", None) )
+        self.assertEqual( len(failures), 2 )
+        self.assertRegex( failures[0], r"^\+0\.0s ConnectTimeout: c$" )
+        self.assertRegex( failures[1], r"^\+\d+\.\ds HTTP 503$" )
+
     def test_retries_server_error( self, sleep ):
         session = FakeSession( [ FakeResponse(503), FakeResponse(200, b"x") ] )
         self.assertEqual( recorder.fetch(session, "u"), (b"x", None) )
@@ -509,7 +517,8 @@ class RecorderRunTest( unittest.TestCase ):
         self.assertEqual( result.returncode, 0, result.stdout )
         self.assertIn( "Stream ended", result.stdout )
         self.assertIn( "fetching them directly", result.stdout )
-        self.assertRegex( result.stdout, r"Playlist reload took \d+\.\ds: track 0 playlist " )
+        # the slow reload's line names the timed-out attempts behind it
+        self.assertRegex( result.stdout, r"Playlist reload took \d+\.\ds: [^\n]*ReadTimeout" )
         self.assertNotIn( "lost segments", result.stdout )
         self.assertNotIn( "failed", result.stdout )
         self.recording()

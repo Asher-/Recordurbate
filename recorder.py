@@ -274,13 +274,17 @@ def sibling_uri( uri, sequence, wanted ):
     run = runs[0]
     return head + slash + name[:run.start()] + str(wanted) + name[run.end():] + mark + query
 
-def fetch( session, url, tries = SEGMENT_TRIES, stop = None, timeout = HTTP_TIMEOUT ):
+def fetch( session, url, tries = SEGMENT_TRIES, stop = None, timeout = HTTP_TIMEOUT, failures = None ):
     # Returns (bytes, None) or (None, reason). 403, 404 and 410 end the
     # attempts at once; a set stop event ends them before the next attempt.
+    # When failures is a list, each failed attempt's reason is appended to it
+    # with its start time relative to the first, whatever the outcome.
     reason = None
+    started = time.time()
     for attempt in range( tries ):
         if stop is not None and stop.is_set():
             return None, reason or "stopped"
+        offset = time.time() - started
         try:
             response = session.get( url, timeout=timeout )
             if response.status_code == 200:
@@ -290,6 +294,8 @@ def fetch( session, url, tries = SEGMENT_TRIES, stop = None, timeout = HTTP_TIME
                 break
         except requests.RequestException as e:
             reason = "{}: {}".format( e.__class__.__name__, e )
+        if failures is not None:
+            failures.append( "+{:.1f}s {}".format(offset, reason) )
         if attempt + 1 < tries:
             if stop is not None:
                 stop.wait( 0.3 )
@@ -493,14 +499,16 @@ def main( url, ready_fd, stop, outcome ):
             # segment, so the muxer can start with all tracks.
             loaded = 0
             ended = False
-            lists = [ list_pool.submit( timed, fetch, session, track.url, PLAYLIST_TRIES, stop, PLAYLIST_TIMEOUT ) for track in tracks ]
+            failures = [ [] for track in tracks ]
+            lists = [ list_pool.submit( timed, fetch, session, track.url, PLAYLIST_TRIES, stop, PLAYLIST_TIMEOUT, failed ) for track, failed in zip( tracks, failures ) ]
             notes = []
             for index, ( track, listed ) in enumerate( zip( tracks, lists ) ):
                 if stop.is_set():
                     break
                 track.segments = []
                 data, reason, took = listed.result()
-                notes.append( "track {} playlist {} in {:.1f}s".format(index, reason or "ok", took) )
+                notes.append( "track {} playlist {} in {:.1f}s{}".format(index, reason or "ok", took,
+                                                                       " after " + "; ".join(failures[index]) if data is not None and failures[index] else "") )
                 if data is None or not data.startswith( b"#EXTM3U" ):
                     continue
                 segments, init_uri, track_ended = parse_playlist( data.decode("utf-8", "replace") )
