@@ -233,7 +233,10 @@ class FakeHls:
         self.stuck = stuck
         self.stuck_seen = 0
         self.stuck_lock = threading.Lock()
-        self.started = time.time()
+        # the stream's clock starts at the first playlist request, so a
+        # recorder that is slow to start sees the same timeline
+        self.started = None
+        self.started_lock = threading.Lock()
         # set once two media segments of each track have been served: the
         # recorder fetches a track in order, so its first has reached the muxer
         self.served = threading.Event()
@@ -254,6 +257,14 @@ class FakeHls:
 
     def handle( self, request ):
         letter, name = request.path.split("?")[0].strip("/").split("/")
+        if name == "playlist.m3u8":
+            with self.started_lock:
+                if self.started is None:
+                    self.started = time.time()
+        if self.started is None:
+            request.send_response( 404 )
+            request.end_headers()
+            return
         elapsed = time.time() - self.started
         if self.outage and self.outage[0] <= elapsed < self.outage[1]:
             request.send_response( 503 )
@@ -480,10 +491,10 @@ class RecorderRunTest( unittest.TestCase ):
         self.recording()
 
     def test_stalled_playlists_lose_no_segment( self ):
-        # Every playlist request from 2s to 6s is held until 6s, longer than
-        # the three-segment window: the segments that left the playlist
+        # Every playlist request from 2s to 8s is held until 8s, twice the
+        # three-segment window: the segments that left the playlist
         # meanwhile are fetched directly.
-        hls = fake_site( stall=(2, 6) )
+        hls = fake_site( stall=(2, 8) )
         try:
             result = self.run_recorder( hls, timeout=60 )
         finally:
@@ -491,6 +502,7 @@ class RecorderRunTest( unittest.TestCase ):
         self.assertEqual( result.returncode, 0, result.stdout )
         self.assertIn( "Stream ended", result.stdout )
         self.assertIn( "fetching them directly", result.stdout )
+        self.assertRegex( result.stdout, r"Playlist reload took \d+\.\ds: track 0 playlist " )
         self.assertNotIn( "lost segments", result.stdout )
         self.assertNotIn( "failed", result.stdout )
         self.recording()

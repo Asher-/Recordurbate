@@ -38,6 +38,7 @@ PLAYLIST_TRIES = 3
 BACKFILL_LIMIT = 10      # most segments fetched directly after a gap; the CDN keeps one ~10s past the window
 SEGMENT_TIMEOUT = (3, 2) # connect, read: seconds without a byte before a segment request is abandoned
 SEGMENT_DEADLINE = 12    # seconds a segment is asked for again after its first request; the CDN keeps one ~11-16s
+SLOW_RELOAD = 3          # seconds a playlist reload may take before its timing is logged
 REEXTRACT_AFTER = 15     # seconds without every playlist loading before asking the site for fresh URLs
 GIVE_UP_AFTER = 120      # seconds without a new segment before exiting
 LOOKUP_TIMEOUT = (3, 5)  # connect, read, for each request of a room lookup
@@ -262,6 +263,11 @@ def fetch( session, url, tries = SEGMENT_TRIES, stop = None, timeout = HTTP_TIME
                 time.sleep( 0.3 )
     return None, reason
 
+def timed( function, *args, **kwargs ):
+    # function's (data, reason) result with the seconds it took appended
+    started = time.time()
+    return function( *args, **kwargs ) + ( time.time() - started, )
+
 def fetch_segment( session, url, stop ):
     # Asks for a segment until it answers, the CDN says it is gone (403, 404
     # or 410), stop is set, or SEGMENT_DEADLINE has passed since the first
@@ -453,19 +459,22 @@ def main( url, ready_fd, stop, outcome ):
             # segment, so the muxer can start with all tracks.
             loaded = 0
             ended = False
-            lists = [ list_pool.submit( fetch, session, track.url, PLAYLIST_TRIES, stop, PLAYLIST_TIMEOUT ) for track in tracks ]
-            for track, listed in zip( tracks, lists ):
+            lists = [ list_pool.submit( timed, fetch, session, track.url, PLAYLIST_TRIES, stop, PLAYLIST_TIMEOUT ) for track in tracks ]
+            notes = []
+            for index, ( track, listed ) in enumerate( zip( tracks, lists ) ):
                 if stop.is_set():
                     break
                 track.segments = []
-                data, reason = listed.result()
+                data, reason, took = listed.result()
+                notes.append( "track {} playlist {} in {:.1f}s".format(index, reason or "ok", took) )
                 if data is None or not data.startswith( b"#EXTM3U" ):
                     continue
                 segments, init_uri, track_ended = parse_playlist( data.decode("utf-8", "replace") )
                 ended = ended or track_ended
                 # The init segment is fetched again only when its URI changes.
                 if init_uri and ( init_uri != track.init_uri or track.init is None ):
-                    init, reason = fetch( session, urljoin(track.url, init_uri), tries=PLAYLIST_TRIES, stop=stop )
+                    init, reason, took = timed( fetch, session, urljoin(track.url, init_uri), tries=PLAYLIST_TRIES, stop=stop )
+                    notes.append( "track {} init {} in {:.1f}s".format(index, reason or "ok", took) )
                     if init is None and track.init is None:
                         log( "Init segment failed: {}".format(reason) )
                         continue
@@ -484,6 +493,8 @@ def main( url, ready_fd, stop, outcome ):
                 loaded += 1
             if loaded == len( tracks ):
                 last_full_load = time.time()
+            if time.time() - started > SLOW_RELOAD:
+                log( "Playlist reload took {:.1f}s: {}".format(time.time() - started, ", ".join(notes)) )
 
             if muxer and not muxer.alive():
                 log( "ffmpeg exited with {}; restarting muxer".format(muxer.proc.returncode) )
