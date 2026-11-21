@@ -36,6 +36,8 @@ FETCH_WORKERS = 8        # segment fetches in flight at once, across all tracks
 PLAYLIST_TIMEOUT = (3, 1.5)  # connect, read: a playlist is a few KB and answers in ~0.05s
 PLAYLIST_TRIES = 3
 BACKFILL_LIMIT = 10      # most segments fetched directly after a gap; the CDN keeps one ~10s past the window
+SEGMENT_TIMEOUT = (3, 2) # connect, read: seconds without a byte before a segment request is abandoned
+SEGMENT_DEADLINE = 12    # seconds a segment is asked for again after its first request; the CDN keeps one ~11-16s
 REEXTRACT_AFTER = 15     # seconds without every playlist loading before asking the site for fresh URLs
 GIVE_UP_AFTER = 120      # seconds without a new segment before exiting
 LOOKUP_TIMEOUT = (3, 5)  # connect, read, for each request of a room lookup
@@ -259,6 +261,23 @@ def fetch( session, url, tries = SEGMENT_TRIES, stop = None, timeout = HTTP_TIME
             else:
                 time.sleep( 0.3 )
     return None, reason
+
+def fetch_segment( session, url, stop ):
+    # Asks for a segment until it answers, the CDN says it is gone (403, 404
+    # or 410), stop is set, or SEGMENT_DEADLINE has passed since the first
+    # request. Returns (bytes, None) or (None, reason) where reason names
+    # every attempt with its start time relative to the first.
+    started = time.time()
+    reasons = []
+    while True:
+        offset = time.time() - started
+        data, reason = fetch( session, url, tries=1, stop=stop, timeout=SEGMENT_TIMEOUT )
+        if data is not None:
+            return data, None
+        reasons.append( "+{:.1f}s {}".format(offset, reason) )
+        if reason in ( "HTTP 403", "HTTP 404", "HTTP 410" ) or stop.is_set() or time.time() - started >= SEGMENT_DEADLINE:
+            return None, "; ".join( reasons )
+        stop.wait( 0.3 )
 
 class Track:
 
@@ -492,8 +511,8 @@ def main( url, ready_fd, stop, outcome ):
                             if first < sequence:
                                 log( "Track {} segments {}-{} left the playlist before it was read; fetching them directly".format(index, first, sequence - 1) )
                             for missing in range( first, sequence ):
-                                track.pending.append( ( missing, pool.submit( fetch, session, urljoin(track.url, sibling_uri(uri, sequence, missing)), stop=stop ) ) )
-                        track.pending.append( ( sequence, pool.submit( fetch, session, urljoin(track.url, uri), stop=stop ) ) )
+                                track.pending.append( ( missing, pool.submit( fetch_segment, session, urljoin(track.url, sibling_uri(uri, sequence, missing)), stop ) ) )
+                        track.pending.append( ( sequence, pool.submit( fetch_segment, session, urljoin(track.url, uri), stop ) ) )
                         track.next_sequence = sequence + 1
                 if feed_fetched( tracks, muxer ):
                     last_segment = time.time()

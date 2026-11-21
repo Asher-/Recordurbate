@@ -216,7 +216,7 @@ class FakeHls:
 
     FIRST = 100
 
-    def __init__( self, failing = (), outage = None, hang = False, slow = 0, stall = None, repeat = () ):
+    def __init__( self, failing = (), outage = None, hang = False, slow = 0, stall = None, repeat = (), stuck = None ):
         # outage=(start, end) answers 503 to everything in that window of
         # seconds; hang=True never answers a media segment; slow delays each
         # media segment's answer by that many seconds; stall=(start, end)
@@ -228,6 +228,11 @@ class FakeHls:
         self.slow = slow
         self.stall = stall
         self.repeat = set( repeat )
+        # stuck=(letter, sequence, count): that segment's first `count`
+        # requests never answer
+        self.stuck = stuck
+        self.stuck_seen = 0
+        self.stuck_lock = threading.Lock()
         self.started = time.time()
         # set once two media segments of each track have been served: the
         # recorder fetches a track in order, so its first has reached the muxer
@@ -280,6 +285,13 @@ class FakeHls:
                 request.send_response( 500 )
                 request.end_headers()
                 return
+            if self.stuck and (letter, sequence) == self.stuck[:2]:
+                with self.stuck_lock:
+                    self.stuck_seen += 1
+                    held = self.stuck_seen <= self.stuck[2]
+                if held:
+                    time.sleep( 30 )
+                    return
             if (letter, sequence) in self.repeat:
                 sequence -= 1
             body = fragments[ sequence - self.FIRST ]
@@ -446,7 +458,7 @@ class RecorderRunTest( unittest.TestCase ):
         finally:
             hls.close()
         self.assertEqual( result.returncode, 0, result.stdout )
-        self.assertIn( "Track 0 segment 102 failed: HTTP 500", result.stdout )
+        self.assertIn( "Track 0 segment 102 failed: +0.0s HTTP 500; +", result.stdout )
         self.assertIn( "Stream ended", result.stdout )
         codecs, container, duration = probe( self.recording() )
         self.assertEqual( codecs, [ "aac", "h264" ] )
@@ -482,6 +494,20 @@ class RecorderRunTest( unittest.TestCase ):
         self.assertNotIn( "lost segments", result.stdout )
         self.assertNotIn( "failed", result.stdout )
         self.recording()
+
+    def test_a_segment_whose_first_requests_never_answer_is_recorded( self ):
+        # Audio segment 102's first three requests never answer; the CDN
+        # still has it, so the recorder keeps asking until it does.
+        hls = fake_site( stuck=("a", 102, 3) )
+        try:
+            result = self.run_recorder( hls, timeout=60 )
+        finally:
+            hls.close()
+        self.assertEqual( result.returncode, 0, result.stdout )
+        self.assertIn( "Stream ended", result.stdout )
+        self.assertNotIn( "failed", result.stdout )
+        self.assertNotIn( "lost segments", result.stdout )
+        self.assertEqual( hls.hls.stuck_seen, 4 )
 
     def test_a_segment_repeating_the_one_before_is_dropped( self ):
         hls = fake_site( repeat=[ ("v", 103) ] )
