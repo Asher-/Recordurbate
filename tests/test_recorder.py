@@ -209,6 +209,27 @@ class MuxerTest( unittest.TestCase ):
         self.assertEqual( codecs, [ "aac", "h264" ] )
         subprocess.run( [ "ffmpeg", "-v", "error", "-i", path, "-f", "null", "-" ], check=True )
 
+    def test_restarted_muxer_carries_the_clock_on( self ):
+        # A muxer restarted on a recording, as when a room comes back from a
+        # private show, starts its timestamps after the file's, so the file
+        # lasts as long as all its stretches together, not the last one.
+        path = os.path.join( Fixtures.tmp, "continued.ts" )
+        video_init, video = Fixtures.video
+        audio_init, audio = Fixtures.audio
+        for _ in range( 2 ):
+            muxer = recorder.Muxer( path, [ video_init, audio_init ] )
+            for fragment in video:
+                muxer.feed( 0, fragment )
+            for fragment in audio:
+                muxer.feed( 1, fragment )
+            muxer.close()
+        _, _, duration = probe( path )
+        self.assertAlmostEqual( duration, 12, delta=2 )
+        self.assertAlmostEqual( recorder.ts_end_seconds( path ), duration, delta=2 )
+
+    def test_ts_end_of_a_missing_file_is_zero( self ):
+        self.assertEqual( recorder.ts_end_seconds( os.path.join(Fixtures.tmp, "absent.ts") ), 0 )
+
 EDGE_API = os.path.join( ROOT, "tests", "fixtures", "edge_api" )
 CAPTURED_HOST = "https://edge27-atl.live.mmcdn.com"
 

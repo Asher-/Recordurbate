@@ -359,11 +359,55 @@ def feed_fetched( tracks, muxer, wait = False ):
             fed = True
     return fed
 
+TS_PACKET = 188
+TS_TAIL_BYTES = 4 << 20
+
+def pes_pts( packet ):
+    # The PTS, in 90 kHz ticks, of a TS packet that starts a PES packet
+    # carrying one, else None.
+    if not packet[1] & 0x40:
+        return None
+    control = ( packet[3] >> 4 ) & 3
+    if not control & 1:
+        return None
+    offset = 4 + ( 1 + packet[4] if control & 2 else 0 )
+    p = packet[ offset: ]
+    if len( p ) < 14 or p[:3] != b"\0\0\1" or not p[7] & 0x80:
+        return None
+    return ( (p[9] >> 1) & 7 ) << 30 | p[10] << 22 | ( p[11] >> 1 ) << 15 | p[12] << 7 | p[13] >> 1
+
+def ts_end_seconds( path ):
+    # The highest PTS among the last TS_TAIL_BYTES of an MPEG-TS file, in
+    # seconds; 0 when the file is missing or holds none. Packets are found by
+    # their sync byte, so a torn packet from a killed ffmpeg is skipped.
+    try:
+        with open( path, "rb" ) as f:
+            f.seek( 0, os.SEEK_END )
+            f.seek( max(0, f.tell() - TS_TAIL_BYTES) )
+            data = f.read()
+    except FileNotFoundError:
+        return 0.0
+    end = 0
+    i = data.find( b"\x47" )
+    while 0 <= i and i + TS_PACKET <= len( data ):
+        if i + TS_PACKET < len( data ) and data[ i + TS_PACKET ] != 0x47:
+            i = data.find( b"\x47", i + 1 )
+            continue
+        pts = pes_pts( data[ i:i + TS_PACKET ] )
+        if pts is not None and pts > end:
+            end = pts
+        i += TS_PACKET
+    return end / 90000
+
 class Muxer:
     # A local ffmpeg reading one fMP4 input per track from pipes and writing
-    # MPEG-TS to stdout, which is appended to the recording.
+    # MPEG-TS to stdout, which is appended to the recording. Every ffmpeg
+    # starts its output clock near zero, so a muxer appending to a recording
+    # starts its timestamps after the file's last one; otherwise the clock
+    # jumps back at each restart and players see only the last stretch.
 
     def __init__( self, path, inits ):
+        offset = ts_end_seconds( path )
         self.out = open( path, "ab" )
         pipes = [ os.pipe() for _ in inits ]
         cmd = [ "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin" ]
@@ -371,6 +415,8 @@ class Muxer:
             cmd += [ "-f", "mov", "-i", "pipe:{}".format(read_fd) ]
         for index in range( len(pipes) ):
             cmd += [ "-map", str(index) ]
+        if offset:
+            cmd += [ "-output_ts_offset", "{:.3f}".format(offset) ]
         cmd += [ "-c", "copy", "-f", "mpegts", "pipe:1" ]
         self.proc = subprocess.Popen( cmd, stdout=subprocess.PIPE, pass_fds=[ read_fd for read_fd, _ in pipes ] )
         for read_fd, _ in pipes:
