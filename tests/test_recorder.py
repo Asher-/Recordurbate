@@ -257,16 +257,56 @@ class ToMp4Test( unittest.TestCase ):
         self.assertIn( "mp4", container.split(",") )
         self.assertAlmostEqual( duration, ts_duration, delta=0.5 )
 
+    def test_a_long_gap_keeps_its_length( self ):
+        parts = []
+        for offset in ( "0", "60" ):
+            parts.append( os.path.join( self.dir, "part" + offset ) )
+            subprocess.run( [ "ffmpeg", "-v", "error", "-i", os.path.join(Fixtures.tmp, "v.mp4"), "-i", os.path.join(Fixtures.tmp, "a.mp4"),
+                              "-c", "copy", "-output_ts_offset", offset, "-f", "mpegts", parts[-1] ], check=True )
+        path = os.path.join( self.dir, "room.ts" )
+        with open( path, "wb" ) as out:
+            for part in parts:
+                with open( part, "rb" ) as f:
+                    out.write( f.read() )
+                os.remove( part )
+        saved = recorder.to_mp4( path )
+        self.assertEqual( os.listdir(self.dir), [ "room.mp4" ] )
+        self.assertAlmostEqual( probe(saved)[2], 66, delta=1 )
+
     def test_a_recording_its_mp4_does_not_match_is_kept( self ):
         path = os.path.join( self.dir, "room.ts" )
         muxer = recorder.Muxer( path, [ Fixtures.video[0] ] )
         for fragment in Fixtures.video[1]:
             muxer.feed( 0, fragment )
         muxer.close()
-        infos = [ (["h264"], 6.0), (["h264"], 3.0) ]
-        with mock.patch.object( recorder, "media_info", side_effect=infos ):
-            recorder.to_mp4( path )
+        good = [ ("aac", 200, 6.0), ("h264", 150, 6.0) ]
+        for bad in ( None, good[:1], [ ("aac", 200, 6.0), ("hevc", 150, 6.0) ],
+                     [ ("aac", 200, 6.0), ("h264", 149, 6.0) ], [ ("aac", 200, 6.0), ("h264", 150, 3.0) ] ):
+            with mock.patch.object( recorder, "media_info", side_effect=[good, bad] ):
+                recorder.to_mp4( path )
+            self.assertEqual( sorted(os.listdir(self.dir)), [ "room.mp4", "room.ts" ], bad )
+        # the same file unmocked matches, and stays when keep is set
+        recorder.to_mp4( path, keep=True )
         self.assertEqual( sorted(os.listdir(self.dir)), [ "room.mp4", "room.ts" ] )
+        recorder.to_mp4( path )
+        self.assertEqual( os.listdir(self.dir), [ "room.mp4" ] )
+
+    def test_sample_descriptions_tell_stream_parameters_apart( self ):
+        other = fragmented_mp4( os.path.join(self.dir, "o.mp4"), "testsrc=size=640x480:rate=25",
+                                [ "-c:v", "libx264", "-g", "25", "-pix_fmt", "yuv420p" ] )[0]
+        same = recorder.sample_descriptions( Fixtures.video[0] )
+        self.assertIn( b"avcC", same )
+        self.assertNotEqual( same, recorder.sample_descriptions(other) )
+        self.assertNotIn( b"mvhd", same )
+
+    def test_the_conversion_runs_detached( self ):
+        for keep in ( False, True ):
+            with mock.patch.object( recorder.subprocess, "Popen" ) as popen:
+                recorder.start_to_mp4( "room.ts", keep )
+            args, kwargs = popen.call_args
+            self.assertEqual( args[0][2:], [ "--to-mp4", "room.ts" ] + ( ["--keep"] if keep else [] ) )
+            self.assertTrue( kwargs["start_new_session"] )
+            popen.return_value.wait.assert_not_called()
 
     def test_a_title_already_recorded_gets_another_path( self ):
         previous = os.getcwd()

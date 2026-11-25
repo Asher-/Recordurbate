@@ -62,12 +62,14 @@ class RoomDir( unittest.TestCase ):
         os.environ[ "RECORDURBATE_SITE" ] = self.hls.base
 
     def tearDown( self ):
-        self.recording() # waits for a remux still writing under cwd
-        self.hls.close()
-        os.environ.clear()
-        os.environ.update( self.env )
-        os.chdir( self.previous )
-        shutil.rmtree( self.cwd )
+        try:
+            self.recording() # waits for a remux still writing under cwd
+        finally:
+            self.hls.close()
+            os.environ.clear()
+            os.environ.update( self.env )
+            os.chdir( self.previous )
+            shutil.rmtree( self.cwd )
 
     def recording( self ):
         # the file recorded for the room, "room <date> <time>.mp4", or a path

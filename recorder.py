@@ -51,7 +51,7 @@ REEXTRACT_AFTER = 15     # seconds without every playlist loading before asking 
 GIVE_UP_AFTER = 120      # seconds without a new segment before exiting
 LOOKUP_TIMEOUT = (3, 5)  # connect, read, for each request of a room lookup
 MP4_TOLERANCE = 1        # seconds an MP4 may differ in length from the .ts it replaces
-CLOSE_TIMEOUT = 3       # seconds each muxer shutdown phase may take
+CLOSE_TIMEOUT = 3        # seconds each muxer shutdown phase may take
 COOKIES_FILE = "chaturbate.com_cookies.txt"  # the user's browser export; read, never written
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 # The edge API's room_status values for a room that is up with no public
@@ -481,17 +481,29 @@ class Muxer:
         self.proc.stdout.close()
         self.out.close()
 
-def to_mp4( path ):
+def sample_descriptions( init ):
+    # The stsd boxes of an fMP4 init segment: a track's codec and parameters.
+    found = b""
+    at = init.find( b"stsd" )
+    while at >= 4:
+        found += init[ at - 4 : at - 4 + int.from_bytes(init[at - 4:at], "big") ]
+        at = init.find( b"stsd", at + 4 )
+    return found
+
+def to_mp4( path, keep = False ):
     # Remuxes the finished MPEG-TS recording at path, without re-encoding,
     # into an MP4 beside it, which iMovie opens and MPEG-TS it does not, then
-    # removes the .ts if the MP4 holds the same codecs for the same time. The
+    # removes the .ts if each track of the MP4 has the same packets over the
+    # same time. keep says the stream's parameters changed as it was recorded:
+    # Apple's decoder stops at such a change in the MP4, so the .ts stays. The
     # MP4 is written under a temporary name and renamed into place, so a remux
     # that fails or is cut short leaves the .ts as it was and no .mp4. An MP4
     # that does not match is kept beside its .ts. Returns the path of the MP4,
     # or of the .ts when there is none.
     target = os.path.splitext( path )[0] + ".mp4"
     temporary = target + ".tmp"
-    cmd = [ "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", path,
+    # By default ffmpeg closes up a gap of over 10s in MPEG-TS timestamps.
+    cmd = [ "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-dts_delta_threshold", "1000000", "-i", path,
             "-c", "copy", "-bsf:a", "aac_adtstoasc", "-f", "mp4", temporary ]
     result = subprocess.run( cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True )
     if result.returncode != 0:
@@ -500,8 +512,15 @@ def to_mp4( path ):
         log( "Converting {} to MP4 failed ({}); keeping the .ts: {}".format(path, result.returncode, result.stderr.strip()) )
         return path
     original, converted = media_info( path ), media_info( temporary )
+    # on disk before the .ts goes, so a power cut cannot take both
+    with open( temporary, "rb" ) as f:
+        os.fsync( f.fileno() )
     os.replace( temporary, target )
-    if original is None or converted is None or original[0] != converted[0] or abs( original[1] - converted[1] ) > MP4_TOLERANCE:
+    if keep:
+        log( "{} changes stream parameters partway; keeping the .ts too".format(target) )
+        return target
+    if original is None or converted is None or len( original ) != len( converted ) or any(
+            a[:2] != b[:2] or abs( a[2] - b[2] ) > MP4_TOLERANCE for a, b in zip( original, converted ) ):
         log( "{} does not match its .ts ({} against {}); keeping both".format(target, converted, original) )
         return target
     os.remove( path )
@@ -509,19 +528,20 @@ def to_mp4( path ):
     return target
 
 def media_info( path ):
-    # ([codec, ...], seconds) of a media file; None when ffprobe cannot tell.
-    result = subprocess.run( [ "ffprobe", "-v", "error", "-show_entries", "stream=codec_name:format=duration", "-of", "json", path ],
-                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL )
+    # [(codec, packets, seconds), ...], one per track of a media file; None
+    # when ffprobe cannot tell.
     try:
+        result = subprocess.run( [ "ffprobe", "-v", "error", "-count_packets", "-show_entries", "stream=codec_name,nb_read_packets,duration", "-of", "json", path ],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL )
         info = json.loads( result.stdout )
-        return sorted( s["codec_name"] for s in info["streams"] ), float( info["format"]["duration"] )
-    except (ValueError, KeyError):
+        return sorted( (s["codec_name"], int(s["nb_read_packets"]), float(s["duration"])) for s in info["streams"] ) or None
+    except (ValueError, KeyError, OSError):
         return None
 
-def start_to_mp4( path ):
+def start_to_mp4( path, keep ):
     # Converts in a process of its own session: a long recording takes minutes,
     # and the daemon launches no recorder for the room until this one exits.
-    subprocess.Popen( [ sys.executable, os.path.abspath(__file__), "--to-mp4", path ], stdin=subprocess.DEVNULL, start_new_session=True )
+    subprocess.Popen( [ sys.executable, os.path.abspath(__file__), "--to-mp4", path ] + ( ["--keep"] if keep else [] ), stdin=subprocess.DEVNULL, start_new_session=True )
 
 def recording_path( name, title ):
     # A path no earlier recording has, as a .ts or as the .mp4 made from it:
@@ -536,9 +556,9 @@ def recording_path( name, title ):
 
 def run():
     # Entry point: recorder.py https://chaturbate.com/<name>/ [<ready fd>]
-    # or, for a finished recording, recorder.py --to-mp4 <path>
+    # or, for a finished recording, recorder.py --to-mp4 <path> [--keep]
     if sys.argv[1] == "--to-mp4":
-        to_mp4( sys.argv[2] )
+        to_mp4( sys.argv[2], "--keep" in sys.argv[3:] )
         return
     url = sys.argv[1]
     ready_fd = int( sys.argv[2] ) if len( sys.argv ) > 2 else None
@@ -584,6 +604,7 @@ def main( url, ready_fd, stop, outcome ):
     session = requests.Session()
     session.headers.update( headers )
     tracks = [ Track(u) for u in urls ]
+    formats = set() # the stream parameters of every muxer started
     muxer = None
     # Segments are fetched on the pool as soon as a playlist lists them, so a
     # slow fetch holds up neither the next playlist reload nor the other
@@ -650,6 +671,7 @@ def main( url, ready_fd, stop, outcome ):
                 muxer = None
             if muxer is None and all( track.init for track in tracks ):
                 muxer = Muxer( path, [ track.init for track in tracks ] )
+                formats.add( tuple(sample_descriptions(track.init) for track in tracks) )
 
             if muxer:
                 for index, track in enumerate( tracks ):
@@ -737,7 +759,7 @@ def main( url, ready_fd, stop, outcome ):
             os.remove( path )
         log( "Stopped recording {}".format(name) )
         if os.path.exists( path ):
-            start_to_mp4( path )
+            start_to_mp4( path, len(formats) > 1 )
     outcome["exit_code"] = 0
 
 if __name__ == "__main__":

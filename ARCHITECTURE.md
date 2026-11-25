@@ -371,9 +371,13 @@ being written, and the file tolerates gaps and muxer restarts.
 On exit by stream end, give-up or signal, the recorder starts
 `recorder.py --to-mp4 <path>` in its own session for a non-empty `.ts` and
 exits without waiting for it, so the daemon can record the room again. `to_mp4` remuxes with
-`ffmpeg -i <title>.ts -c copy -bsf:a aac_adtstoasc -f mp4 <title>.mp4.tmp`,
-renames the result to `<title>.mp4` and, when ffprobe finds the same codecs and
-a length within 1s in both, removes the `.ts`; otherwise both are kept. When
+`ffmpeg -dts_delta_threshold 1000000 -i <title>.ts -c copy -bsf:a aac_adtstoasc -f mp4 <title>.mp4.tmp`,
+renames the result to `<title>.mp4` and, when ffprobe finds the same
+codec, packet count and length (within 1s) for every track in both, removes the
+`.ts`; otherwise both are kept. Both are also kept (`--keep`) when the stream's
+parameters changed during the recording, as Apple's decoder stops at the change
+in the MP4. A conversion that is killed leaves the `.ts`, and perhaps a
+`.mp4.tmp`, and is not retried; nor is one started for a killed recorder. When
 ffmpeg fails the temporary file is removed, the failure is logged and the `.ts`
 is kept. A title that already names a `.ts` or `.mp4` gets ` (2)`, ` (3)`, …
 
