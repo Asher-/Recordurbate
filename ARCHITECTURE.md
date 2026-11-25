@@ -351,7 +351,7 @@ Chaturbate serves LL-HLS with video and audio as separate fMP4 playlists of
 | Init segment bytes differ from the last ones fetched  | Restart the muxer, appending to the same file                      |
 | ffmpeg exits                                          | Restart the muxer, appending to the same file                      |
 | The `.ts` cannot be written, as on a full disk        | Log it, hold the stream in memory and try every 1s until it can be; what is held is lost if the muxer closes first |
-| A log line cannot be written                          | Drop it and keep recording                                         |
+| A log line cannot be written                          | Keep recording; Python may write the line later                    |
 | Media sequence restarts                               | Resume from the playlist's first segment                           |
 | No new segment for 120s                               | Exit                                                               |
 | `EXT-X-ENDLIST`                                       | Exit                                                               |
@@ -370,11 +370,11 @@ it is killed.
 On exit an empty output file is deleted. ffprobe reads the `.ts` while it is
 being written, and the file tolerates gaps and muxer restarts.
 
-On exit by stream end, give-up or signal, the recorder starts
+On exit by stream end, give-up, signal or exception, the recorder starts
 `recorder.py --to-mp4 <path>` in its own session for a non-empty `.ts` and
 exits without waiting for it, so the daemon can record the room again. `to_mp4` remuxes with
-`ffmpeg -dts_delta_threshold 1000000 -i <title>.ts -c copy -bsf:a aac_adtstoasc -f mp4 <title>.mp4.tmp`,
-renames the result to `<title>.mp4` and, when ffprobe finds the same
+`ffmpeg -dts_delta_threshold 1000000 -i <title>.ts -c copy -bsf:a aac_adtstoasc -f mp4 <title>.mp4.tmp`
+(HEVC with `-tag:v hvc1`), flushes the result to the drive, renames the result to `<title>.mp4` and, when ffprobe finds the same
 codec, packet count and length (within 1s) for every track in both, removes the
 `.ts`; otherwise both are kept. Both are also kept (`--keep`) when the stream's
 parameters changed during the recording, as Apple's decoder stops at the change

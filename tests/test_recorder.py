@@ -261,7 +261,7 @@ class MuxerTest( unittest.TestCase ):
         self.assertFalse( muxer.reader.is_alive() )
         self.assertIn( "its last stretch is lost", log.call_args.args[0] )
 
-    def test_a_log_that_cannot_be_written_is_dropped( self ):
+    def test_a_log_that_cannot_be_written_does_not_raise( self ):
         with mock.patch.object( recorder, "print", side_effect=OSError(28, "No space left on device"), create=True ) as printed:
             recorder.log( "message" )
         printed.assert_called_once()
@@ -382,7 +382,10 @@ class FakeHls:
 
     FIRST = 100
 
-    def __init__( self, failing = (), outage = None, hang = False, slow = 0, stall = None, repeat = (), stuck = None ):
+    def __init__( self, failing = (), outage = None, hang = False, slow = 0, stall = None, repeat = (), stuck = None, change = None ):
+        # change=(init, fragments) replaces the video track from its fourth
+        # second on, under another init URI.
+        self.change = change
         # outage=(start, end) answers 503 to everything in that window of
         # seconds; hang=True never answers a media segment; slow delays each
         # media segment's answer by that many seconds; stall=(start, end)
@@ -442,19 +445,26 @@ class FakeHls:
         if self.slow and name.startswith("seg_"):
             time.sleep( self.slow )
         init, fragments = self.track( letter )
+        init_name = "init.mp4"
+        if self.change and letter == "v":
+            fragments = fragments[:3] + self.change[1][3:]
+            if name == "init2.mp4":
+                init = self.change[0]
+            if elapsed >= 3:
+                init_name = "init2.mp4"
         if name == "playlist.m3u8" and self.stall and self.stall[0] <= elapsed < self.stall[1]:
             time.sleep( self.stall[1] - elapsed )
         if name == "playlist.m3u8":
             available = min( len(fragments), int(time.time() - self.started) + 1 )
             first = max( 0, available - 3 )
             lines = [ "#EXTM3U", "#EXT-X-VERSION:6", "#EXT-X-TARGETDURATION:1",
-                      "#EXT-X-MEDIA-SEQUENCE:{}".format(self.FIRST + first), '#EXT-X-MAP:URI="init.mp4"' ]
+                      "#EXT-X-MEDIA-SEQUENCE:{}".format(self.FIRST + first), '#EXT-X-MAP:URI="{}"'.format(init_name) ]
             for index in range( first, available ):
                 lines += [ "#EXTINF:1.0,", "seg_{}.m4s".format(self.FIRST + index) ]
             if available == len( fragments ) and time.time() - self.started > len( fragments ) + 1:
                 lines.append( "#EXT-X-ENDLIST" )
             body = ( "\n".join(lines) + "\n" ).encode()
-        elif name == "init.mp4":
+        elif name in ( "init.mp4", "init2.mp4" ):
             body = init
         else:
             sequence = int( name[len("seg_"):-len(".m4s")] )
@@ -596,7 +606,7 @@ class FakeSite:
             self.respond( request, e.code )
             return
         prefix = "{}/{}/".format( self.hls.base, letter )
-        text = text.replace( 'URI="init.mp4"', 'URI="{}init.mp4"'.format(prefix) )
+        text = text.replace( 'URI="init', 'URI="{}init'.format(prefix) )
         text = "\n".join( prefix + line if line.startswith("seg_") else line for line in text.split("\n") )
         self.respond( request, 200, text.encode() )
 
@@ -650,6 +660,19 @@ class RecorderRunTest( unittest.TestCase ):
         self.assertEqual( codecs, [ "aac", "h264" ] )
         self.assertIn( "mp4", container.split(",") )
         self.assertGreater( duration, 4 )
+
+    def test_a_change_of_resolution_keeps_the_ts( self ):
+        hls = fake_site( change=fragmented_mp4( os.path.join(self.cwd, "big.mp4"), "testsrc=size=640x480:rate=25",
+                                                [ "-c:v", "libx264", "-g", "25", "-pix_fmt", "yuv420p" ] ) )
+        try:
+            result = self.run_recorder( hls )
+        finally:
+            hls.close()
+        self.assertEqual( result.returncode, 0, result.stdout )
+        self.assertIn( "Stream parameters changed; restarting muxer", result.stdout )
+        self.assertIn( "changes stream parameters partway; keeping the .ts too", result.stdout )
+        names = os.listdir( os.path.join(self.cwd, "videos", "room") )
+        self.assertEqual( sorted( os.path.splitext(name)[1] for name in names ), [ ".mp4", ".ts" ] )
 
     def test_slow_segments_are_all_recorded( self ):
         # Each media segment takes 0.8s to answer while each track gains one

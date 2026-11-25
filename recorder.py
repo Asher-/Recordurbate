@@ -16,6 +16,7 @@ when no segment arrives for GIVE_UP_AFTER seconds, or on SIGINT/SIGTERM.
 As it exits it starts a process that remuxes the finished .ts into an .mp4 and
 removes the .ts.
 """
+import fcntl
 import hashlib
 import json
 import os
@@ -530,19 +531,26 @@ def to_mp4( path, keep = False ):
     # or of the .ts when there is none.
     target = os.path.splitext( path )[0] + ".mp4"
     temporary = target + ".tmp"
+    original = media_info( path )
+    # Apple's decoders take HEVC under the tag hvc1, not ffmpeg's hev1.
+    tag = [ "-tag:v", "hvc1" ] if any( track[0] == "hevc" for track in original or [] ) else []
     # By default ffmpeg closes up a gap of over 10s in MPEG-TS timestamps.
     cmd = [ "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-dts_delta_threshold", "1000000", "-i", path,
-            "-c", "copy", "-bsf:a", "aac_adtstoasc", "-f", "mp4", temporary ]
+            "-c", "copy", "-bsf:a", "aac_adtstoasc" ] + tag + [ "-f", "mp4", temporary ]
     result = subprocess.run( cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True )
     if result.returncode != 0:
         if os.path.exists( temporary ):
             os.remove( temporary )
         log( "Converting {} to MP4 failed ({}); keeping the .ts: {}".format(path, result.returncode, result.stderr.strip()) )
         return path
-    original, converted = media_info( path ), media_info( temporary )
+    converted = media_info( temporary )
     # on disk before the .ts goes, so a power cut cannot take both
+    # (macOS's fsync leaves data in the drive's cache; F_FULLFSYNC does not)
     with open( temporary, "rb" ) as f:
-        os.fsync( f.fileno() )
+        if hasattr( fcntl, "F_FULLFSYNC" ):
+            fcntl.fcntl( f.fileno(), fcntl.F_FULLFSYNC )
+        else:
+            os.fsync( f.fileno() )
     os.replace( temporary, target )
     if keep:
         log( "{} changes stream parameters partway; keeping the .ts too".format(target) )
