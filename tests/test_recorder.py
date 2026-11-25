@@ -227,6 +227,45 @@ class MuxerTest( unittest.TestCase ):
         self.assertAlmostEqual( duration, 12, delta=2 )
         self.assertAlmostEqual( recorder.ts_end_seconds( path ), duration, delta=2 )
 
+    def feed_with_full_disk( self, path, refusals ):
+        # A muxer whose first writes are refused for want of space, and whose
+        # later ones take at most 1000 bytes each.
+        muxer = recorder.Muxer( path, [ Fixtures.video[0] ] )
+        out = muxer.out
+        left = [ refusals ]
+        def write( data ):
+            if left[0] > 0:
+                left[0] -= 1
+                raise OSError( 28, "No space left on device" )
+            return out.write( data[:1000] )
+        muxer.out = mock.Mock( write=write, close=out.close )
+        for fragment in Fixtures.video[1]:
+            muxer.feed( 0, fragment )
+        return muxer
+
+    def test_a_full_disk_loses_nothing_once_it_has_space( self ):
+        path = os.path.join( Fixtures.tmp, "full.ts" )
+        with mock.patch.object( recorder, "WRITE_RETRY", 0.1 ), mock.patch.object( recorder, "log" ) as log:
+            self.feed_with_full_disk( path, 5 ).close()
+        self.assertEqual( [ call.args[0].split(" (")[0] for call in log.call_args_list ],
+                          [ "Cannot write the recording", "Writing the recording again" ] )
+        self.assertEqual( recorder.media_info(path)[0][1], 150 )
+
+    def test_a_muxer_closes_while_the_disk_is_full( self ):
+        path = os.path.join( Fixtures.tmp, "stillfull.ts" )
+        muxer = self.feed_with_full_disk( path, 10 ** 9 )
+        with mock.patch.object( recorder, "log" ) as log:
+            started = time.time()
+            muxer.close()
+        self.assertLess( time.time() - started, 10 )
+        self.assertFalse( muxer.reader.is_alive() )
+        self.assertIn( "its last stretch is lost", log.call_args.args[0] )
+
+    def test_a_log_that_cannot_be_written_is_dropped( self ):
+        with mock.patch.object( recorder, "print", side_effect=OSError(28, "No space left on device"), create=True ) as printed:
+            recorder.log( "message" )
+        printed.assert_called_once()
+
     def test_ts_end_of_a_missing_file_is_zero( self ):
         self.assertEqual( recorder.ts_end_seconds( os.path.join(Fixtures.tmp, "absent.ts") ), 0 )
 

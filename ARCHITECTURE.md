@@ -350,6 +350,8 @@ Chaturbate serves LL-HLS with video and audio as separate fMP4 playlists of
 | Re-resolution: a different number of tracks          | Restart the muxer with the new tracks, appending to the same file  |
 | Init segment bytes differ from the last ones fetched  | Restart the muxer, appending to the same file                      |
 | ffmpeg exits                                          | Restart the muxer, appending to the same file                      |
+| The `.ts` cannot be written, as on a full disk        | Log it, hold the stream in memory and try every 1s until it can be; what is held is lost if the muxer closes first |
+| A log line cannot be written                          | Drop it and keep recording                                         |
 | Media sequence restarts                               | Resume from the playlist's first segment                           |
 | No new segment for 120s                               | Exit                                                               |
 | `EXT-X-ENDLIST`                                       | Exit                                                               |

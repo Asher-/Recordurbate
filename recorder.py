@@ -50,7 +50,8 @@ CONFIG_FILE = os.path.join( "configs", "config.json" )
 REEXTRACT_AFTER = 15     # seconds without every playlist loading before asking the site for fresh URLs
 GIVE_UP_AFTER = 120      # seconds without a new segment before exiting
 LOOKUP_TIMEOUT = (3, 5)  # connect, read, for each request of a room lookup
-MP4_TOLERANCE = 1        # seconds an MP4 may differ in length from the .ts it replaces
+WRITE_RETRY = 1          # seconds between tries at a write the disk refused
+MP4_TOLERANCE = 1       # seconds an MP4 may differ in length from the .ts it replaces
 CLOSE_TIMEOUT = 3        # seconds each muxer shutdown phase may take
 COOKIES_FILE = "chaturbate.com_cookies.txt"  # the user's browser export; read, never written
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -65,7 +66,11 @@ ROOM_STATUS_MESSAGES = {
 }
 
 def log( message ):
-    print( "[recorder {}] {}".format( time.strftime("%Y-%m-%d %H:%M:%S"), message ), flush=True )
+    # A log that cannot be written, as on a full disk, must not end a recording.
+    try:
+        print( "[recorder {}] {}".format( time.strftime("%Y-%m-%d %H:%M:%S"), message ), flush=True )
+    except OSError:
+        pass
 
 def signal_ready( fd ):
     # Tells the daemon that launched this recorder that the room resolved. The
@@ -411,7 +416,8 @@ class Muxer:
 
     def __init__( self, path, inits ):
         offset = ts_end_seconds( path )
-        self.out = open( path, "ab" )
+        self.out = open( path, "ab", buffering=0 ) # nothing held back for close() to fail on
+        self.closing = threading.Event()
         pipes = [ os.pipe() for _ in inits ]
         cmd = [ "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin" ]
         for read_fd, _ in pipes:
@@ -456,8 +462,29 @@ class Muxer:
             chunk = self.proc.stdout.read1( 1 << 16 )
             if not chunk:
                 break
-            self.out.write( chunk )
-            self.out.flush()
+            if not self._save( chunk ):
+                break
+
+    def _save( self, chunk ):
+        # Writes chunk whole, trying again while the disk refuses it: ffmpeg
+        # waits on its full pipe and the segments on their queues, so a disk
+        # that was full loses nothing once it has space. False when the muxer
+        # closes first.
+        view = memoryview( chunk )
+        failed = False
+        while view:
+            try:
+                view = view[ self.out.write( view ): ]
+            except OSError as e:
+                if not failed:
+                    log( "Cannot write the recording ({}); trying until it can be".format(e) )
+                failed = True
+                if self.closing.wait( WRITE_RETRY ):
+                    log( "Recording closed while it could not be written; its last stretch is lost" )
+                    return False
+        if failed:
+            log( "Writing the recording again" )
+        return True
 
     def alive( self ):
         return self.proc.poll() is None
@@ -477,6 +504,7 @@ class Muxer:
         if self.proc.poll() is None:
             self.proc.kill()
         self.proc.wait()
+        self.closing.set()
         self.reader.join()
         self.proc.stdout.close()
         self.out.close()
