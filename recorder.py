@@ -52,7 +52,8 @@ REEXTRACT_AFTER = 15     # seconds without every playlist loading before asking 
 GIVE_UP_AFTER = 120      # seconds without a new segment before exiting
 LOOKUP_TIMEOUT = (3, 5)  # connect, read, for each request of a room lookup
 WRITE_RETRY = 1          # seconds between tries at a write the disk refused
-MP4_TOLERANCE = 1       # seconds an MP4 may differ in length from the .ts it replaces
+AUDIO_GAP = 0.1          # seconds between audio packets that make a gap; AAC's are ~0.02s apart
+MP4_TOLERANCE = 1      # seconds an MP4 may differ in length from the .ts it replaces
 CLOSE_TIMEOUT = 3        # seconds each muxer shutdown phase may take
 COOKIES_FILE = "chaturbate.com_cookies.txt"  # the user's browser export; read, never written
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -520,8 +521,7 @@ def sample_descriptions( init ):
     return found
 
 def to_mp4( path, keep = False ):
-    # Remuxes the finished MPEG-TS recording at path, without re-encoding,
-    # into an MP4 beside it, which iMovie opens and MPEG-TS it does not, then
+    # Remuxes the finished MPEG-TS recording at path, its video as it is, into an MP4 beside it, which iMovie opens and MPEG-TS it does not, then
     # removes the .ts if each track of the MP4 has the same packets over the
     # same time. keep says the stream's parameters changed as it was recorded:
     # Apple's decoder stops at such a change in the MP4, so the .ts stays. The
@@ -534,9 +534,14 @@ def to_mp4( path, keep = False ):
     original = media_info( path )
     # Apple's decoders take HEVC under the tag hvc1, not ffmpeg's hev1.
     tag = [ "-tag:v", "hvc1" ] if any( track[0] == "hevc" for track in original or [] ) else []
+    # Apple's players close up a gap in an MP4's audio and play the rest out of
+    # step with the video, so the gaps are filled with silence, which takes
+    # encoding the audio again.
+    gaps = has_audio_gaps( path )
+    audio = [ "-c:a", "aac", "-af", "aresample=async=1:min_hard_comp=0.1" ] if gaps else [ "-c:a", "copy", "-bsf:a", "aac_adtstoasc" ]
     # By default ffmpeg closes up a gap of over 10s in MPEG-TS timestamps.
-    cmd = [ "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-dts_delta_threshold", "1000000", "-i", path,
-            "-c", "copy", "-bsf:a", "aac_adtstoasc" ] + tag + [ "-f", "mp4", temporary ]
+    cmd = [ "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin", "-y", "-dts_delta_threshold", "1000000", "-i", path,
+            "-c:v", "copy" ] + audio + tag + [ "-f", "mp4", temporary ]
     result = subprocess.run( cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True )
     if result.returncode != 0:
         if os.path.exists( temporary ):
@@ -555,6 +560,12 @@ def to_mp4( path, keep = False ):
     if keep:
         log( "{} changes stream parameters partway; keeping the .ts too".format(target) )
         return target
+    if gaps:
+        log( "{} has silence in place of gaps in its audio; keeping the .ts too".format(target) )
+        return target
+    if "corrupt" in result.stderr.lower():
+        log( "{} has damaged packets; keeping the .ts too".format(target) )
+        return target
     if original is None or converted is None or len( original ) != len( converted ) or any(
             a[:2] != b[:2] or abs( a[2] - b[2] ) > MP4_TOLERANCE for a, b in zip( original, converted ) ):
         log( "{} does not match its .ts ({} against {}); keeping both".format(target, converted, original) )
@@ -562,6 +573,25 @@ def to_mp4( path, keep = False ):
     os.remove( path )
     log( "Saved {}".format(target) )
     return target
+
+def has_audio_gaps( path ):
+    # Whether any two audio packets in a row are over AUDIO_GAP seconds apart.
+    try:
+        probe = subprocess.Popen( [ "ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "packet=pts_time", "-of", "csv=p=0", path ],
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True )
+    except OSError:
+        return False # without ffprobe to_mp4 keeps the .ts whatever this says
+    found = False
+    last = None
+    with probe:
+        for line in probe.stdout:
+            try:
+                pts = float( line.split(",")[0] )
+            except ValueError:
+                continue
+            found = found or ( last is not None and pts - last > AUDIO_GAP )
+            last = pts
+    return found
 
 def media_info( path ):
     # [(codec, packets, seconds), ...], one per track of a media file; None

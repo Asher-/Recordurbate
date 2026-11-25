@@ -245,7 +245,9 @@ class MuxerTest( unittest.TestCase ):
 
     def test_a_full_disk_loses_nothing_once_it_has_space( self ):
         path = os.path.join( Fixtures.tmp, "full.ts" )
-        with mock.patch.object( recorder, "WRITE_RETRY", 0.1 ), mock.patch.object( recorder, "log" ) as log:
+        # a close budget under which ffmpeg is not killed while it drains
+        with mock.patch.object( recorder, "WRITE_RETRY", 0.1 ), mock.patch.object( recorder, "CLOSE_TIMEOUT", 30 ), \
+             mock.patch.object( recorder, "log" ) as log:
             self.feed_with_full_disk( path, 5 ).close()
         self.assertEqual( [ call.args[0].split(" (")[0] for call in log.call_args_list ],
                           [ "Cannot write the recording", "Writing the recording again" ] )
@@ -308,9 +310,27 @@ class ToMp4Test( unittest.TestCase ):
                 with open( part, "rb" ) as f:
                     out.write( f.read() )
                 os.remove( part )
+        self.assertTrue( recorder.has_audio_gaps(path) )
         saved = recorder.to_mp4( path )
-        self.assertEqual( os.listdir(self.dir), [ "room.mp4" ] )
+        self.assertEqual( sorted(os.listdir(self.dir)), [ "room.mp4", "room.ts" ] )
         self.assertAlmostEqual( probe(saved)[2], 66, delta=1 )
+        # the gap is filled with silence, the video is copied whole
+        self.assertFalse( recorder.has_audio_gaps(saved) )
+        self.assertEqual( [ track[1] for track in recorder.media_info(saved) if track[0] == "h264" ], [ 300 ] )
+
+    def test_a_damaged_recording_is_kept( self ):
+        path = os.path.join( self.dir, "room.ts" )
+        muxer = recorder.Muxer( path, [ Fixtures.video[0], Fixtures.audio[0] ] )
+        for index, fragments in enumerate( (Fixtures.video[1], Fixtures.audio[1]) ):
+            for fragment in fragments:
+                muxer.feed( index, fragment )
+        muxer.close()
+        size = os.path.getsize( path )
+        with open( path, "r+b" ) as f:
+            f.seek( size // 2 )
+            f.write( b"\0" * 2000 )
+        recorder.to_mp4( path )
+        self.assertIn( "room.ts", os.listdir(self.dir) )
 
     def test_a_recording_its_mp4_does_not_match_is_kept( self ):
         path = os.path.join( self.dir, "room.ts" )
@@ -640,9 +660,10 @@ class RecorderRunTest( unittest.TestCase ):
                                timeout=timeout, text=True )
 
     def recording( self ):
-        # the one file recorded for the room, named "room <date> <time>.mp4"
-        names = os.listdir( os.path.join(self.cwd, "videos", "room") )
-        self.assertEqual( len(names), 1, names )
+        # the one recording of the room, "room <date> <time>.mp4"; its .ts is
+        # kept beside it when its audio has gaps
+        names = sorted( os.listdir( os.path.join(self.cwd, "videos", "room") ) )
+        self.assertIn( names[1:], ( [], [ os.path.splitext(names[0])[0] + ".ts" ] ), names )
         self.assertRegex( names[0], RECORDING )
         return os.path.join( self.cwd, "videos", "room", names[0] )
 
