@@ -13,6 +13,7 @@ stream URLs. When the site reports the room unavailable it waits up to
 room_return_wait_minutes (configs/config.json) for the room to come back and
 records on into the same file; it exits when the room stays away that long,
 when no segment arrives for GIVE_UP_AFTER seconds, or on SIGINT/SIGTERM.
+As it exits it remuxes the finished .ts into an .mp4 and removes the .ts.
 """
 import hashlib
 import json
@@ -478,6 +479,27 @@ class Muxer:
         self.proc.stdout.close()
         self.out.close()
 
+def to_mp4( path ):
+    # Remuxes the finished MPEG-TS recording at path, without re-encoding,
+    # into an MP4 beside it, which iMovie opens and MPEG-TS it does not, then
+    # removes the .ts. The MP4 is written under a temporary name and renamed
+    # into place, so a remux that fails or is cut short leaves the .ts as it
+    # was and no .mp4. Returns the path the recording ends up at.
+    target = os.path.splitext( path )[0] + ".mp4"
+    temporary = target + ".tmp"
+    cmd = [ "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", path,
+            "-c", "copy", "-bsf:a", "aac_adtstoasc", "-f", "mp4", temporary ]
+    result = subprocess.run( cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True )
+    if result.returncode != 0:
+        if os.path.exists( temporary ):
+            os.remove( temporary )
+        log( "Converting {} to MP4 failed ({}); keeping the .ts: {}".format(path, result.returncode, result.stderr.strip()) )
+        return path
+    os.replace( temporary, target )
+    os.remove( path )
+    log( "Saved {}".format(target) )
+    return target
+
 def run():
     # Entry point: recorder.py https://chaturbate.com/<name>/ [<ready fd>]
     url = sys.argv[1]
@@ -676,6 +698,8 @@ def main( url, ready_fd, stop, outcome ):
         if os.path.exists( path ) and os.path.getsize( path ) == 0:
             os.remove( path )
         log( "Stopped recording {}".format(name) )
+        if os.path.exists( path ):
+            to_mp4( path )
     outcome["exit_code"] = 0
 
 if __name__ == "__main__":

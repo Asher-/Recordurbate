@@ -230,6 +230,42 @@ class MuxerTest( unittest.TestCase ):
     def test_ts_end_of_a_missing_file_is_zero( self ):
         self.assertEqual( recorder.ts_end_seconds( os.path.join(Fixtures.tmp, "absent.ts") ), 0 )
 
+class ToMp4Test( unittest.TestCase ):
+
+    def setUp( self ):
+        self.dir = tempfile.mkdtemp()
+
+    def tearDown( self ):
+        shutil.rmtree( self.dir )
+
+    def test_remuxes_a_recording_into_mp4_and_removes_the_ts( self ):
+        path = os.path.join( self.dir, "room 2026-11-25 12_00.ts" )
+        video_init, video = Fixtures.video
+        audio_init, audio = Fixtures.audio
+        muxer = recorder.Muxer( path, [ video_init, audio_init ] )
+        for fragment in video:
+            muxer.feed( 0, fragment )
+        for fragment in audio:
+            muxer.feed( 1, fragment )
+        muxer.close()
+        _, _, ts_duration = probe( path )
+        saved = recorder.to_mp4( path )
+        self.assertEqual( saved, os.path.join( self.dir, "room 2026-11-25 12_00.mp4" ) )
+        self.assertEqual( os.listdir( self.dir ), [ "room 2026-11-25 12_00.mp4" ] )
+        codecs, container, duration = probe( saved )
+        self.assertEqual( codecs, [ "aac", "h264" ] )
+        self.assertIn( "mp4", container.split(",") )
+        self.assertAlmostEqual( duration, ts_duration, delta=0.5 )
+
+    def test_a_recording_that_cannot_be_remuxed_is_kept( self ):
+        path = os.path.join( self.dir, "room 2026-11-25 12_00.ts" )
+        with open( path, "wb" ) as f:
+            f.write( b"not a transport stream" )
+        self.assertEqual( recorder.to_mp4( path ), path )
+        self.assertEqual( os.listdir( self.dir ), [ "room 2026-11-25 12_00.ts" ] )
+        with open( path, "rb" ) as f:
+            self.assertEqual( f.read(), b"not a transport stream" )
+
 EDGE_API = os.path.join( ROOT, "tests", "fixtures", "edge_api" )
 CAPTURED_HOST = "https://edge27-atl.live.mmcdn.com"
 
@@ -474,6 +510,7 @@ def fake_site( api = "ok", master = "ok", back = None, **media ):
     return FakeSite( FakeHls(**media), api, master, back )
 
 TITLE = re.compile( r"room \d{4}-\d\d-\d\d \d\d_\d\d\.ts" )
+RECORDING = re.compile( r"room \d{4}-\d\d-\d\d \d\d_\d\d\.mp4" )
 
 class RecorderRunTest( unittest.TestCase ):
     # Runs recorder.py as the daemon does, against FakeSite as the site's room API
@@ -492,10 +529,10 @@ class RecorderRunTest( unittest.TestCase ):
                                timeout=timeout, text=True )
 
     def recording( self ):
-        # the one file recorded for the room, named "room <date> <time>.ts"
+        # the one file recorded for the room, named "room <date> <time>.mp4"
         names = os.listdir( os.path.join(self.cwd, "videos", "room") )
         self.assertEqual( len(names), 1, names )
-        self.assertRegex( names[0], TITLE )
+        self.assertRegex( names[0], RECORDING )
         return os.path.join( self.cwd, "videos", "room", names[0] )
 
     def test_records_both_tracks_across_a_failed_segment( self ):
@@ -507,9 +544,10 @@ class RecorderRunTest( unittest.TestCase ):
         self.assertEqual( result.returncode, 0, result.stdout )
         self.assertIn( "Track 0 segment 102 failed: +0.0s HTTP 500; +", result.stdout )
         self.assertIn( "Stream ended", result.stdout )
+        self.assertIn( "Saved videos/room/room ", result.stdout )
         codecs, container, duration = probe( self.recording() )
         self.assertEqual( codecs, [ "aac", "h264" ] )
-        self.assertEqual( container, "mpegts" )
+        self.assertIn( "mp4", container.split(",") )
         self.assertGreater( duration, 4 )
 
     def test_slow_segments_are_all_recorded( self ):

@@ -70,7 +70,8 @@ list status).
 The daemon spawns one `recorder.py` subprocess per online streamer. The
 recorder looks the room's playlists up through the site's API, downloads every video and
 audio segment itself, and has a local ffmpeg mux them into
-`videos/<name>/<title>.ts`. The daemon monitors these processes, validates
+`videos/<name>/<title>.ts`, remuxed into `<title>.mp4` when the recording
+ends. The daemon monitors these processes, validates
 that each launch started, and relaunches recorders when streams end.
 
 The daemon listens on a fixed localhost TCP port, so the CLI connects to it
@@ -366,6 +367,12 @@ it is killed.
 
 On exit an empty output file is deleted. ffprobe reads the `.ts` while it is
 being written, and the file tolerates gaps and muxer restarts.
+
+On exit, however the recording ended, `to_mp4` remuxes a non-empty `.ts` with
+`ffmpeg -i <title>.ts -c copy -bsf:a aac_adtstoasc -f mp4 <title>.mp4.tmp`,
+renames the result to `<title>.mp4` and removes the `.ts`. When ffmpeg fails
+the temporary file is removed, the failure is logged and the `.ts` is kept. A
+stopped recorder exits only once the remux is done.
 
 ---
 

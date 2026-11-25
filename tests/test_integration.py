@@ -69,12 +69,12 @@ class RoomDir( unittest.TestCase ):
         shutil.rmtree( self.cwd )
 
     def recording( self ):
-        # the file recorded for the room, "room <date> <time>.ts", or a path
+        # the file recorded for the room, "room <date> <time>.mp4", or a path
         # that does not exist when nothing was recorded
         folder = os.path.join( self.cwd, "videos", "room" )
         names = os.listdir( folder ) if os.path.isdir( folder ) else []
         self.assertLessEqual( len(names), 1, names )
-        return os.path.join( folder, names[0] ) if names else os.path.join( folder, "nothing.ts" )
+        return os.path.join( folder, names[0] ) if names else os.path.join( folder, "nothing.mp4" )
 
 class StreamerLaunchesRecorderTest( RoomDir ):
 
@@ -88,7 +88,7 @@ class StreamerLaunchesRecorderTest( RoomDir ):
         self.assertIsNone( streamer.stream )
         codecs, container, duration = probe( self.recording() )
         self.assertEqual( codecs, [ "aac", "h264" ] )
-        self.assertEqual( container, "mpegts" )
+        self.assertIn( "mp4", container.split(",") )
         with open( os.path.join("configs", "capture-room.log") ) as f:
             self.assertIn( "Stream ended", f.read() )
 
