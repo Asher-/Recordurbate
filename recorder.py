@@ -13,7 +13,8 @@ stream URLs. When the site reports the room unavailable it waits up to
 room_return_wait_minutes (configs/config.json) for the room to come back and
 records on into the same file; it exits when the room stays away that long,
 when no segment arrives for GIVE_UP_AFTER seconds, or on SIGINT/SIGTERM.
-As it exits it remuxes the finished .ts into an .mp4 and removes the .ts.
+As it exits it starts a process that remuxes the finished .ts into an .mp4 and
+removes the .ts.
 """
 import hashlib
 import json
@@ -49,7 +50,8 @@ CONFIG_FILE = os.path.join( "configs", "config.json" )
 REEXTRACT_AFTER = 15     # seconds without every playlist loading before asking the site for fresh URLs
 GIVE_UP_AFTER = 120      # seconds without a new segment before exiting
 LOOKUP_TIMEOUT = (3, 5)  # connect, read, for each request of a room lookup
-CLOSE_TIMEOUT = 3        # seconds each muxer shutdown phase may take
+MP4_TOLERANCE = 1        # seconds an MP4 may differ in length from the .ts it replaces
+CLOSE_TIMEOUT = 3       # seconds each muxer shutdown phase may take
 COOKIES_FILE = "chaturbate.com_cookies.txt"  # the user's browser export; read, never written
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 # The edge API's room_status values for a room that is up with no public
@@ -482,9 +484,11 @@ class Muxer:
 def to_mp4( path ):
     # Remuxes the finished MPEG-TS recording at path, without re-encoding,
     # into an MP4 beside it, which iMovie opens and MPEG-TS it does not, then
-    # removes the .ts. The MP4 is written under a temporary name and renamed
-    # into place, so a remux that fails or is cut short leaves the .ts as it
-    # was and no .mp4. Returns the path the recording ends up at.
+    # removes the .ts if the MP4 holds the same codecs for the same time. The
+    # MP4 is written under a temporary name and renamed into place, so a remux
+    # that fails or is cut short leaves the .ts as it was and no .mp4. An MP4
+    # that does not match is kept beside its .ts. Returns the path of the MP4,
+    # or of the .ts when there is none.
     target = os.path.splitext( path )[0] + ".mp4"
     temporary = target + ".tmp"
     cmd = [ "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", path,
@@ -495,13 +499,47 @@ def to_mp4( path ):
             os.remove( temporary )
         log( "Converting {} to MP4 failed ({}); keeping the .ts: {}".format(path, result.returncode, result.stderr.strip()) )
         return path
+    original, converted = media_info( path ), media_info( temporary )
     os.replace( temporary, target )
+    if original is None or converted is None or original[0] != converted[0] or abs( original[1] - converted[1] ) > MP4_TOLERANCE:
+        log( "{} does not match its .ts ({} against {}); keeping both".format(target, converted, original) )
+        return target
     os.remove( path )
     log( "Saved {}".format(target) )
     return target
 
+def media_info( path ):
+    # ([codec, ...], seconds) of a media file; None when ffprobe cannot tell.
+    result = subprocess.run( [ "ffprobe", "-v", "error", "-show_entries", "stream=codec_name:format=duration", "-of", "json", path ],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL )
+    try:
+        info = json.loads( result.stdout )
+        return sorted( s["codec_name"] for s in info["streams"] ), float( info["format"]["duration"] )
+    except (ValueError, KeyError):
+        return None
+
+def start_to_mp4( path ):
+    # Converts in a process of its own session: a long recording takes minutes,
+    # and the daemon launches no recorder for the room until this one exits.
+    subprocess.Popen( [ sys.executable, os.path.abspath(__file__), "--to-mp4", path ], stdin=subprocess.DEVNULL, start_new_session=True )
+
+def recording_path( name, title ):
+    # A path no earlier recording has, as a .ts or as the .mp4 made from it:
+    # a room recorded twice in a minute gets the same title twice.
+    stem = os.path.join( "videos", name, title )
+    number = 1
+    candidate = stem
+    while os.path.exists( candidate + ".ts" ) or os.path.exists( candidate + ".mp4" ):
+        number += 1
+        candidate = "{} ({})".format( stem, number )
+    return candidate + ".ts"
+
 def run():
     # Entry point: recorder.py https://chaturbate.com/<name>/ [<ready fd>]
+    # or, for a finished recording, recorder.py --to-mp4 <path>
+    if sys.argv[1] == "--to-mp4":
+        to_mp4( sys.argv[2] )
+        return
     url = sys.argv[1]
     ready_fd = int( sys.argv[2] ) if len( sys.argv ) > 2 else None
 
@@ -538,7 +576,7 @@ def main( url, ready_fd, stop, outcome ):
         return
     title, urls, headers = result
     os.makedirs( os.path.join("videos", name), exist_ok=True )
-    path = os.path.join( "videos", name, title + ".ts" )
+    path = recording_path( name, title )
     log( "Recording {} to {}".format(name, path) )
     if ready_fd is not None:
         signal_ready( ready_fd )
@@ -699,7 +737,7 @@ def main( url, ready_fd, stop, outcome ):
             os.remove( path )
         log( "Stopped recording {}".format(name) )
         if os.path.exists( path ):
-            to_mp4( path )
+            start_to_mp4( path )
     outcome["exit_code"] = 0
 
 if __name__ == "__main__":

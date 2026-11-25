@@ -63,7 +63,8 @@ pip install psutil requests
 Streams are recorded to `videos/<streamer_name>/<title>.ts`, MPEG-TS that can be
 opened while it is still being written. When the recording ends it is remuxed,
 without re-encoding, into `videos/<streamer_name>/<title>.mp4` (which iMovie
-opens) and the `.ts` is removed; if the remux fails the `.ts` is kept.
+opens) and the `.ts` is removed; if the remux fails or its length or codecs
+differ from the `.ts`, the `.ts` is kept.
 
 ## Running Recordurbate
 

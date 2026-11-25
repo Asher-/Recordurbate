@@ -257,6 +257,28 @@ class ToMp4Test( unittest.TestCase ):
         self.assertIn( "mp4", container.split(",") )
         self.assertAlmostEqual( duration, ts_duration, delta=0.5 )
 
+    def test_a_recording_its_mp4_does_not_match_is_kept( self ):
+        path = os.path.join( self.dir, "room.ts" )
+        muxer = recorder.Muxer( path, [ Fixtures.video[0] ] )
+        for fragment in Fixtures.video[1]:
+            muxer.feed( 0, fragment )
+        muxer.close()
+        infos = [ (["h264"], 6.0), (["h264"], 3.0) ]
+        with mock.patch.object( recorder, "media_info", side_effect=infos ):
+            recorder.to_mp4( path )
+        self.assertEqual( sorted(os.listdir(self.dir)), [ "room.mp4", "room.ts" ] )
+
+    def test_a_title_already_recorded_gets_another_path( self ):
+        previous = os.getcwd()
+        os.chdir( self.dir )
+        self.addCleanup( os.chdir, previous )
+        os.makedirs( "videos/room" )
+        self.assertEqual( recorder.recording_path("room", "t"), "videos/room/t.ts" )
+        open( "videos/room/t.mp4", "w" ).close()
+        self.assertEqual( recorder.recording_path("room", "t"), "videos/room/t (2).ts" )
+        open( "videos/room/t (2).ts", "w" ).close()
+        self.assertEqual( recorder.recording_path("room", "t"), "videos/room/t (3).ts" )
+
     def test_a_recording_that_cannot_be_remuxed_is_kept( self ):
         path = os.path.join( self.dir, "room 2026-11-25 12_00.ts" )
         with open( path, "wb" ) as f:

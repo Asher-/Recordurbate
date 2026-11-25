@@ -62,6 +62,7 @@ class RoomDir( unittest.TestCase ):
         os.environ[ "RECORDURBATE_SITE" ] = self.hls.base
 
     def tearDown( self ):
+        self.recording() # waits for a remux still writing under cwd
         self.hls.close()
         os.environ.clear()
         os.environ.update( self.env )
@@ -72,7 +73,13 @@ class RoomDir( unittest.TestCase ):
         # the file recorded for the room, "room <date> <time>.mp4", or a path
         # that does not exist when nothing was recorded
         folder = os.path.join( self.cwd, "videos", "room" )
-        names = os.listdir( folder ) if os.path.isdir( folder ) else []
+        # the remux outlives its recorder
+        deadline = time.time() + 20
+        while True:
+            names = os.listdir( folder ) if os.path.isdir( folder ) else []
+            if all( name.endswith(".mp4") for name in names ) or time.time() > deadline:
+                break
+            time.sleep( 0.1 )
         self.assertLessEqual( len(names), 1, names )
         return os.path.join( folder, names[0] ) if names else os.path.join( folder, "nothing.mp4" )
 
