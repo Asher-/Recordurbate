@@ -62,18 +62,24 @@ def probe( path ):
     return sorted( s["codec_name"] for s in info["streams"] ), info["format"]["format_name"], float( info["format"]["duration"] )
 
 class Fixtures:
+    home = None
     tmp = None
     video = None
     audio = None
 
 def setUpModule():
     Fixtures.tmp = tempfile.mkdtemp()
+    # recordings are moved to the Trash of this home, not the user's
+    Fixtures.home = os.environ[ "HOME" ]
+    os.environ[ "HOME" ] = os.path.join( Fixtures.tmp, "home" )
+    os.makedirs( os.path.expanduser("~/.Trash") )
     Fixtures.video = fragmented_mp4( os.path.join(Fixtures.tmp, "v.mp4"), "testsrc=size=320x240:rate=25",
                                      [ "-c:v", "libx264", "-g", "25", "-pix_fmt", "yuv420p" ] )
     Fixtures.audio = fragmented_mp4( os.path.join(Fixtures.tmp, "a.mp4"), "sine=frequency=440:sample_rate=48000",
                                      [ "-c:a", "aac" ] )
 
 def tearDownModule():
+    os.environ[ "HOME" ] = Fixtures.home
     shutil.rmtree( Fixtures.tmp )
 
 LL_HLS = """#EXTM3U
@@ -251,7 +257,7 @@ class MuxerTest( unittest.TestCase ):
             self.feed_with_full_disk( path, 5 ).close()
         self.assertEqual( [ call.args[0].split(" (")[0] for call in log.call_args_list ],
                           [ "Cannot write the recording", "Writing the recording again" ] )
-        self.assertEqual( recorder.media_info(path)[0][1], 150 )
+        self.assertAlmostEqual( probe(path)[2], 6, delta=0.1 )
 
     def test_a_muxer_closes_while_the_disk_is_full( self ):
         path = os.path.join( Fixtures.tmp, "stillfull.ts" )
@@ -279,7 +285,7 @@ class ToMp4Test( unittest.TestCase ):
     def tearDown( self ):
         shutil.rmtree( self.dir )
 
-    def test_remuxes_a_recording_into_mp4_and_removes_the_ts( self ):
+    def test_remuxes_a_recording_into_mp4_and_moves_the_ts_to_the_trash( self ):
         path = os.path.join( self.dir, "room 2026-11-25 12_00.ts" )
         video_init, video = Fixtures.video
         audio_init, audio = Fixtures.audio
@@ -293,79 +299,19 @@ class ToMp4Test( unittest.TestCase ):
         saved = recorder.to_mp4( path )
         self.assertEqual( saved, os.path.join( self.dir, "room 2026-11-25 12_00.mp4" ) )
         self.assertEqual( os.listdir( self.dir ), [ "room 2026-11-25 12_00.mp4" ] )
+        self.assertTrue( os.path.exists( os.path.expanduser("~/.Trash/room 2026-11-25 12_00.ts") ) )
         codecs, container, duration = probe( saved )
         self.assertEqual( codecs, [ "aac", "h264" ] )
         self.assertIn( "mp4", container.split(",") )
         self.assertAlmostEqual( duration, ts_duration, delta=0.5 )
 
-    def test_a_long_gap_keeps_its_length( self ):
-        parts = []
-        for offset in ( "0", "60" ):
-            parts.append( os.path.join( self.dir, "part" + offset ) )
-            subprocess.run( [ "ffmpeg", "-v", "error", "-i", os.path.join(Fixtures.tmp, "v.mp4"), "-i", os.path.join(Fixtures.tmp, "a.mp4"),
-                              "-c", "copy", "-output_ts_offset", offset, "-f", "mpegts", parts[-1] ], check=True )
-        path = os.path.join( self.dir, "room.ts" )
-        with open( path, "wb" ) as out:
-            for part in parts:
-                with open( part, "rb" ) as f:
-                    out.write( f.read() )
-                os.remove( part )
-        self.assertTrue( recorder.has_audio_gaps(path) )
-        saved = recorder.to_mp4( path )
-        self.assertEqual( sorted(os.listdir(self.dir)), [ "room.mp4", "room.ts" ] )
-        self.assertAlmostEqual( probe(saved)[2], 66, delta=1 )
-        # the gap is filled with silence, the video is copied whole
-        self.assertFalse( recorder.has_audio_gaps(saved) )
-        self.assertEqual( [ track[1] for track in recorder.media_info(saved) if track[0] == "h264" ], [ 300 ] )
-
-    def test_a_damaged_recording_is_kept( self ):
-        path = os.path.join( self.dir, "room.ts" )
-        muxer = recorder.Muxer( path, [ Fixtures.video[0], Fixtures.audio[0] ] )
-        for index, fragments in enumerate( (Fixtures.video[1], Fixtures.audio[1]) ):
-            for fragment in fragments:
-                muxer.feed( index, fragment )
-        muxer.close()
-        size = os.path.getsize( path )
-        with open( path, "r+b" ) as f:
-            f.seek( size // 2 )
-            f.write( b"\0" * 2000 )
-        recorder.to_mp4( path )
-        self.assertIn( "room.ts", os.listdir(self.dir) )
-
-    def test_a_recording_its_mp4_does_not_match_is_kept( self ):
-        path = os.path.join( self.dir, "room.ts" )
-        muxer = recorder.Muxer( path, [ Fixtures.video[0] ] )
-        for fragment in Fixtures.video[1]:
-            muxer.feed( 0, fragment )
-        muxer.close()
-        good = [ ("aac", 200, 6.0), ("h264", 150, 6.0) ]
-        for bad in ( None, good[:1], [ ("aac", 200, 6.0), ("hevc", 150, 6.0) ],
-                     [ ("aac", 200, 6.0), ("h264", 149, 6.0) ], [ ("aac", 200, 6.0), ("h264", 150, 3.0) ] ):
-            with mock.patch.object( recorder, "media_info", side_effect=[good, bad] ):
-                recorder.to_mp4( path )
-            self.assertEqual( sorted(os.listdir(self.dir)), [ "room.mp4", "room.ts" ], bad )
-        # the same file unmocked matches, and stays when keep is set
-        recorder.to_mp4( path, keep=True )
-        self.assertEqual( sorted(os.listdir(self.dir)), [ "room.mp4", "room.ts" ] )
-        recorder.to_mp4( path )
-        self.assertEqual( os.listdir(self.dir), [ "room.mp4" ] )
-
-    def test_sample_descriptions_tell_stream_parameters_apart( self ):
-        other = fragmented_mp4( os.path.join(self.dir, "o.mp4"), "testsrc=size=640x480:rate=25",
-                                [ "-c:v", "libx264", "-g", "25", "-pix_fmt", "yuv420p" ] )[0]
-        same = recorder.sample_descriptions( Fixtures.video[0] )
-        self.assertIn( b"avcC", same )
-        self.assertNotEqual( same, recorder.sample_descriptions(other) )
-        self.assertNotIn( b"mvhd", same )
-
     def test_the_conversion_runs_detached( self ):
-        for keep in ( False, True ):
-            with mock.patch.object( recorder.subprocess, "Popen" ) as popen:
-                recorder.start_to_mp4( "room.ts", keep )
-            args, kwargs = popen.call_args
-            self.assertEqual( args[0][2:], [ "--to-mp4", "room.ts" ] + ( ["--keep"] if keep else [] ) )
-            self.assertTrue( kwargs["start_new_session"] )
-            popen.return_value.wait.assert_not_called()
+        with mock.patch.object( recorder.subprocess, "Popen" ) as popen:
+            recorder.start_to_mp4( "room.ts" )
+        args, kwargs = popen.call_args
+        self.assertEqual( args[0][2:], [ "--to-mp4", "room.ts" ] )
+        self.assertTrue( kwargs["start_new_session"] )
+        popen.return_value.wait.assert_not_called()
 
     def test_a_title_already_recorded_gets_another_path( self ):
         previous = os.getcwd()
@@ -402,10 +348,7 @@ class FakeHls:
 
     FIRST = 100
 
-    def __init__( self, failing = (), outage = None, hang = False, slow = 0, stall = None, repeat = (), stuck = None, change = None ):
-        # change=(init, fragments) replaces the video track from its fourth
-        # second on, under another init URI.
-        self.change = change
+    def __init__( self, failing = (), outage = None, hang = False, slow = 0, stall = None, repeat = (), stuck = None ):
         # outage=(start, end) answers 503 to everything in that window of
         # seconds; hang=True never answers a media segment; slow delays each
         # media segment's answer by that many seconds; stall=(start, end)
@@ -465,26 +408,19 @@ class FakeHls:
         if self.slow and name.startswith("seg_"):
             time.sleep( self.slow )
         init, fragments = self.track( letter )
-        init_name = "init.mp4"
-        if self.change and letter == "v":
-            fragments = fragments[:3] + self.change[1][3:]
-            if name == "init2.mp4":
-                init = self.change[0]
-            if elapsed >= 3:
-                init_name = "init2.mp4"
         if name == "playlist.m3u8" and self.stall and self.stall[0] <= elapsed < self.stall[1]:
             time.sleep( self.stall[1] - elapsed )
         if name == "playlist.m3u8":
             available = min( len(fragments), int(time.time() - self.started) + 1 )
             first = max( 0, available - 3 )
             lines = [ "#EXTM3U", "#EXT-X-VERSION:6", "#EXT-X-TARGETDURATION:1",
-                      "#EXT-X-MEDIA-SEQUENCE:{}".format(self.FIRST + first), '#EXT-X-MAP:URI="{}"'.format(init_name) ]
+                      "#EXT-X-MEDIA-SEQUENCE:{}".format(self.FIRST + first), '#EXT-X-MAP:URI="init.mp4"' ]
             for index in range( first, available ):
                 lines += [ "#EXTINF:1.0,", "seg_{}.m4s".format(self.FIRST + index) ]
             if available == len( fragments ) and time.time() - self.started > len( fragments ) + 1:
                 lines.append( "#EXT-X-ENDLIST" )
             body = ( "\n".join(lines) + "\n" ).encode()
-        elif name in ( "init.mp4", "init2.mp4" ):
+        elif name == "init.mp4":
             body = init
         else:
             sequence = int( name[len("seg_"):-len(".m4s")] )
@@ -626,7 +562,7 @@ class FakeSite:
             self.respond( request, e.code )
             return
         prefix = "{}/{}/".format( self.hls.base, letter )
-        text = text.replace( 'URI="init', 'URI="{}init'.format(prefix) )
+        text = text.replace( 'URI="init.mp4"', 'URI="{}init.mp4"'.format(prefix) )
         text = "\n".join( prefix + line if line.startswith("seg_") else line for line in text.split("\n") )
         self.respond( request, 200, text.encode() )
 
@@ -660,10 +596,9 @@ class RecorderRunTest( unittest.TestCase ):
                                timeout=timeout, text=True )
 
     def recording( self ):
-        # the one recording of the room, "room <date> <time>.mp4"; its .ts is
-        # kept beside it when its audio has gaps
-        names = sorted( os.listdir( os.path.join(self.cwd, "videos", "room") ) )
-        self.assertIn( names[1:], ( [], [ os.path.splitext(names[0])[0] + ".ts" ] ), names )
+        # the one file recorded for the room, named "room <date> <time>.mp4"
+        names = os.listdir( os.path.join(self.cwd, "videos", "room") )
+        self.assertEqual( len(names), 1, names )
         self.assertRegex( names[0], RECORDING )
         return os.path.join( self.cwd, "videos", "room", names[0] )
 
@@ -681,19 +616,6 @@ class RecorderRunTest( unittest.TestCase ):
         self.assertEqual( codecs, [ "aac", "h264" ] )
         self.assertIn( "mp4", container.split(",") )
         self.assertGreater( duration, 4 )
-
-    def test_a_change_of_resolution_keeps_the_ts( self ):
-        hls = fake_site( change=fragmented_mp4( os.path.join(self.cwd, "big.mp4"), "testsrc=size=640x480:rate=25",
-                                                [ "-c:v", "libx264", "-g", "25", "-pix_fmt", "yuv420p" ] ) )
-        try:
-            result = self.run_recorder( hls )
-        finally:
-            hls.close()
-        self.assertEqual( result.returncode, 0, result.stdout )
-        self.assertIn( "Stream parameters changed; restarting muxer", result.stdout )
-        self.assertIn( "changes stream parameters partway; keeping the .ts too", result.stdout )
-        names = os.listdir( os.path.join(self.cwd, "videos", "room") )
-        self.assertEqual( sorted( os.path.splitext(name)[1] for name in names ), [ ".mp4", ".ts" ] )
 
     def test_slow_segments_are_all_recorded( self ):
         # Each media segment takes 0.8s to answer while each track gains one

@@ -13,15 +13,14 @@ stream URLs. When the site reports the room unavailable it waits up to
 room_return_wait_minutes (configs/config.json) for the room to come back and
 records on into the same file; it exits when the room stays away that long,
 when no segment arrives for GIVE_UP_AFTER seconds, or on SIGINT/SIGTERM.
-As it exits it starts a process that remuxes the finished .ts into an .mp4 and
-removes the .ts.
+As it exits it starts a process that recodes the finished .ts to .mp4.
 """
-import fcntl
 import hashlib
 import json
 import os
 import queue
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -52,8 +51,6 @@ REEXTRACT_AFTER = 15     # seconds without every playlist loading before asking 
 GIVE_UP_AFTER = 120      # seconds without a new segment before exiting
 LOOKUP_TIMEOUT = (3, 5)  # connect, read, for each request of a room lookup
 WRITE_RETRY = 1          # seconds between tries at a write the disk refused
-AUDIO_GAP = 0.1          # seconds between audio packets that make a gap; AAC's are ~0.02s apart
-MP4_TOLERANCE = 1      # seconds an MP4 may differ in length from the .ts it replaces
 CLOSE_TIMEOUT = 3        # seconds each muxer shutdown phase may take
 COOKIES_FILE = "chaturbate.com_cookies.txt"  # the user's browser export; read, never written
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -511,103 +508,31 @@ class Muxer:
         self.proc.stdout.close()
         self.out.close()
 
-def sample_descriptions( init ):
-    # The stsd boxes of an fMP4 init segment: a track's codec and parameters.
-    found = b""
-    at = init.find( b"stsd" )
-    while at >= 4:
-        found += init[ at - 4 : at - 4 + int.from_bytes(init[at - 4:at], "big") ]
-        at = init.find( b"stsd", at + 4 )
-    return found
-
-def to_mp4( path, keep = False ):
-    # Remuxes the finished MPEG-TS recording at path, its video as it is, into an MP4 beside it, which iMovie opens and MPEG-TS it does not, then
-    # removes the .ts if each track of the MP4 has the same packets over the
-    # same time. keep says the stream's parameters changed as it was recorded:
-    # Apple's decoder stops at such a change in the MP4, so the .ts stays. The
-    # MP4 is written under a temporary name and renamed into place, so a remux
-    # that fails or is cut short leaves the .ts as it was and no .mp4. An MP4
-    # that does not match is kept beside its .ts. Returns the path of the MP4,
-    # or of the .ts when there is none.
+def to_mp4( path ):
+    # What `recode` does: copies the streams of the finished recording at path
+    # into an MP4 and moves the original to the Trash. A copy that fails leaves
+    # the .ts where it is. Returns the path of the recording.
     target = os.path.splitext( path )[0] + ".mp4"
     temporary = target + ".tmp"
-    original = media_info( path )
-    # Apple's decoders take HEVC under the tag hvc1, not ffmpeg's hev1.
-    tag = [ "-tag:v", "hvc1" ] if any( track[0] == "hevc" for track in original or [] ) else []
-    # Apple's players close up a gap in an MP4's audio and play the rest out of
-    # step with the video, so the gaps are filled with silence, which takes
-    # encoding the audio again.
-    gaps = has_audio_gaps( path )
-    audio = [ "-c:a", "aac", "-af", "aresample=async=1:min_hard_comp=0.1" ] if gaps else [ "-c:a", "copy", "-bsf:a", "aac_adtstoasc" ]
-    # By default ffmpeg closes up a gap of over 10s in MPEG-TS timestamps.
-    cmd = [ "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin", "-y", "-dts_delta_threshold", "1000000", "-i", path,
-            "-c:v", "copy" ] + audio + tag + [ "-f", "mp4", temporary ]
-    result = subprocess.run( cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True )
+    result = subprocess.run( [ "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", path, "-c", "copy", "-f", "mp4", "-bsf:a", "aac_adtstoasc", temporary ],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True )
     if result.returncode != 0:
         if os.path.exists( temporary ):
             os.remove( temporary )
         log( "Converting {} to MP4 failed ({}); keeping the .ts: {}".format(path, result.returncode, result.stderr.strip()) )
         return path
-    converted = media_info( temporary )
-    # on disk before the .ts goes, so a power cut cannot take both
-    # (macOS's fsync leaves data in the drive's cache; F_FULLFSYNC does not)
-    with open( temporary, "rb" ) as f:
-        if hasattr( fcntl, "F_FULLFSYNC" ):
-            fcntl.fcntl( f.fileno(), fcntl.F_FULLFSYNC )
-        else:
-            os.fsync( f.fileno() )
     os.replace( temporary, target )
-    if keep:
-        log( "{} changes stream parameters partway; keeping the .ts too".format(target) )
-        return target
-    if gaps:
-        log( "{} has silence in place of gaps in its audio; keeping the .ts too".format(target) )
-        return target
-    if "corrupt" in result.stderr.lower():
-        log( "{} has damaged packets; keeping the .ts too".format(target) )
-        return target
-    if original is None or converted is None or len( original ) != len( converted ) or any(
-            a[:2] != b[:2] or abs( a[2] - b[2] ) > MP4_TOLERANCE for a, b in zip( original, converted ) ):
-        log( "{} does not match its .ts ({} against {}); keeping both".format(target, converted, original) )
-        return target
-    os.remove( path )
+    try:
+        shutil.move( path, os.path.join(os.path.expanduser("~/.Trash"), os.path.basename(path)) )
+    except OSError as e:
+        log( "Cannot move {} to the Trash: {}".format(path, e) )
     log( "Saved {}".format(target) )
     return target
 
-def has_audio_gaps( path ):
-    # Whether any two audio packets in a row are over AUDIO_GAP seconds apart.
-    try:
-        probe = subprocess.Popen( [ "ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "packet=pts_time", "-of", "csv=p=0", path ],
-                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True )
-    except OSError:
-        return False # without ffprobe to_mp4 keeps the .ts whatever this says
-    found = False
-    last = None
-    with probe:
-        for line in probe.stdout:
-            try:
-                pts = float( line.split(",")[0] )
-            except ValueError:
-                continue
-            found = found or ( last is not None and pts - last > AUDIO_GAP )
-            last = pts
-    return found
-
-def media_info( path ):
-    # [(codec, packets, seconds), ...], one per track of a media file; None
-    # when ffprobe cannot tell.
-    try:
-        result = subprocess.run( [ "ffprobe", "-v", "error", "-count_packets", "-show_entries", "stream=codec_name,nb_read_packets,duration", "-of", "json", path ],
-                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL )
-        info = json.loads( result.stdout )
-        return sorted( (s["codec_name"], int(s["nb_read_packets"]), float(s["duration"])) for s in info["streams"] ) or None
-    except (ValueError, KeyError, OSError):
-        return None
-
-def start_to_mp4( path, keep ):
-    # Converts in a process of its own session: a long recording takes minutes,
-    # and the daemon launches no recorder for the room until this one exits.
-    subprocess.Popen( [ sys.executable, os.path.abspath(__file__), "--to-mp4", path ] + ( ["--keep"] if keep else [] ), stdin=subprocess.DEVNULL, start_new_session=True )
+def start_to_mp4( path ):
+    # In a process of its own session: the daemon launches no recorder for the
+    # room until this one exits.
+    subprocess.Popen( [ sys.executable, os.path.abspath(__file__), "--to-mp4", path ], stdin=subprocess.DEVNULL, start_new_session=True )
 
 def recording_path( name, title ):
     # A path no earlier recording has, as a .ts or as the .mp4 made from it:
@@ -622,9 +547,9 @@ def recording_path( name, title ):
 
 def run():
     # Entry point: recorder.py https://chaturbate.com/<name>/ [<ready fd>]
-    # or, for a finished recording, recorder.py --to-mp4 <path> [--keep]
+    # or, for a finished recording, recorder.py --to-mp4 <path>
     if sys.argv[1] == "--to-mp4":
-        to_mp4( sys.argv[2], "--keep" in sys.argv[3:] )
+        to_mp4( sys.argv[2] )
         return
     url = sys.argv[1]
     ready_fd = int( sys.argv[2] ) if len( sys.argv ) > 2 else None
@@ -670,7 +595,6 @@ def main( url, ready_fd, stop, outcome ):
     session = requests.Session()
     session.headers.update( headers )
     tracks = [ Track(u) for u in urls ]
-    formats = set() # the stream parameters of every muxer started
     muxer = None
     # Segments are fetched on the pool as soon as a playlist lists them, so a
     # slow fetch holds up neither the next playlist reload nor the other
@@ -737,7 +661,6 @@ def main( url, ready_fd, stop, outcome ):
                 muxer = None
             if muxer is None and all( track.init for track in tracks ):
                 muxer = Muxer( path, [ track.init for track in tracks ] )
-                formats.add( tuple(sample_descriptions(track.init) for track in tracks) )
 
             if muxer:
                 for index, track in enumerate( tracks ):
@@ -825,7 +748,7 @@ def main( url, ready_fd, stop, outcome ):
             os.remove( path )
         log( "Stopped recording {}".format(name) )
         if os.path.exists( path ):
-            start_to_mp4( path, len(formats) > 1 )
+            start_to_mp4( path )
     outcome["exit_code"] = 0
 
 if __name__ == "__main__":
