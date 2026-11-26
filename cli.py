@@ -109,6 +109,15 @@ def restart():
         return      
     ipc( "restart" )
 
+LAUNCHD_LABEL = "com.recordurbate.daemon"  # service.sh's LABEL
+
+def launchd_loaded():
+    # Whether launchd has the daemon's job loaded, as service.sh's is_loaded asks
+    try:
+        return subprocess.call( [ "launchctl", "list", LAUNCHD_LABEL ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL ) == 0
+    except OSError:
+        return False # no launchctl: not macOS
+
 def upgrade():
     if not check_num_args(2): 
         print("Encountered unexpected extra arguments {}.".format(" ".join(sys.argv[2:])))
@@ -128,6 +137,11 @@ def upgrade():
     else:
         print("Old daemon did not exit within {}s.".format(max_wait))
         sys.exit(1)
+    if launchd_loaded():
+        # launchd runs the daemon; one started here would be a second daemon
+        # it knows nothing of
+        print("Starting new daemon through launchd...")
+        sys.exit( subprocess.call( [ "launchctl", "kickstart", "gui/{}/{}".format(os.getuid(), LAUNCHD_LABEL) ] ) )
     print("Starting new daemon...")
     global socket_client
     socket_client = None

@@ -356,6 +356,43 @@ def test_ipc_without_daemon_reports_not_running(monkeypatch):
     assert cli.socket_client is None
 
 
+def run_upgrade(monkeypatch, loaded):
+    # upgrade after the old daemon has taken the handoff and freed the port;
+    # returns the commands it ran and the daemons it started itself
+    calls, started = [], []
+    monkeypatch.setattr(cli.sys, "argv", ["cli.py", "upgrade"])
+    monkeypatch.setattr(cli, "ipc", lambda command: None)
+    monkeypatch.setattr(cli, "port_in_use", lambda: False)
+    monkeypatch.setattr(cli.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(cli, "launchd_loaded", lambda: loaded)
+    monkeypatch.setattr(cli.subprocess, "call", lambda args: calls.append(args) or 0)
+    monkeypatch.setattr(cli, "Daemon", lambda: type("D", (), {"start": lambda self: started.append(True)})())
+    try:
+        cli.upgrade()
+    except SystemExit as exited:
+        assert exited.code == 0
+    return calls, started
+
+
+def test_upgrade_of_a_launchd_daemon_restarts_it_through_launchd(monkeypatch):
+    calls, started = run_upgrade(monkeypatch, loaded=True)
+
+    assert calls == [["launchctl", "kickstart", "gui/{}/{}".format(os.getuid(), cli.LAUNCHD_LABEL)]]
+    assert started == []
+
+
+def test_upgrade_without_launchd_starts_the_daemon_itself(monkeypatch):
+    calls, started = run_upgrade(monkeypatch, loaded=False)
+
+    assert calls == []
+    assert started == [True]
+
+
+def test_launchd_label_matches_service_sh():
+    with open(os.path.join(REPO, "service.sh")) as f:
+        assert 'LABEL="{}"'.format(cli.LAUNCHD_LABEL) in f.read()
+
+
 def test_port_in_use_while_held_and_free_once_released(monkeypatch):
     holder = hold_port(monkeypatch)
     holder.listen(1)

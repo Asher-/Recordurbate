@@ -1115,7 +1115,10 @@ python cli.py upgrade
 ```
 
 Performs a full in-place upgrade: handoff → wait → start. Active recordings
-continue uninterrupted through the new daemon.
+continue uninterrupted through the new daemon. When launchd has the job
+`com.recordurbate.daemon` loaded, the start is `launchctl kickstart
+gui/<uid>/com.recordurbate.daemon`; a daemon started by the CLI instead would
+be one launchd does not know of, beside the one launchd starts.
 
 ### Files Changed
 

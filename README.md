@@ -131,7 +131,9 @@ python cli.py start --foreground
 
 The `upgrade` command performs a graceful handoff: the running daemon stops
 accepting new streams, hands its child process table to a new daemon instance,
-and exits. Active recordings continue uninterrupted across the restart.
+and exits. Active recordings continue uninterrupted across the restart. When
+launchd runs the daemon (`./service.sh enable`), the new daemon is started
+through launchd (`launchctl kickstart`), so launchd still runs the only daemon.
 
 ```bash
 ./service.sh upgrade
