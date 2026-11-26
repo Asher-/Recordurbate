@@ -6,6 +6,7 @@ class ClientResponse:
   
     connected_socket = None
     server = None
+    closed = False
 
     def __init__( self, server, connected_socket ):
       self.connected_socket = connected_socket
@@ -19,5 +20,10 @@ class ClientResponse:
         # self.server.daemon.logger.info("Finished sending return data.")
 
     def close( self ):
-        # self.server.daemon.logger.info("Sending client response terminator.")
+        # Sends the terminator once: stop and handoff close the response
+        # themselves, before the server's own close, and a second terminator
+        # reaches the client as undecodable text.
+        if self.closed:
+            return
+        self.closed = True
         self.connected_socket.sendall( Terminator.bytes )

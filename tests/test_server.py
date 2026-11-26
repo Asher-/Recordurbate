@@ -1,9 +1,11 @@
 import errno
 import logging
 import socket
+import threading
 
 import pytest
 
+from ipc.client import SocketClient
 from ipc.server import SocketServer
 
 
@@ -39,6 +41,32 @@ def test_bind_raises_other_bind_errors():
         server.bind()
 
     assert raised.value.errno == errno.EADDRNOTAVAIL
+
+
+class HandoffDaemon(LoggingDaemon):
+    # answers as Daemon.handoff and Daemon.stop do: closes the response itself,
+    # before the server's own close
+    def ipc(self, command, client_response):
+        client_response.print("Handoff initiated, daemon exiting.")
+        client_response.close()
+
+
+def test_a_response_closed_by_its_command_reaches_the_client_whole(capsys):
+    server = SocketServer(daemon=HandoffDaemon(), hostname="127.0.0.1", port=0)
+    server.bind()
+    client = SocketClient("127.0.0.1", server.ipc.getsockname()[1])
+    client.start()
+    served, address = server.ipc.accept()
+    handler = threading.Thread(target=server.handle_connection, args=(served, address))
+    handler.start()
+    try:
+        client.ipc("handoff")
+    finally:
+        handler.join(timeout=5)
+        client.server.close()
+        server.ipc.close()
+
+    assert capsys.readouterr().out == "Handoff initiated, daemon exiting.\n\n"
 
 
 def test_port_rebinds_while_a_served_connection_is_in_time_wait():
