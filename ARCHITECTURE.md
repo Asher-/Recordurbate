@@ -242,9 +242,13 @@ while self.pid:
     for each streamer:
         if not self.pid: break         # stop/handoff ends the pass
         if not streaming: start()      # launch recorder.py
-        self.wake.wait(rate_limit_time)
-    self.wake.wait(60)                 # an error in the pass also waits here
+        self.wake.wait(60 / streamers + random 0-100ms)  # once a minute, never in a burst
+    # an error in the pass waits 60s; no streamers waits 60s
 ```
+
+Spacing launches evenly keeps the room lookups at one every `60/streamers`
+seconds: a pass that launched them 0.1s apart and then waited 60s drew
+`429 Too Many Requests` from the room API for the later streamers of each burst.
 
 **`stop()`**: Sets `self.pid = None` and sets the `wake` event, so the run
 loop leaves any wait at once and exits. The run loop's cleanup phase calls
@@ -707,8 +711,8 @@ Location: `configs/config.json`
 | Key                       | Type     | Default                       | Description                                                                  |
 | :------------------------ | :------- | :---------------------------- | :--------------------------------------------------------------------------- |
 | `auto_reload_config`      | `bool`   | `true`                        | If true, config is reloaded every loop iteration (60s). Allows live changes.      |
-| `rate_limit`              | `bool`   | `true`                        | Whether to rate-limit API calls (controls if `rate_limit_time` is used).          |
-| `rate_limit_time`         | `number` | `0`                           | Seconds to sleep between launching streamers. `0` means no delay.                 |
+| `rate_limit`              | `bool`   | `true`                        | Unused; launches are spaced `60/streamers` seconds apart.                         |
+| `rate_limit_time`         | `number` | `0`                           | Unused; launches are spaced `60/streamers` seconds apart.                         |
 | `room_return_wait_minutes` | `number` | `10`                         | Minutes recorder.py waits for a room that went unavailable mid-recording to come back (checking every 3s), recording on into the same file through a new muxer when it does. Read each time a room goes away, so edits reach running recorders. |
 | `default_export_location` | `string` | `"./list.txt"`                | Default file path for the `export` command.                                  |
 | `streamers`               | `array`  | `[]`                          | Array of Chaturbate usernames to record.                                     |
@@ -899,11 +903,11 @@ recorder PIDs.
 When a streamer is offline, the recorder's room lookup reports the room
 state and the recorder exits. The readiness wait sees the pipe's end of file
 at once. The streamer thread cleans up and sets
-`stream = None`. On the next run loop iteration (up to 60s later), the daemon
+`stream = None`. On its next turn in the run loop (60s after its last), the daemon
 re-launches the recorder for that streamer.
 
-With 96+ streamers and `rate_limit_time: 0`, all offline streamers are cycled
-rapidly. Each cycle creates a short-lived recorder that exits immediately.
+Each offline streamer is cycled once a minute, one launch every
+`60/streamers` seconds. Each cycle creates a short-lived recorder that exits immediately.
 This is normal and expected.
 
 ### Unreachable Site Warning

@@ -146,8 +146,8 @@ One config file in the `configs/` directory, and an optional cookies export:
 | Key                       | Type     | Default                       | Description                                                                |
 | :------------------------ | :------- | :---------------------------- | :------------------------------------------------------------------------- |
 | `auto_reload_config`      | `bool`   | `true`                        | Reload config every loop iteration (60s). Allows live streamer list edits.     |
-| `rate_limit`              | `bool`   | `true`                        | Whether to rate-limit between launching streamers.                             |
-| `rate_limit_time`         | `number` | `0`                           | Seconds to sleep between streamer launches. `0` = no delay.                    |
+| `rate_limit`              | `bool`   | `true`                        | Unused; streamers are launched one every `60/streamers` seconds.               |
+| `rate_limit_time`         | `number` | `0`                           | Unused; streamers are launched one every `60/streamers` seconds.               |
 | `room_return_wait_minutes` | `number` | `10`                         | Minutes a recorder waits for a room that went unavailable mid-recording to come back, recording on into the same file when it does. Read each time a room goes away. |
 | `default_export_location` | `string` | `"./list.txt"`                | Default file path for the `export` command.                                |
 | `streamers`               | `array`  | `[]`                          | Chaturbate usernames to record.                                            |

@@ -1,6 +1,7 @@
 import sys
 import os
 import logging
+import random
 import signal
 import threading
 from ipc.server import SocketServer
@@ -9,6 +10,9 @@ from ipc.ipc_config import IpcConfig
 from streamer import Streamer
 from pid import recorded_recorder
 import config as Config
+
+PASS_SECONDS = 60  # each streamer is checked once in this many seconds
+PAD_SECONDS = 0.1  # most random padding added to each pause between launches
 
 class Daemon:
 
@@ -316,19 +320,19 @@ class Daemon:
 
                     with self.streamers_lock:
                         streamer_snapshot = dict(self.streamers)
+                    # one streamer every PASS_SECONDS / streamers, so each is
+                    # checked once a pass and the site never sees a burst of
+                    # lookups; stop and handoff clear pid and set wake
+                    pause = PASS_SECONDS / max(1, len(streamer_snapshot))
                     for name, streamer in streamer_snapshot.items():
-                        # stop and handoff clear pid; leave the pass at once
                         if not self.pid:
                             break
                         if not streamer.stream:
                             streamer.start()
-                        # the configured pause between launches; stop and handoff end it
-                        if self.config["rate_limit_time"]:
-                            self.wake.wait(self.config["rate_limit_time"])
-
-                    # wait a minute; stop and handoff clear pid and set wake
-                    if self.pid:
-                        self.wake.wait(60)
+                        if self.pid:
+                            self.wake.wait(pause + random.uniform(0, PAD_SECONDS))
+                    if not streamer_snapshot and self.pid:
+                        self.wake.wait(PASS_SECONDS)
 
                 except Exception:
                     self.logger.exception("loop error")

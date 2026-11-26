@@ -6,6 +6,7 @@ import socket
 import subprocess
 import sys
 import threading
+import types
 
 import pytest
 
@@ -155,7 +156,8 @@ def test_stop_ends_the_run_loops_wait_at_once(monkeypatch):
     # loop reaches its minute wait only through the recorded wait
     waits = run_with_recorded_waits(instance, GatedStreamer(fail=False))
 
-    assert waits == [60]
+    # one streamer: 60s plus the random padding
+    assert len(waits) == 1 and 60 <= waits[0] <= 60.1
 
 
 @pytest.mark.parametrize("method", ["stop", "handoff"])
@@ -232,17 +234,48 @@ def test_run_loop_waits_for_wake_after_an_error(monkeypatch):
     assert streamer.starts == 1
 
 
-def test_stop_ends_the_rate_limit_pause(monkeypatch):
+def test_streamers_are_spread_over_the_pass(monkeypatch):
     monkeypatch.setattr(daemon, "recorded_recorder", lambda name: None)
     instance = bare_daemon()
-    instance.config = {"auto_reload_config": False, "rate_limit_time": 45}
-    streamer = GatedStreamer(fail=False)
+    instance.pid = os.getpid()
+    instance.config = {"auto_reload_config": False}
+    instance.streamers_lock = threading.Lock()
+    started = []
 
-    waits = run_with_recorded_waits(instance, streamer)
+    class RecordingStreamer:
+        stream = None
 
-    # the pause after a launch is a wait on wake, so stop ends it at once
-    assert waits == [45]
-    assert streamer.starts == 1
+        def __init__(self, name):
+            self.name = name
+
+        def start(self):
+            started.append(self.name)
+
+        def stop(self):
+            pass
+
+    instance.streamers = {name: RecordingStreamer(name) for name in "abcd"}
+    waits = []
+
+    class RecordingEvent(threading.Event):
+        def wait(self, timeout=None):
+            # a pass and a half, then stop
+            waits.append(timeout)
+            if len(waits) == 6:
+                instance.stop()
+            return self.is_set()
+
+    # only the daemon's own Event records; threading's internals keep theirs
+    monkeypatch.setattr(daemon, "threading", types.SimpleNamespace(**{**vars(threading), "Event": RecordingEvent}))
+    thread = instance.run()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    # 60s / 4 streamers between launches plus up to 100ms of random padding,
+    # and no wait between passes
+    assert len(waits) == 6 and all(15 <= wait <= 15.1 for wait in waits), waits
+    assert len(set(waits)) > 1
+    assert started[:6] == list("abcdab")
 
 
 def test_shutdown_stops_streamers_together(monkeypatch):
