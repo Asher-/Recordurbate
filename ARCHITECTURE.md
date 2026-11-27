@@ -1118,7 +1118,11 @@ Performs a full in-place upgrade: handoff → wait → start. Active recordings
 continue uninterrupted through the new daemon. When launchd has the job
 `com.recordurbate.daemon` loaded, the start is `launchctl kickstart
 gui/<uid>/com.recordurbate.daemon`; a daemon started by the CLI instead would
-be one launchd does not know of, beside the one launchd starts.
+be one launchd does not know of, beside the one launchd starts. `cli.py start`
+without `--foreground` does the same kickstart while the job is loaded, and
+reports "Already started." when a daemon holds the port; `--foreground` is how
+launchd itself starts the daemon. `restart` re-executes the daemon in place,
+so launchd keeps the same process.
 
 ### Files Changed
 

@@ -388,6 +388,43 @@ def test_upgrade_without_launchd_starts_the_daemon_itself(monkeypatch):
     assert started == [True]
 
 
+def run_start(monkeypatch, argv, loaded, running=False):
+    # start, returning the commands it ran, the daemons it started itself
+    # (with their foreground flag) and its exit code
+    calls, started = [], []
+    monkeypatch.setattr(cli.sys, "argv", argv)
+    monkeypatch.setattr(cli, "launchd_loaded", lambda: loaded)
+    monkeypatch.setattr(cli, "port_in_use", lambda: running)
+    monkeypatch.setattr(cli.subprocess, "call", lambda args: calls.append(args) or 0)
+    monkeypatch.setattr(cli, "Daemon", lambda: type("D", (), {"start": lambda self, foreground: started.append(foreground)})())
+    code = None
+    try:
+        cli.start()
+    except SystemExit as exited:
+        code = exited.code
+    return calls, started, code
+
+
+KICKSTART = ["launchctl", "kickstart", "gui/{}/{}".format(os.getuid(), "com.recordurbate.daemon")]
+
+
+def test_start_of_a_launchd_job_goes_through_launchd(monkeypatch):
+    assert run_start(monkeypatch, ["cli.py", "start"], loaded=True) == ([KICKSTART], [], 0)
+
+
+def test_start_of_a_running_launchd_job_reports_already_started(monkeypatch, capsys):
+    assert run_start(monkeypatch, ["cli.py", "start"], loaded=True, running=True) == ([], [], 1)
+    assert capsys.readouterr().out == "Already started.\n"
+
+
+def test_launchd_itself_starts_the_daemon_in_the_foreground(monkeypatch):
+    assert run_start(monkeypatch, ["cli.py", "start", "--foreground"], loaded=True) == ([], [True], None)
+
+
+def test_start_without_launchd_starts_the_daemon_itself(monkeypatch):
+    assert run_start(monkeypatch, ["cli.py", "start"], loaded=False) == ([], [False], None)
+
+
 def test_launchd_label_matches_service_sh():
     with open(os.path.join(REPO, "service.sh")) as f:
         assert 'LABEL="{}"'.format(cli.LAUNCHD_LABEL) in f.read()

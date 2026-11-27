@@ -93,6 +93,15 @@ def start():
         return
     # The daemon reports "Already started." itself when it cannot bind its port
     foreground = "--foreground" in sys.argv
+    # launchd starts the daemon with --foreground; any other start of a job
+    # launchd has loaded goes through launchd, which would not know of a
+    # daemon started here and could start a second one
+    if not foreground and launchd_loaded():
+        if port_in_use():
+            print("Already started.")
+            sys.exit(1)
+        print("Starting daemon through launchd...")
+        sys.exit( launchd_start() )
     daemon = Daemon()
     daemon.start(foreground=foreground)
 
@@ -118,6 +127,10 @@ def launchd_loaded():
     except OSError:
         return False # no launchctl: not macOS
 
+def launchd_start():
+    # Runs the daemon's launchd job now; its exit status
+    return subprocess.call( [ "launchctl", "kickstart", "gui/{}/{}".format(os.getuid(), LAUNCHD_LABEL) ] )
+
 def upgrade():
     if not check_num_args(2): 
         print("Encountered unexpected extra arguments {}.".format(" ".join(sys.argv[2:])))
@@ -141,7 +154,7 @@ def upgrade():
         # launchd runs the daemon; one started here would be a second daemon
         # it knows nothing of
         print("Starting new daemon through launchd...")
-        sys.exit( subprocess.call( [ "launchctl", "kickstart", "gui/{}/{}".format(os.getuid(), LAUNCHD_LABEL) ] ) )
+        sys.exit( launchd_start() )
     print("Starting new daemon...")
     global socket_client
     socket_client = None
